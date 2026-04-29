@@ -558,7 +558,10 @@ async function buildSpriteForFolder(galleryAbs) {
         '--across', String(SPRITE_ACROSS),
         '--hspacing', String(cellW),
         '--vspacing', String(cellH),
-        '--background', '0 0 0',
+        // Single-element background broadcasts to any channel count. PNGs become 4-channel
+        // RGBA .v intermediates and reject a 3-element RGB background ("vector must have 1
+        // or 4 elements"). 1-element black works for both 3-channel and 4-channel inputs.
+        '--background', '0',
       ], vTmp);
       await runStep('vips', [
         'jpegsave', vTmp, tmp,
