@@ -1091,9 +1091,6 @@ function galleryHTML({ urlPath, folders, images, spriteMeta, isAdminFlag, hasPas
 
 <header id="topbar">
   <nav id="breadcrumb">${breadcrumbs}</nav>
-  <span id="zoomBox" title="Thumbnail size">
-    <input id="zoomSlider" type="range" min="0" max="100" />
-  </span>
   <a id="adminlink" href="/_admin/" title="Admin">⚙</a>
 </header>
 
@@ -1102,9 +1099,16 @@ function galleryHTML({ urlPath, folders, images, spriteMeta, isAdminFlag, hasPas
 ${folders.length ? `<section id="folders">${folderCards}</section>` : ''}
 
 <div id="prevnext">
-  <button onclick="leftbutton()">‹ Prev</button>
-  <a href="#:" onclick="displaythumbs();return false;"> Thumbnails </a>
-  <button onclick="rightbutton()">Next ›</button>
+  <div class="image-nav">
+    <button onclick="leftbutton()">‹ Prev</button>
+    <a href="#:" onclick="displaythumbs();return false;"> Thumbnails </a>
+    <button onclick="rightbutton()">Next ›</button>
+  </div>
+  <div class="zoom-nav" title="Thumbnail size">
+    <span class="zoom-icon" aria-hidden="true">▫</span>
+    <input id="zoomSlider" type="range" min="0" max="100" />
+    <span class="zoom-icon" aria-hidden="true">▣</span>
+  </div>
 </div>
 
 <div id="counter"></div>

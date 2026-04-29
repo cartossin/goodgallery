@@ -194,35 +194,6 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 }
 #thumbs .sprite-thumb:hover { opacity: 0.85; transform: scale(1.04); }
 
-/* Zoom slider in the topbar */
-#zoomBox { display: flex; align-items: center; gap: 6px; }
-#zoomSlider {
-  -webkit-appearance: none;
-  appearance: none;
-  width: 140px;
-  height: 4px;
-  background: var(--border);
-  border-radius: 2px;
-  outline: none;
-}
-#zoomSlider::-webkit-slider-thumb {
-  -webkit-appearance: none;
-  appearance: none;
-  width: 14px; height: 14px;
-  background: var(--fg);
-  border-radius: 50%;
-  cursor: pointer;
-}
-#zoomSlider::-moz-range-thumb {
-  width: 14px; height: 14px;
-  background: var(--fg);
-  border-radius: 50%;
-  cursor: pointer;
-  border: none;
-}
-@media (max-width: 600px) {
-  #zoomSlider { width: 90px; }
-}
 
 /* Justified rows layout */
 #thumbs.layout {
@@ -239,4 +210,35 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 #thumbs .row > .sprite-thumb {
   margin: 0;
   flex-shrink: 0;
+}
+
+/* prevent horizontal scroll due to row gap rounding */
+html, body { overflow-x: hidden; }
+
+/* prev/next bar swaps between image-nav (in image view) and zoom-nav (in thumb view) */
+#prevnext { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 8px 12px; }
+#prevnext .image-nav { display: none; align-items: center; gap: 12px; }
+#prevnext .zoom-nav  { display: none; align-items: center; gap: 8px; width: 100%; max-width: 360px; }
+body.image-view #prevnext .image-nav { display: flex; }
+body.thumb-view #prevnext .zoom-nav  { display: flex; }
+.zoom-icon { color: var(--muted); font-size: 16px; line-height: 1; }
+#zoomSlider {
+  -webkit-appearance: none;
+  appearance: none;
+  flex: 1;
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  outline: none;
+}
+#zoomSlider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px; height: 14px;
+  background: var(--fg);
+  border-radius: 50%;
+  cursor: pointer;
+}
+#zoomSlider::-moz-range-thumb {
+  width: 14px; height: 14px; background: var(--fg); border-radius: 50%; cursor: pointer; border: none;
 }

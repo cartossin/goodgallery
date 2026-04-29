@@ -129,6 +129,8 @@
     showAdminBar();
     setHTML('thumbs', '');
     isfullres = 0;
+    document.body.classList.add('image-view');
+    document.body.classList.remove('thumb-view');
     var pd = $('photodiv'); if (pd) pd.classList.remove('fullres');
     var name = images[inum];
     hashmirror = encodeURIComponent(name);
@@ -187,20 +189,64 @@
     return n ? sum / n : 200;
   }
 
+  // Binary-search the largest target row height H such that the actual layout's total
+  // height (with justification + gaps) is ≤ available viewport. The closed-form
+  // approximation underestimates because justification can stretch rows taller than H.
   function fitAllHeight() {
     if (!window.spriteMeta || lastimagevalue < 1) return 100;
-    var W = (document.getElementById('thumbs') || document.body).clientWidth || window.innerWidth;
-    var H = Math.max(120, window.innerHeight - chromeHeight());
-    var aspect = avgThumbWidth() / spriteMeta.cellH;
-    // total layout height ≈ N * h^2 * aspect / W; solve for h s.t. height = H
-    var h = Math.sqrt((H * W) / (lastimagevalue * aspect));
-    return Math.max(4, Math.min(spriteMeta.cellH, h));
+    var W = layoutWidth();
+    var H = layoutHeight();
+    var lo = 2, hi = spriteMeta.cellH;
+    for (var i = 0; i < 18; i++) {
+      var mid = (lo + hi) / 2;
+      var measured = simulateLayoutHeight(mid, W);
+      if (measured > H) hi = mid; else lo = mid;
+    }
+    return Math.max(2, lo);
+  }
+
+  // Width available for thumbs (the #thumbs box) and height available below it. We use
+  // bounding rects so chrome (header + prev/next + footer + adminnotify) is accounted
+  // for exactly, without hardcoded estimates.
+  function layoutWidth() {
+    var el = document.getElementById('thumbs');
+    return (el && el.clientWidth) || window.innerWidth;
+  }
+  function layoutHeight() {
+    var el = document.getElementById('thumbs');
+    var foot = document.getElementById('bottomlink');
+    var top = el ? el.getBoundingClientRect().top : 100;
+    var footH = foot ? foot.offsetHeight : 0;
+    return Math.max(120, window.innerHeight - top - footH - 8);
+  }
+
+  // Compute total layout height for a given row-height target without rendering. Mirrors
+  // layoutRows()/finalizeRow() exactly so fit-all is accurate.
+  var ROW_GAP = 2;  // matches CSS .row gap
+  function simulateLayoutHeight(H, W) {
+    if (!window.spriteMeta) return 0;
+    var rows = 0, totalH = 0;
+    var natRowW = 0, count = 0;
+    for (var i = 1; i <= lastimagevalue; i++) {
+      var name = images[i];
+      var loc = spriteMeta.imageMap[name];
+      var natW = (loc ? loc.w : spriteMeta.cellH) * H / spriteMeta.cellH;
+      if (count > 0 && (natRowW + ROW_GAP * count + natW) > W) {
+        // close row
+        var rowScale = Math.min(1.5, (W - ROW_GAP * (count - 1)) / Math.max(1, natRowW));
+        totalH += H * rowScale + ROW_GAP;
+        rows++; natRowW = 0; count = 0;
+      }
+      natRowW += natW; count++;
+    }
+    if (count > 0) totalH += H + ROW_GAP;  // last row at natural height
+    return totalH;
   }
 
   var ZOOM_KEY_PREFIX = 'ggZoom:';
   function getZoom() {
     var saved = localStorage.getItem(ZOOM_KEY_PREFIX + folderURL);
-    var t = saved !== null ? parseInt(saved, 10) : 50;
+    var t = saved !== null ? parseInt(saved, 10) : 0;  // default = fit-all
     if (isNaN(t) || t < 0) t = 0;
     if (t > 100) t = 100;
     return t;
@@ -217,7 +263,7 @@
 
   function layoutRows(H) {
     if (!window.spriteMeta) return [];
-    var W = (document.getElementById('thumbs') || document.body).clientWidth || window.innerWidth;
+    var W = layoutWidth();
     var rows = [];
     var current = [];
     var natRowW = 0;
@@ -225,7 +271,9 @@
       var name = images[i];
       var loc = spriteMeta.imageMap[name];
       var natW = (loc ? loc.w : spriteMeta.cellH) * H / spriteMeta.cellH;
-      if (natRowW + natW > W && current.length > 0) {
+      // Available content width = W minus inter-thumb gaps for items already in row.
+      var avail = W - ROW_GAP * Math.max(0, current.length - 1);
+      if (current.length > 0 && (natRowW + natW + ROW_GAP) > W) {
         rows.push(finalizeRow(current, natRowW, H, W, false));
         current = []; natRowW = 0;
       }
@@ -237,7 +285,8 @@
   }
 
   function finalizeRow(items, natRowW, H, W, isLast) {
-    var rowScale = isLast ? 1 : Math.min(1.5, W / Math.max(1, natRowW));
+    var contentW = W - ROW_GAP * Math.max(0, items.length - 1);
+    var rowScale = isLast ? 1 : Math.min(1.5, contentW / Math.max(1, natRowW));
     return {
       items: items.map(function (it) {
         return { index: it.index, w: Math.max(1, Math.round(it.natW * rowScale)), h: Math.max(1, Math.round(H * rowScale)) };
@@ -300,6 +349,8 @@
     setHTML('photospot', '');
     setHTML('preimages', '');
     setText('counter', '');
+    document.body.classList.add('thumb-view');
+    document.body.classList.remove('image-view');
     renderGallery();
   }
 
