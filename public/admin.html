@@ -383,33 +383,122 @@ async function uploadEntry(entry, parentPath) {
   }
 }
 
-async function uploadFiles(files, dir) {
+// Chunked uploader (port of sendinator's pattern). Each file: create -> chunk*N (with
+// per-chunk SHA-256 hash + infinite retry/backoff) -> finalize. Up to PARALLEL_FILES
+// uploads run concurrently. Network blips are recoverable per-chunk; a tab close mid-
+// upload leaves the server's chunk dir intact so a subsequent attempt could resume
+// (resume UI is future work — for now we leave abandoned uploads to the 24h GC).
+const PARALLEL_FILES = 4;
+const RETRY_MAX_WAIT_MS = 8000;
+
+async function sha256Hex(buffer) {
+  var hb = await crypto.subtle.digest('SHA-256', buffer);
+  return Array.from(new Uint8Array(hb)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function makeUploadRow(label) {
   var list = document.getElementById('uploadList');
-  for (var f of files) {
-    if (!f.type.startsWith('image/')) continue;
-    var row = document.createElement('div');
-    row.style = 'padding:6px 0;border-bottom:1px solid #1f1f1f';
-    row.innerHTML = '<div style="display:flex;justify-content:space-between"><span></span><small></small></div><div class="progress"><div></div></div>';
-    row.querySelector('span').textContent = (dir === cwdPath ? '' : dir.slice(cwdPath.length)) + f.name;
-    list.appendChild(row);
-    var bar = row.querySelector('.progress > div');
-    var sm  = row.querySelector('small');
-    try {
-      var fd = new FormData(); fd.append('file', f, f.name);
-      await new Promise((resolve, reject) => {
-        var xhr = new XMLHttpRequest();
-        xhr.open('POST', dir + '?upload=1');
-        xhr.setRequestHeader('Authorization', 'Bearer ' + sessionToken);
-        xhr.upload.onprogress = e => { if (e.lengthComputable) bar.style.width = (e.loaded / e.total * 100) + '%'; };
-        xhr.onload = () => { if (xhr.status >= 200 && xhr.status < 300) resolve(); else reject(new Error(xhr.responseText || ('http ' + xhr.status))); };
-        xhr.onerror = () => reject(new Error('network'));
-        xhr.send(fd);
-      });
-      bar.style.width = '100%'; sm.textContent = 'OK'; sm.style.color = '#9bff9b';
-    } catch (e) {
-      sm.textContent = 'FAIL: ' + e.message; sm.style.color = '#ff8585';
+  var row = document.createElement('div');
+  row.style = 'padding:6px 0;border-bottom:1px solid #1f1f1f';
+  row.innerHTML = '<div style="display:flex;justify-content:space-between;gap:8px"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1"></span><small style="white-space:nowrap"></small></div><div class="progress"><div></div></div>';
+  row.querySelector('span').textContent = label;
+  list.appendChild(row);
+  return {
+    bar: row.querySelector('.progress > div'),
+    sm:  row.querySelector('small'),
+  };
+}
+
+async function uploadFiles(files, dir) {
+  var imgs = Array.from(files).filter(f => f.type && f.type.startsWith('image/'));
+  if (imgs.length === 0) return;
+
+  var rows = imgs.map(f => ({
+    file: f,
+    ui: makeUploadRow((dir === cwdPath ? '' : dir.slice(cwdPath.length)) + f.name),
+  }));
+
+  // Worker pool: PARALLEL_FILES uploads in flight at once.
+  var next = 0;
+  async function worker() {
+    while (next < rows.length) {
+      var i = next++;
+      try {
+        await uploadOneFile(rows[i].file, dir, rows[i].ui);
+      } catch (e) {
+        rows[i].ui.sm.textContent = 'FAIL: ' + (e.message || e);
+        rows[i].ui.sm.style.color = '#ff8585';
+      }
     }
   }
+  await Promise.all(Array.from({length: PARALLEL_FILES}, worker));
+}
+
+async function uploadOneFile(file, dir, ui) {
+  // 1. create
+  ui.sm.textContent = 'starting…';
+  var createRes = await fetchJson('/api/upload/create', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filename: file.name, size: file.size, targetFolder: dir }),
+  });
+  var id = createRes.id;
+  var chunkSize = createRes.chunkSize;
+  var totalChunks = createRes.totalChunks;
+
+  // 2. chunk loop with infinite retry
+  for (var idx = 0; idx < totalChunks; idx++) {
+    var start = idx * chunkSize;
+    var end = Math.min(start + chunkSize, file.size);
+    var blob = file.slice(start, end);
+    var buf = await blob.arrayBuffer();
+    var hash = await sha256Hex(buf);
+
+    var attempt = 0;
+    while (true) {
+      try {
+        var r = await fetch('/api/upload/chunk/' + id + '/' + idx, {
+          method: 'POST',
+          headers: Object.assign({ 'X-Chunk-Hash': hash }, authHeaders()),
+          body: buf,
+        });
+        if (!r.ok) {
+          var errBody = await r.json().catch(() => ({ error: 'http ' + r.status }));
+          throw new Error(errBody.error || 'chunk failed');
+        }
+        break;
+      } catch (e) {
+        attempt++;
+        var wait = Math.min(attempt * 1000, RETRY_MAX_WAIT_MS);
+        ui.sm.textContent = 'retry ' + attempt + ' in ' + (wait/1000) + 's (' + (e.message || e) + ')';
+        ui.sm.style.color = '#fc0';
+        await new Promise(res => setTimeout(res, wait));
+      }
+    }
+    ui.bar.style.width = ((idx + 1) / totalChunks * 100) + '%';
+    ui.sm.textContent = (idx + 1) + '/' + totalChunks + ' chunks';
+    ui.sm.style.color = '';
+  }
+
+  // 3. finalize
+  ui.sm.textContent = 'finalizing…';
+  await fetchJson('/api/upload/finalize/' + id, { method: 'POST' });
+  ui.bar.style.width = '100%';
+  ui.sm.textContent = 'OK';
+  ui.sm.style.color = '#9bff9b';
+}
+
+async function fetchJson(url, opts) {
+  opts = opts || {};
+  opts.headers = Object.assign({}, opts.headers || {}, authHeaders());
+  var r = await fetch(url, opts);
+  var j = null;
+  try { j = await r.json(); } catch {}
+  if (!r.ok) {
+    var msg = (j && j.error) ? j.error : ('http ' + r.status);
+    throw new Error(msg);
+  }
+  return j;
 }
 
 // initial path from query

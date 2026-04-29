@@ -557,14 +557,16 @@ async function handleUploadAPI(req, res, pathname, method) {
   if (method === 'POST' && pathname === '/api/upload/create') {
     let body;
     try { body = JSON.parse(await readBody(req, 1024 * 1024)); } catch { return badRequest(res); }
-    const { filename, size, totalChunks, targetFolder } = body;
+    const { filename, size, targetFolder } = body;
     if (!filename || typeof filename !== 'string' || filename.length > 255) return sendJson(res, 400, { error: 'invalid filename' });
     const baseName = path.basename(filename);
     if (baseName.startsWith('.') || RESERVED.has(baseName) || isOrphanTmp(baseName)) return sendJson(res, 400, { error: 'invalid filename' });
     if (!isImage(baseName)) return sendJson(res, 400, { error: 'unsupported file type' });
     if (typeof size !== 'number' || !Number.isInteger(size) || size <= 0) return sendJson(res, 400, { error: 'invalid size' });
-    if (typeof totalChunks !== 'number' || !Number.isInteger(totalChunks) || totalChunks <= 0) return sendJson(res, 400, { error: 'invalid totalChunks' });
-    if (totalChunks * CHUNK_SIZE < size || (totalChunks - 1) * CHUNK_SIZE >= size) return sendJson(res, 400, { error: 'totalChunks does not match size' });
+    // Server derives totalChunks from size + CHUNK_SIZE so the client doesn't need to
+    // know the chunk size up front. This avoids a config round-trip and a class of
+    // off-by-one errors when client and server disagree on the math.
+    const totalChunks = Math.ceil(size / CHUNK_SIZE) || 1;
 
     // Resolve and validate target folder
     const tfSegs = (typeof targetFolder === 'string' ? targetFolder : '/').split('/').filter(Boolean);
@@ -591,7 +593,7 @@ async function handleUploadAPI(req, res, pathname, method) {
     };
     uploads.set(id, info);
     saveUploadMeta(id, info);
-    return sendJson(res, 200, { id, chunkSize: CHUNK_SIZE });
+    return sendJson(res, 200, { id, chunkSize: CHUNK_SIZE, totalChunks });
   }
 
   // POST /api/upload/chunk/:id/:idx
