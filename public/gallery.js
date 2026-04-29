@@ -179,21 +179,27 @@
       }
       count++;
       var name = images[i];
-      // If a sprite atlas is current, render this thumb as a CSS-sliced background div.
-      // One JPEG = N thumbs, no per-image HTTP request. Falls back to <img> otherwise.
+      // Sprite path: each thumb is a fixed-height variable-width slice of an atlas JPEG.
+      // The sprite stores cells of cellW x cellH; the actual thumb is left-aligned in its
+      // cell, so we slice to width=loc.w (its real width) — black padding to the right is
+      // never revealed. One atlas request renders many thumbs.
       if (window.spriteMeta && spriteMeta.imageMap && spriteMeta.imageMap[name]) {
         var loc = spriteMeta.imageMap[name];
         var spriteFile = spriteMeta.sprites[loc.sprite].file;
         var spriteURL = folderURL + 'thumbcache/' + spriteFile;
-        var cell = spriteMeta.cell;
-        var dispPx = Math.round(cell / 2); // 2x retina by default
-        var bgX = -loc.col * dispPx;
-        var bgY = -loc.row * dispPx;
+        var cellW = spriteMeta.cellW, cellH = spriteMeta.cellH;
+        // Display at half cell-height — physical thumbs are 2x retina-friendly.
+        var dispH = Math.round(cellH / 2);
+        var scale = dispH / cellH;
+        var dispW = Math.round(loc.w * scale);
+        var bgX = -loc.col * cellW * scale;
+        var bgY = -loc.row * cellH * scale;
+        var bgSizeW = spriteMeta.across * cellW * scale;
         html += '<a class="sprite-thumb" href="#' + encodeURIComponent(name) + '" data-i="' + i + '" title="' + name + '" ' +
-          'style="display:inline-block;width:' + dispPx + 'px;height:' + dispPx + 'px;' +
+          'style="display:inline-block;width:' + dispW + 'px;height:' + dispH + 'px;' +
           'background-image:url(' + spriteURL + ');' +
           'background-position:' + bgX + 'px ' + bgY + 'px;' +
-          'background-size:' + (spriteMeta.across * dispPx) + 'px auto;"></a>';
+          'background-size:' + bgSizeW + 'px auto;"></a>';
       } else {
         html += '<a href="#' + encodeURIComponent(name) + '" data-i="' + i + '">';
         html += '<img src="' + thumbURL(name) + '" id="img-' + i + '" alt="' + name + '" loading="lazy">';

@@ -156,6 +156,12 @@ class BuildQueue {
         } finally {
           this._bumpProgress(galleryAbs, p => { p.inProgress--; });
           this.inFlight.delete(k);
+          // When the folder's queue drains and any builds occurred, (re)build the sprite
+          // atlas. Fire-and-forget; deduped per folder so concurrent triggers don't race.
+          const after = this.progress.get(galleryAbs);
+          if (after && after.pending === 0 && after.inProgress === 0 && after.total > 0) {
+            maybeBuildSprite(galleryAbs);
+          }
         }
       }
     } finally { this.workers--; }
@@ -376,6 +382,31 @@ async function ensureBuilt(folderAbs, filename) {
 }
 
 
+
+// Read JPEG width/height by parsing the SOF marker. Avoids spawning a subprocess per
+// thumbnail to discover its dims (which we need at sprite-build time for variable-width
+// cell layout).
+function readJpegDims(absPath) {
+  let buf;
+  try { buf = fs.readFileSync(absPath); } catch { return null; }
+  let i = 2;
+  while (i < buf.length) {
+    if (buf[i] !== 0xFF) return null;
+    while (buf[i] === 0xFF) i++;
+    const marker = buf[i++];
+    if (marker === 0xD8 || marker === 0xD9) continue;
+    const sof = (marker >= 0xC0 && marker <= 0xCF) && marker !== 0xC4 && marker !== 0xC8 && marker !== 0xCC;
+    if (sof) {
+      const h = buf.readUInt16BE(i + 3);
+      const w = buf.readUInt16BE(i + 5);
+      return { w, h };
+    }
+    const len = buf.readUInt16BE(i);
+    i += len;
+  }
+  return null;
+}
+
 // ---------- sprite atlas ----------
 async function readSpriteMeta(galleryAbs) {
   try {
@@ -398,22 +429,30 @@ async function buildSpriteForFolder(galleryAbs) {
   const { images } = await listFolder(galleryAbs);
   if (images.length === 0) return null;
   const thumbDir = path.join(galleryAbs, 'thumbcache');
-  // require all individual thumbs to exist before we attempt a sprite. If any are missing,
-  // bail; the queue will trigger us again once they're built.
+  // require every thumb to exist; bail (the queue will retry) if any are missing.
   for (const f of images) {
     if (!fs.existsSync(path.join(thumbDir, f + '.resized.jpg'))) return null;
   }
-  await fsp.mkdir(thumbDir, { recursive: true });
 
-  // We hardlink each thumb into a private temp dir under sequential names so vips arrayjoin
-  // (which parses its input list as space-separated paths) works regardless of original
-  // filenames. Hardlinks are free on the same filesystem.
-  const numChunks = Math.ceil(images.length / SPRITE_CAPACITY);
-  const sprites = [];
-  const imageMap = {};
+  // Each thumb is fixed-height (THUMB_CELL px) but variable-width — read each one's
+  // actual width so the client can slice the atlas at the correct column boundary.
+  // Cell height is uniform (THUMB_CELL); cell width is the widest thumb in the gallery,
+  // capped to a sane upper bound so a single panorama doesn't bloat the atlas.
+  const SPRITE_CELL_W_MAX = parseInt(process.env.SPRITE_CELL_W_MAX || '600', 10);
+  const widths = images.map(f => {
+    const d = readJpegDims(path.join(thumbDir, f + '.resized.jpg'));
+    return d ? d.w : THUMB_CELL;
+  });
+  const cellW = Math.min(SPRITE_CELL_W_MAX, Math.max(THUMB_CELL, ...widths));
+  const cellH = THUMB_CELL;
+
   const stagingDir = path.join(thumbDir, '_sprite_staging');
   await fsp.rm(stagingDir, { recursive: true, force: true });
   await fsp.mkdir(stagingDir, { recursive: true });
+
+  const numChunks = Math.ceil(images.length / SPRITE_CAPACITY);
+  const sprites = [];
+  const imageMap = {};
 
   try {
     for (let c = 0; c < numChunks; c++) {
@@ -428,14 +467,18 @@ async function buildSpriteForFolder(galleryAbs) {
       const spriteFile = `sprite-${c}.jpg`;
       const spriteAbs = path.join(thumbDir, spriteFile);
       const tmp = spriteAbs + '.__tmp.jpg';
-      // vips arrayjoin: first arg is space-separated list of inputs, second is output, then options.
-      // Specifying [Q=…] on the output path bakes the JPEG options.
+      // vips arrayjoin: hspacing/vspacing letterbox each input into a uniform cell of that
+      // size, top-left aligned, padded with --background. So a 320x200 thumb in a 600x200
+      // cell becomes 320 wide of image + 280 wide of black padding to its right — and the
+      // CSS slice on the client only reveals the leftmost \`actualW\` pixels.
       await new Promise((resolve, reject) => {
         const proc = spawn('vips', [
           'arrayjoin',
           inputPaths.join(' '),
           `${tmp}[Q=80,strip,optimize_coding,interlace]`,
           '--across', String(SPRITE_ACROSS),
+          '--hspacing', String(cellW),
+          '--vspacing', String(cellH),
           '--background', '0 0 0',
         ]);
         let err = '';
@@ -447,18 +490,22 @@ async function buildSpriteForFolder(galleryAbs) {
         });
       });
       sprites.push({ file: spriteFile, count: chunk.length });
+      const baseOffset = c * SPRITE_CAPACITY;
       chunk.forEach((name, i) => {
-        imageMap[name] = { sprite: c, row: Math.floor(i / SPRITE_ACROSS), col: i % SPRITE_ACROSS };
+        imageMap[name] = {
+          sprite: c,
+          row: Math.floor(i / SPRITE_ACROSS),
+          col: i % SPRITE_ACROSS,
+          w: Math.min(widths[baseOffset + i], cellW),
+        };
       });
     }
   } finally {
     await fsp.rm(stagingDir, { recursive: true, force: true });
   }
 
-  // Write _sprite.json last so readers either see no sprite metadata at all (and fall back
-  // to per-thumb URLs) or see a fully-consistent metadata pointing at completed sprite files.
   const meta = {
-    cell: THUMB_CELL,
+    cellW, cellH,
     across: SPRITE_ACROSS,
     capacity: SPRITE_CAPACITY,
     sprites,
@@ -470,7 +517,7 @@ async function buildSpriteForFolder(galleryAbs) {
   await fsp.writeFile(metaPath + '.tmp', JSON.stringify(meta));
   await fsp.rename(metaPath + '.tmp', metaPath);
 
-  // Garbage-collect old sprite-N.jpg files no longer referenced.
+  // GC old sprite files no longer referenced.
   const referenced = new Set(sprites.map(s => s.file));
   for (const e of await fsp.readdir(thumbDir)) {
     if (/^sprite-\d+\.jpg$/.test(e) && !referenced.has(e)) {
@@ -1003,9 +1050,8 @@ async function handle(req, res) {
 
   // Render gallery page
   const { folders, images, sizes } = await listFolder(abs, { withSizes: true });
-  // Sprite atlas disabled: required cover-cropped (square) thumbs which the user
-  // prefers not to look at. Per-thumb rendering with HTTP/2 is fast enough.
-  let spriteMeta = null;
+  let spriteMeta = await readSpriteMeta(abs);
+  if (!spriteIsCurrent(spriteMeta, images)) spriteMeta = null;
   const html = galleryHTML({
     urlPath: pathname,
     folders,

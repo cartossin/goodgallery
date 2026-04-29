@@ -183,3 +183,13 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   #prevnext button { min-width: 88px; }
   #photospot img { max-height: 78vh; }
 }
+
+/* Variable-width sprite thumbs (CSS-sliced from a single atlas JPEG) */
+#thumbs .sprite-thumb {
+  border-radius: 2px;
+  background-color: var(--thumb-bg);
+  background-repeat: no-repeat;
+  margin: 1px;
+  transition: opacity .12s, transform .12s;
+}
+#thumbs .sprite-thumb:hover { opacity: 0.85; transform: scale(1.04); }
