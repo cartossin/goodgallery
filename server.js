@@ -502,6 +502,7 @@ async function buildSpriteForFolder(galleryAbs) {
       // cell becomes 320 wide of image + 280 wide of black padding to its right — and the
       // CSS slice on the client only reveals the leftmost \`actualW\` pixels.
       await new Promise((resolve, reject) => {
+        console.log(`[sprite] building ${spriteFile}: ${chunk.length} thumbs, cell ${cellW}x${cellH}`);
         const proc = spawn('vips', [
           'arrayjoin',
           inputPaths.join(' '),
@@ -515,6 +516,10 @@ async function buildSpriteForFolder(galleryAbs) {
         proc.stderr.on('data', d => { err += d; });
         proc.on('error', reject);
         proc.on('close', code => {
+          const tmpExists = fs.existsSync(tmp);
+          if (code !== 0 || err.trim() || !tmpExists) {
+            console.warn(`[sprite] vips arrayjoin: code=${code}, tmpExists=${tmpExists}, stderr=${err.trim() || '(empty)'}`);
+          }
           if (code !== 0) { fs.promises.unlink(tmp).catch(()=>{}); reject(new Error('arrayjoin failed: ' + err.trim())); return; }
           fs.promises.rename(tmp, spriteAbs).then(resolve, reject);
         });
@@ -893,7 +898,7 @@ function galleryHTML({ urlPath, folders, images, spriteMeta, isAdminFlag, hasPas
       acc += encodeURIComponent(p) + '/';
       out.push(`<a href="${hxEscape(acc)}">${hxEscape(p)}</a>`);
     }
-    return out.join(' / ');
+    return out.join('');
   })();
 
   const folderCards = folders.map(name => {

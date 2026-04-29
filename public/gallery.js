@@ -175,7 +175,7 @@
     for (var i = 1; i <= lastimagevalue; i++) {
       if (count === 0) {
         html = '';
-        if (lastpagevalue > 1) html += '<div style="text-align:center;color:#888;font-size:12px;padding:4px">Page ' + page + ' of ' + lastpagevalue + '</div>';
+        if (lastpagevalue > 1) html += '<div style="flex-basis:100%;text-align:center;color:#888;font-size:12px;padding:4px">Page ' + page + ' of ' + lastpagevalue + '</div>';
       }
       count++;
       var name = images[i];
