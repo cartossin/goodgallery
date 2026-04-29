@@ -308,10 +308,65 @@ document.getElementById('clearCacheBtn').addEventListener('click', async () => {
   var r = await fetch(cwdPath + '?clearcache=1', { method: 'POST', headers: authHeaders() });
   log(await r.text());
 });
-document.getElementById('exploreTrashBtn').addEventListener('click', async () => {
+document.getElementById('exploreTrashBtn').addEventListener('click', exploreTrash);
+
+async function exploreTrash() {
+  var trashEl = document.getElementById('trashPanel');
+  if (!trashEl) {
+    trashEl = document.createElement('div');
+    trashEl.className = 'panel';
+    trashEl.id = 'trashPanel';
+    document.getElementById('adminMain').appendChild(trashEl);
+  }
+  trashEl.innerHTML = '<strong>Trash <small style="color:#888">(' + cwdPath + ')</small></strong><div id="trashList" style="margin-top:8px"><small>Loading…</small></div>';
+
   var r = await fetch(cwdPath + '?exploretrash=1', { headers: authHeaders() });
-  log(await r.text());
-});
+  var txt = await r.text();
+  var data = null;
+  try { data = JSON.parse(txt); } catch (_) {}
+
+  var listEl = document.getElementById('trashList');
+  if (!data || !data.files || !data.files.length) {
+    listEl.innerHTML = '<small>Trash is empty.</small>';
+    return;
+  }
+  var rows = data.files.map(function (f) {
+    return '<li><span>' + escapeHtml(f) + '</span>' +
+           '<span><button data-restore="' + escapeHtml(f) + '">Restore</button> ' +
+           '<button data-delete="' + escapeHtml(f) + '">Delete</button></span></li>';
+  }).join('');
+  listEl.innerHTML = '<ul class="files">' + rows + '</ul>' +
+    '<div class="row" style="margin-top:8px">' +
+    '<button id="restoreAllBtn">Restore all</button>' +
+    '<button id="emptyTrashBtn" style="margin-left:auto">Empty trash</button></div>';
+
+  listEl.querySelectorAll('button[data-restore]').forEach(b => b.addEventListener('click', async () => {
+    var name = b.getAttribute('data-restore');
+    var rr = await fetch(cwdPath + '?restorefile=' + encodeURIComponent(name), { method: 'POST', headers: authHeaders() });
+    log(await rr.text());
+    exploreTrash();
+    loadFolder();
+  }));
+  listEl.querySelectorAll('button[data-delete]').forEach(b => b.addEventListener('click', async () => {
+    var name = b.getAttribute('data-delete');
+    if (!confirm('Permanently delete ' + name + '? This cannot be undone.')) return;
+    var rr = await fetch(cwdPath + '?deletefile=' + encodeURIComponent(name), { method: 'POST', headers: authHeaders() });
+    log(await rr.text());
+    exploreTrash();
+  }));
+  document.getElementById('restoreAllBtn').addEventListener('click', async () => {
+    var rr = await fetch(cwdPath + '?restoreall=1', { method: 'POST', headers: authHeaders() });
+    log(await rr.text());
+    exploreTrash();
+    loadFolder();
+  });
+  document.getElementById('emptyTrashBtn').addEventListener('click', async () => {
+    if (!confirm('Permanently delete ALL trashed files in ' + cwdPath + '? This cannot be undone.')) return;
+    var rr = await fetch(cwdPath + '?emptytrash=1', { method: 'POST', headers: authHeaders() });
+    log(await rr.text());
+    exploreTrash();
+  });
+}
 
 // ---------- upload ----------
 var drop = document.getElementById('drop');
