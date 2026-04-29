@@ -66,7 +66,8 @@ fs.mkdirSync(STATE_DIR, { recursive: true });
 // Recognize tmp files left behind by killed write paths. Sweep these on startup and on
 // maintenance ops. Keep this function in one place so every writer pays the same tax.
 function isOrphanTmp(name) {
-  return name.endsWith('.__tmp.jpg') || name.endsWith('.tmp');
+  // Any '.__tmp.<format>' (jpg, v, etc.) or legacy '.tmp' are sweep-eligible orphans.
+  return /\.__tmp\.[^/]+$/.test(name) || name.endsWith('.tmp');
 }
 
 async function sweepOrphanTmps(rootDir) {
