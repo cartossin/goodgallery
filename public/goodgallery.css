@@ -57,9 +57,10 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 #breadcrumb {
   flex: 1;
   font-size: 14px;
-  overflow-x: auto;
   white-space: nowrap;
-  scrollbar-width: thin;
+  text-overflow: ellipsis;
+  overflow: hidden;        /* no scrollbar gutter, no white sliver next to gear */
+  min-width: 0;            /* let flex item actually shrink */
 }
 #breadcrumb a { padding: 2px 4px; }
 #breadcrumb a:not(:last-child)::after { content: ' / '; padding: 0 6px; color: var(--muted); }
