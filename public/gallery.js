@@ -16,11 +16,7 @@
 
   var previewimages = [null];
   var thumbs        = [null];
-  var thumbpage     = [];
-
   var inum = 1;
-  var pnum = 1;
-  var lastpagevalue = 1;
   var isfullres = 0;
   var keyslocked = 0;
   var hashmirror = '';
@@ -108,15 +104,13 @@
 
   function nextimage()    { inum = nextIndex(inum); startimage(); }
   function previousimage(){ inum = prevIndex(inum); startimage(); }
-  function nextpage()     { pnum = pnum >= lastpagevalue ? 1 : pnum + 1; displaythumbs(); }
-  function previouspage() { pnum = pnum <= 1 ? lastpagevalue : pnum - 1; displaythumbs(); }
 
-  function leftbutton() {
-    if ((decodeURIComponent(location.hash.slice(1)) || '').charAt(0) === ':') previouspage(); else previousimage();
+  function isThumbView() {
+    var raw = decodeURIComponent(location.hash.slice(1) || '');
+    return !raw || raw.charAt(0) === ':';
   }
-  function rightbutton() {
-    if ((decodeURIComponent(location.hash.slice(1)) || '').charAt(0) === ':') nextpage(); else nextimage();
-  }
+  function leftbutton()  { if (isThumbView()) return; previousimage(); }
+  function rightbutton() { if (isThumbView()) return; nextimage(); }
 
   // ---------- keys ----------
   function unlockkeys() { keyslocked = 0; }
@@ -136,7 +130,6 @@
     setHTML('thumbs', '');
     isfullres = 0;
     var pd = $('photodiv'); if (pd) pd.classList.remove('fullres');
-    pnum = Math.ceil(inum / window.thumbsperpage);
     var name = images[inum];
     hashmirror = encodeURIComponent(name);
     location.hash = hashmirror;
@@ -166,75 +159,156 @@
 
   function preview(i) { inum = i; startimage(); }
 
-  function buildthumbpages() {
-    lastpagevalue = Math.max(1, Math.ceil(lastimagevalue / window.thumbsperpage));
-    var page = 1, count = 0;
-    thumbpage = [];
-    if (lastimagevalue === 0) return;
-    var html = '';
+  // ---- justified-rows layout + zoom slider ---------------------------------
+  // No pagination. The zoom slider drives a single value (target row height in CSS px).
+  // At slider=0, the height is computed so all thumbs fit in the viewport with no
+  // scroll. At slider=100, height is the atlas height (200 px). In between we
+  // interpolate geometrically (one slider notch ~doubles the size of the thumbs).
+  //
+  // For target row height H: w_disp = loc.w * H / cellH; greedy-pack into rows; each
+  // row except the last is justified by scaling uniformly to fill the viewport width.
+  var rafPending = false;
+  function scheduleRender() {
+    if (rafPending) return;
+    rafPending = true;
+    requestAnimationFrame(function () { rafPending = false; renderGallery(); });
+  }
+
+  function chromeHeight() {
+    var top = document.getElementById('topbar');
+    var foot = document.getElementById('bottomlink');
+    return (top ? top.offsetHeight : 50) + (foot ? foot.offsetHeight : 50) + 24;
+  }
+
+  function avgThumbWidth() {
+    if (!window.spriteMeta || !spriteMeta.imageMap) return 200;
+    var sum = 0, n = 0;
+    for (var k in spriteMeta.imageMap) { sum += spriteMeta.imageMap[k].w; n++; }
+    return n ? sum / n : 200;
+  }
+
+  function fitAllHeight() {
+    if (!window.spriteMeta || lastimagevalue < 1) return 100;
+    var W = (document.getElementById('thumbs') || document.body).clientWidth || window.innerWidth;
+    var H = Math.max(120, window.innerHeight - chromeHeight());
+    var aspect = avgThumbWidth() / spriteMeta.cellH;
+    // total layout height ≈ N * h^2 * aspect / W; solve for h s.t. height = H
+    var h = Math.sqrt((H * W) / (lastimagevalue * aspect));
+    return Math.max(4, Math.min(spriteMeta.cellH, h));
+  }
+
+  var ZOOM_KEY_PREFIX = 'ggZoom:';
+  function getZoom() {
+    var saved = localStorage.getItem(ZOOM_KEY_PREFIX + folderURL);
+    var t = saved !== null ? parseInt(saved, 10) : 50;
+    if (isNaN(t) || t < 0) t = 0;
+    if (t > 100) t = 100;
+    return t;
+  }
+  function setZoom(t) { localStorage.setItem(ZOOM_KEY_PREFIX + folderURL, String(t)); }
+
+  function targetRowHeight(t) {
+    if (!window.spriteMeta) return 100;
+    var Hmin = fitAllHeight();
+    var Hmax = spriteMeta.cellH;
+    if (Hmax <= Hmin) return Hmax;
+    return Hmin * Math.pow(Hmax / Hmin, t / 100);
+  }
+
+  function layoutRows(H) {
+    if (!window.spriteMeta) return [];
+    var W = (document.getElementById('thumbs') || document.body).clientWidth || window.innerWidth;
+    var rows = [];
+    var current = [];
+    var natRowW = 0;
     for (var i = 1; i <= lastimagevalue; i++) {
-      if (count === 0) {
-        html = '';
-        if (lastpagevalue > 1) html += '<div style="flex-basis:100%;text-align:center;color:#888;font-size:12px;padding:4px">Page ' + page + ' of ' + lastpagevalue + '</div>';
-      }
-      count++;
       var name = images[i];
-      // Sprite path: each thumb is a fixed-height variable-width slice of an atlas JPEG.
-      // The sprite stores cells of cellW x cellH; the actual thumb is left-aligned in its
-      // cell, so we slice to width=loc.w (its real width) — black padding to the right is
-      // never revealed. One atlas request renders many thumbs.
-      if (window.spriteMeta && spriteMeta.imageMap && spriteMeta.imageMap[name]) {
+      var loc = spriteMeta.imageMap[name];
+      var natW = (loc ? loc.w : spriteMeta.cellH) * H / spriteMeta.cellH;
+      if (natRowW + natW > W && current.length > 0) {
+        rows.push(finalizeRow(current, natRowW, H, W, false));
+        current = []; natRowW = 0;
+      }
+      current.push({ index: i, natW: natW });
+      natRowW += natW;
+    }
+    if (current.length) rows.push(finalizeRow(current, natRowW, H, W, true));
+    return rows;
+  }
+
+  function finalizeRow(items, natRowW, H, W, isLast) {
+    var rowScale = isLast ? 1 : Math.min(1.5, W / Math.max(1, natRowW));
+    return {
+      items: items.map(function (it) {
+        return { index: it.index, w: Math.max(1, Math.round(it.natW * rowScale)), h: Math.max(1, Math.round(H * rowScale)) };
+      }),
+      height: H * rowScale,
+    };
+  }
+
+  function renderGallery() {
+    var thumbsEl = $('thumbs');
+    if (!thumbsEl) return;
+    if (lastimagevalue < 1) {
+      thumbsEl.innerHTML = '<div style="padding:24px;text-align:center;color:#888">' +
+        (window.isadmin ? 'No images yet — upload some via the admin panel.' : 'No images.') +
+        '</div>';
+      return;
+    }
+    if (!window.spriteMeta) {
+      thumbsEl.innerHTML = '<div style="padding:32px;text-align:center;color:#888">' +
+        '<div style="font-size:16px;margin-bottom:8px">Generating thumbnails…</div>' +
+        '<div style="font-size:13px">' + lastimagevalue + ' images in this folder</div>' +
+        '</div>';
+      pollBuildStatus({ reloadOnComplete: true });
+      return;
+    }
+    var H = targetRowHeight(getZoom());
+    var rows = layoutRows(H);
+    var html = '';
+    for (var r = 0; r < rows.length; r++) {
+      html += '<div class="row">';
+      for (var j = 0; j < rows[r].items.length; j++) {
+        var it = rows[r].items[j];
+        var name = images[it.index];
         var loc = spriteMeta.imageMap[name];
         var spriteFile = spriteMeta.sprites[loc.sprite].file;
         var spriteURL = folderURL + 'thumbcache/' + spriteFile;
-        var cellW = spriteMeta.cellW, cellH = spriteMeta.cellH;
-        // Display at half cell-height — physical thumbs are 2x retina-friendly.
-        var dispH = Math.round(cellH / 2);
-        var scale = dispH / cellH;
-        var dispW = Math.round(loc.w * scale);
-        var bgX = -loc.col * cellW * scale;
-        var bgY = -loc.row * cellH * scale;
-        var bgSizeW = spriteMeta.across * cellW * scale;
-        html += '<a class="sprite-thumb" href="#' + encodeURIComponent(name) + '" data-i="' + i + '" title="' + name + '" ' +
-          'style="display:inline-block;width:' + dispW + 'px;height:' + dispH + 'px;' +
+        var scale = it.h / spriteMeta.cellH;
+        var bgX = -loc.col * spriteMeta.cellW * scale;
+        var bgY = -loc.row * spriteMeta.cellH * scale;
+        var bgSizeW = spriteMeta.across * spriteMeta.cellW * scale;
+        html += '<a class="sprite-thumb" href="#' + encodeURIComponent(name) + '" data-i="' + it.index + '" title="' + name + '" ' +
+          'style="display:inline-block;width:' + it.w + 'px;height:' + it.h + 'px;' +
           'background-image:url(' + spriteURL + ');' +
           'background-position:' + bgX + 'px ' + bgY + 'px;' +
           'background-size:' + bgSizeW + 'px auto;"></a>';
-      } else {
-        html += '<a href="#' + encodeURIComponent(name) + '" data-i="' + i + '">';
-        html += '<img src="' + thumbURL(name) + '" id="img-' + i + '" alt="' + name + '" loading="lazy">';
-        html += '</a>';
       }
-      if (count === window.thumbsperpage || i === lastimagevalue) { thumbpage[page] = html; page++; count = 0; }
+      html += '</div>';
     }
+    thumbsEl.classList.add('layout');
+    thumbsEl.innerHTML = html;
   }
+
+  function buildthumbpages() { /* legacy stub — layout is now incremental via renderGallery */ }
 
   function displaythumbs() {
     if (isfullres) togglefullres();
     showAdminBar();
-    hashmirror = ':' + pnum;
-    location.hash = hashmirror;
+    if (location.hash) location.hash = '';
+    hashmirror = '';
     setHTML('photospot', '');
     setHTML('preimages', '');
     setText('counter', '');
-    var place = $('thumbs');
-    if (lastimagevalue < 1) {
-      place.innerHTML = '<div style="padding:24px;text-align:center;color:#888">' +
-        (window.isadmin ? 'No images yet — upload some via the admin panel.' : 'No images.') +
-        '</div>';
-    } else {
-      place.innerHTML = thumbpage[pnum] || thumbpage[1];
-    }
+    renderGallery();
   }
 
   // ---------- hash routing ----------
   function refreshfromhash() {
     hashmirror = location.hash.slice(1);
     var raw = decodeURIComponent(hashmirror || '');
-    if (raw.charAt(0) === ':') {
-      var n = parseInt(raw.slice(1), 10);
-      pnum = (n >= 1 && n <= lastpagevalue) ? n : 1;
-      displaythumbs();
+    if (!raw || raw.charAt(0) === ':') {
+      displaythumbs();  // empty hash or legacy ':N' both = thumb view
     } else {
       for (var i = 1; i <= lastimagevalue; i++) {
         if (raw === images[i]) { inum = i; break; }
@@ -309,6 +383,16 @@
   function ggEmptyTrash()   { if (!confirm('Permanently delete ALL trashed files?')) return; trashApi('empty').then(ggExploreTrash); }
 
   // ---------- touch swipe ----------
+  function setupZoomSlider() {
+    var sl = $('zoomSlider');
+    if (!sl) return;
+    sl.value = String(getZoom());
+    sl.addEventListener('input', function () {
+      setZoom(parseInt(sl.value, 10));
+      scheduleRender();
+    });
+  }
+
   function setupTouch() {
     var startX = 0, startY = 0, startT = 0;
     var photodiv = $('photodiv');
@@ -346,21 +430,19 @@
 
     setupTouch();
     setupThumbClicks();
+    setupZoomSlider();
 
-    // populate preview/thumb arrays (preserve names from 2014 client for any code that references them)
+    // populate preview-image array (used by image-viewer prev/next preload)
     for (var i = 1; i <= lastimagevalue; i++) {
       previewimages[i] = previewSrc(i);
-      thumbs[i]        = thumbURL(images[i]);
     }
-    buildthumbpages();
+    window.addEventListener('resize', scheduleRender);
 
-    // initial route from hash
+    // initial route: hash empty or ':N' → thumb view; #filename → image view
     var raw = decodeURIComponent(location.hash.slice(1) || '');
-    if (raw.charAt(0) === ':') {
-      var n = parseInt(raw.slice(1), 10);
-      pnum = (n >= 1 && n <= lastpagevalue) ? n : 1;
+    if (!raw || raw.charAt(0) === ':') {
       displaythumbs();
-    } else if (raw && lastimagevalue > 0) {
+    } else if (lastimagevalue > 0) {
       var found = 0;
       for (var j = 1; j <= lastimagevalue; j++) if (raw === images[j]) { inum = j; found = 1; break; }
       if (found) startimage(); else displaythumbs();

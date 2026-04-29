@@ -1091,6 +1091,9 @@ function galleryHTML({ urlPath, folders, images, spriteMeta, isAdminFlag, hasPas
 
 <header id="topbar">
   <nav id="breadcrumb">${breadcrumbs}</nav>
+  <span id="zoomBox" title="Thumbnail size">
+    <input id="zoomSlider" type="range" min="0" max="100" />
+  </span>
   <a id="adminlink" href="/_admin/" title="Admin">⚙</a>
 </header>
 
@@ -1123,7 +1126,6 @@ ${folders.length ? `<section id="folders">${folderCards}</section>` : ''}
 <script>
 ${imagesJsArray}
 var lastimagevalue   = ${lastImageValue};
-var thumbsperpage    = ${THUMBS_PER_PAGE};
 var xhrpush          = 4;
 var isadmin          = ${isAdminFlag ? 1 : 0};
 var hasPasskey       = ${hasPasskey ? 'true' : 'false'};

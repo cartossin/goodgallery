@@ -193,3 +193,50 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   transition: opacity .12s, transform .12s;
 }
 #thumbs .sprite-thumb:hover { opacity: 0.85; transform: scale(1.04); }
+
+/* Zoom slider in the topbar */
+#zoomBox { display: flex; align-items: center; gap: 6px; }
+#zoomSlider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 140px;
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  outline: none;
+}
+#zoomSlider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px; height: 14px;
+  background: var(--fg);
+  border-radius: 50%;
+  cursor: pointer;
+}
+#zoomSlider::-moz-range-thumb {
+  width: 14px; height: 14px;
+  background: var(--fg);
+  border-radius: 50%;
+  cursor: pointer;
+  border: none;
+}
+@media (max-width: 600px) {
+  #zoomSlider { width: 90px; }
+}
+
+/* Justified rows layout */
+#thumbs.layout {
+  display: block;        /* override flex from old layout */
+  padding: 4px 0;
+  text-align: left;
+}
+#thumbs .row {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 2px;
+  margin-bottom: 2px;
+}
+#thumbs .row > .sprite-thumb {
+  margin: 0;
+  flex-shrink: 0;
+}
