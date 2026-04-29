@@ -349,15 +349,21 @@ function vipsThumb(srcAbs, dstAbs, dim, quality) {
 // Sprite atlas was tried but disabled because uniform-cell tiling required cover-cropping
 // every thumb to a square, which loses information at the edges of every image.
 // HTTP/2 multiplexing + 50/page pagination makes per-thumb requests fast enough.
-function vipsHeightThumb(srcAbs, dstAbs, height, quality) {
+// Lossless .v intermediate (libvips raw native format, gd2 analog). Resizing is the
+// expensive operation — we want each per-image resize to be its own atomic, idempotent,
+// LOSSLESS unit. Sprite assembly memmaps these with ~zero decode cost. Note: the
+// op-style 'vips thumbnail' is reliable; 'vipsthumbnail --output X.v' silently no-ops.
+function vipsHeightThumbV(srcAbs, dstAbs, height) {
   return new Promise((resolve, reject) => {
-    const tmp = dstAbs + '.__tmp.jpg';
+    const tmp = dstAbs + '.__tmp.v';
     const args = [
-      srcAbs,
-      '--size', `99999x${height}>`,  // cap height, no effective width cap; only shrink
-      '--output', `${tmp}[Q=${quality},strip,optimize_coding,interlace]`,
+      'thumbnail', srcAbs, tmp, '99999',
+      '--height', String(height),
+      '--size', 'down',
     ];
-    runVips('vipsthumbnail', args, tmp, dstAbs).then(resolve, reject);
+    runStep('vips', args, tmp).then(() =>
+      fs.promises.rename(tmp, dstAbs).then(resolve, reject)
+    ).catch(reject);
   });
 }
 
@@ -400,9 +406,10 @@ async function ensureBuilt(folderAbs, filename) {
   try { st = await fsp.stat(src); } catch { throw new Error('missing original'); }
   const thumbDir = path.join(folderAbs, 'thumbcache');
   await fsp.mkdir(thumbDir, { recursive: true });
-  const thumbOut = path.join(thumbDir, filename + '.resized.jpg');
+  // Lossless .v intermediate (gd2 analog) — sprite atlas is the only lossy step.
+  const thumbOut = path.join(thumbDir, filename + '.resized.v');
   let did = 0;
-  if (!fs.existsSync(thumbOut)) { await vipsHeightThumb(src, thumbOut, THUMB_CELL, THUMB_QUALITY); did++; }
+  if (!fs.existsSync(thumbOut)) { await vipsHeightThumbV(src, thumbOut, THUMB_CELL); did++; }
   // Preview only for large originals — for small ones the client uses the original directly.
   if (st.size >= PREVIEW_SIZE_THRESHOLD) {
     const previewDir = path.join(folderAbs, 'previewcache');
@@ -414,6 +421,23 @@ async function ensureBuilt(folderAbs, filename) {
 }
 
 
+
+// Parse libvips .v file header. Layout (little-endian after a 4-byte magic):
+//   offset 4: uint32 width, offset 8: uint32 height
+function readVipsHeader(absPath) {
+  let fd;
+  try {
+    fd = fs.openSync(absPath, 'r');
+    const buf = Buffer.alloc(16);
+    const n = fs.readSync(fd, buf, 0, 16, 0);
+    if (n < 16) return null;
+    const w = buf.readUInt32LE(4);
+    const h = buf.readUInt32LE(8);
+    if (w <= 0 || h <= 0 || w > 100000 || h > 100000) return null;
+    return { w, h };
+  } catch { return null; }
+  finally { if (fd !== undefined) try { fs.closeSync(fd); } catch {} }
+}
 
 // Read JPEG width/height by parsing the SOF marker. Avoids spawning a subprocess per
 // thumbnail to discover its dims (which we need at sprite-build time for variable-width
@@ -472,7 +496,7 @@ async function buildSpriteForFolder(galleryAbs) {
   const thumbDir = path.join(galleryAbs, 'thumbcache');
   // require every thumb to exist; bail (the queue will retry) if any are missing.
   for (const f of images) {
-    if (!fs.existsSync(path.join(thumbDir, f + '.resized.jpg'))) return null;
+    if (!fs.existsSync(path.join(thumbDir, f + '.resized.v'))) return null;
   }
 
   // Each thumb is fixed-height (THUMB_CELL px) but variable-width — read each one's
@@ -481,7 +505,7 @@ async function buildSpriteForFolder(galleryAbs) {
   // capped to a sane upper bound so a single panorama doesn't bloat the atlas.
   const SPRITE_CELL_W_MAX = parseInt(process.env.SPRITE_CELL_W_MAX || '600', 10);
   const widths = images.map(f => {
-    const d = readJpegDims(path.join(thumbDir, f + '.resized.jpg'));
+    const d = readVipsHeader(path.join(thumbDir, f + '.resized.v'));
     return d ? d.w : THUMB_CELL;
   });
   const cellW = Math.min(SPRITE_CELL_W_MAX, Math.max(THUMB_CELL, ...widths));
@@ -508,9 +532,9 @@ async function buildSpriteForFolder(galleryAbs) {
       const chunk = images.slice(c * cellsPerSprite, (c + 1) * cellsPerSprite);
       const inputPaths = [];
       for (let i = 0; i < chunk.length; i++) {
-        const link = path.join(stagingDir, `${c}_${i}.jpg`);
+        const link = path.join(stagingDir, `${c}_${i}.v`);
         try { await fsp.unlink(link); } catch {}
-        await fsp.link(path.join(thumbDir, chunk[i] + '.resized.jpg'), link);
+        await fsp.link(path.join(thumbDir, chunk[i] + '.resized.v'), link);
         inputPaths.push(link);
       }
       const spriteFile = `sprite-${c}.jpg`;
@@ -1034,21 +1058,18 @@ async function handle(req, res) {
     const grandparent = segs.slice(0, -2);
 
     // 1) cache file: /<gallery>/.../{thumbcache,previewcache}/<file>.resized.jpg
-    if ((dirOfFile === 'thumbcache' || dirOfFile === 'previewcache') && fileName.endsWith('.resized.jpg')) {
+    if (dirOfFile === 'previewcache' && fileName.endsWith('.resized.jpg')) {
       const galleryAbs = resolveGallery(grandparent);
       if (!galleryAbs) return notFound(res);
-      const cacheFile = path.join(galleryAbs, dirOfFile, fileName);
+      const cacheFile = path.join(galleryAbs, 'previewcache', fileName);
       const originalName = fileName.slice(0, -'.resized.jpg'.length);
       if (fs.existsSync(cacheFile)) return serveStaticFile(req, res, cacheFile);
-      // Miss: trigger build (idempotent; skips preview generation for files <500KB).
+      // Cache miss → trigger build (idempotent; skips preview gen for files <500KB).
       try { await ensureBuilt(galleryAbs, originalName); } catch {}
       if (fs.existsSync(cacheFile)) return serveStaticFile(req, res, cacheFile);
-      // For previewcache misses on small files, transparently serve the original.
-      // Browsers scale fine; downsampling tiny files in advance is wasted I/O.
-      if (dirOfFile === 'previewcache') {
-        const original = path.join(galleryAbs, originalName);
-        if (fs.existsSync(original)) return serveStaticFile(req, res, original);
-      }
+      // For small originals there's no preview; serve the original. Browsers scale fine.
+      const original = path.join(galleryAbs, originalName);
+      if (fs.existsSync(original)) return serveStaticFile(req, res, original);
       return notFound(res);
     }
     // sprite atlas files: /<gallery>/.../thumbcache/sprite-N.jpg
@@ -1090,7 +1111,7 @@ async function handle(req, res) {
 
   // gallery action queries (?build=, ?buildall=1, etc.) — POST or GET.
   const q = u.searchParams;
-  if (q.has('build')) return handleBuild(req, res, abs, q);
+  // ?build= retired (sprite-only architecture; no per-client thumb requests)
   if (q.get('buildall') === '1') return handleBuildAll(req, res, abs);
   if (q.has('clearcache'))  return adminAction(req, res, () => clearcache(abs));
   if (q.has('exploretrash')) return adminAction(req, res, () => exploretrash(abs));
@@ -1154,14 +1175,25 @@ async function handleBuildAll(req, res, abs) {
   // ?build-status for live progress instead of looping this endpoint.
   const { images } = await listFolder(abs);
   const queued = await buildQueue.enqueueFolder(abs);
+  // .v thumbnails and .resized.jpg previews stay as long as the original exists in the
+  // gallery OR in trash. Resize is the expensive op; we never throw the result away while
+  // the source is recoverable. Only after a hard-delete (or after the orphan sweep notices
+  // a file genuinely gone) do we reclaim the cache.
   const presence = new Set(images);
+  const trashDir = path.join(abs, 'ggTrash');
+  if (fs.existsSync(trashDir)) {
+    for (const f of fs.readdirSync(trashDir)) presence.add(f);
+  }
   for (const sub of ['thumbcache', 'previewcache']) {
     const dir = path.join(abs, sub);
     if (!fs.existsSync(dir)) continue;
     for (const f of fs.readdirSync(dir)) {
       if (isOrphanTmp(f)) { try { fs.unlinkSync(path.join(dir, f)); } catch {} continue; }
-      if (!f.endsWith('.resized.jpg')) continue;
-      const original = f.slice(0, -'.resized.jpg'.length);
+      // Recognize both intermediate (.resized.v) and preview (.resized.jpg) suffixes.
+      let original = null;
+      if (f.endsWith('.resized.v'))         original = f.slice(0, -'.resized.v'.length);
+      else if (f.endsWith('.resized.jpg'))  original = f.slice(0, -'.resized.jpg'.length);
+      if (!original) continue;
       if (!presence.has(original)) { try { fs.unlinkSync(path.join(dir, f)); } catch {} }
     }
   }
@@ -1190,11 +1222,8 @@ async function movetotrash(abs, filename) {
   const dst = path.join(trash, filename);
   if (fs.existsSync(dst)) throw new Error('file with same name already in trash');
   await fsp.rename(src, dst);
-  // also move cache files so they don't dangle
-  for (const sub of ['thumbcache', 'previewcache']) {
-    const cf = path.join(abs, sub, filename + '.resized.jpg');
-    try { await fsp.unlink(cf); } catch {}
-  }
+  // Intentionally KEEP the cached .v thumbnail (and preview JPEG, if any). Restore is
+  // then instant — no need to re-resize a recoverable original. Hard delete cleans them.
   return `${filename} moved to trash`;
 }
 async function exploretrash(abs) {
@@ -1217,6 +1246,11 @@ async function deletefile(abs, filename) {
   const src = path.join(abs, 'ggTrash', filename);
   if (!fs.existsSync(src)) throw new Error('not in trash');
   await fsp.unlink(src);
+  // Permanent delete: reclaim the cached intermediate + preview.
+  for (const cf of [
+    path.join(abs, 'thumbcache',   filename + '.resized.v'),
+    path.join(abs, 'previewcache', filename + '.resized.jpg'),
+  ]) { try { await fsp.unlink(cf); } catch {} }
   return `${filename} deleted`;
 }
 async function restoreall(abs) {
