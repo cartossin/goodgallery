@@ -61,6 +61,82 @@ const SUPPORTED_EXT = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.avif'
 // ---------- bootstrap ----------
 fs.mkdirSync(GALLERIES_ROOT, { recursive: true });
 fs.mkdirSync(STATE_DIR, { recursive: true });
+const TRASH_DIR = path.join(STATE_DIR, 'trash');
+fs.mkdirSync(TRASH_DIR, { recursive: true });
+
+// Map a gallery file path to its location inside the global trash root.
+//   /var/lib/goodgallery/galleries/wallpapers/sunset.jpg
+//      -> STATE_DIR/trash/wallpapers/sunset.jpg
+function trashSliceDir(galleryAbs) {
+  return path.join(TRASH_DIR, path.relative(GALLERIES_ROOT, galleryAbs));
+}
+function trashPathFor(galleryAbs, filename) {
+  return path.join(trashSliceDir(galleryAbs), filename);
+}
+
+// Walk the global trash and return [{name, relPath, size, trashedAt}, ...] for every file.
+async function listAllTrash() {
+  const out = [];
+  async function walk(absDir, relPrefix) {
+    let entries;
+    try { entries = await fsp.readdir(absDir, { withFileTypes: true }); }
+    catch { return; }
+    for (const e of entries) {
+      const full = path.join(absDir, e.name);
+      const rel = relPrefix ? relPrefix + '/' + e.name : e.name;
+      if (e.isDirectory()) await walk(full, rel);
+      else if (e.isFile()) {
+        let st; try { st = await fsp.stat(full); } catch { continue; }
+        out.push({ name: e.name, relPath: rel, size: st.size, trashedAt: st.mtimeMs });
+      }
+    }
+  }
+  await walk(TRASH_DIR, '');
+  out.sort((a, b) => b.trashedAt - a.trashedAt);
+  return out;
+}
+
+// Validate a relPath is safe (no '..', no leading '/', etc.) and resolves under TRASH_DIR.
+function safeTrashPath(relPath) {
+  if (!relPath || typeof relPath !== 'string') return null;
+  if (relPath.includes('\0')) return null;
+  const segs = relPath.split('/').filter(Boolean);
+  if (segs.some(s => s === '..' || s === '.' || s.startsWith('.'))) return null;
+  const abs = path.resolve(TRASH_DIR, ...segs);
+  if (!abs.startsWith(TRASH_DIR + path.sep) && abs !== TRASH_DIR) return null;
+  return abs;
+}
+
+// Migrate any legacy <gallery>/ggTrash/<file> contents into the global trash on startup.
+async function migrateLegacyTrash() {
+  let migrated = 0;
+  async function walk(dir) {
+    let entries;
+    try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (e.name.startsWith('.')) continue;
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        if (e.name === 'ggTrash') {
+          const galleryAbs = dir;
+          const newDir = trashSliceDir(galleryAbs);
+          await fsp.mkdir(newDir, { recursive: true });
+          for (const f of await fsp.readdir(full)) {
+            try {
+              await fsp.rename(path.join(full, f), path.join(newDir, f));
+              migrated++;
+            } catch {}
+          }
+          try { await fsp.rmdir(full); } catch {}
+        } else if (e.name !== 'thumbcache' && e.name !== 'previewcache' && e.name !== '_sprite_staging') {
+          await walk(full);
+        }
+      }
+    }
+  }
+  await walk(GALLERIES_ROOT);
+  if (migrated) console.log(`Migrated ${migrated} legacy ggTrash file(s) to global trash.`);
+}
 
 
 // Recognize tmp files left behind by killed write paths. Sweep these on startup and on
@@ -1080,6 +1156,7 @@ async function handle(req, res) {
   // --- API
   if (pathname.startsWith('/api/admin/')) return handleAdminAPI(req, res, pathname, method);
   if (pathname.startsWith('/api/upload/')) return handleUploadAPI(req, res, pathname, method);
+  if (pathname.startsWith('/api/trash')) return handleTrashAPI(req, res, pathname, method);
 
   // --- gallery view (any other path is treated as a folder under GALLERIES_ROOT)
   // Normalize: must end with /, otherwise 301-redirect (but only if it's a real directory)
@@ -1116,13 +1193,8 @@ async function handle(req, res) {
       return serveStaticFile(req, res, path.join(galleryAbs, 'thumbcache', fileName));
     }
 
-    // 2) trash file: /<gallery>/.../ggTrash/<file>
-    if (dirOfFile === 'ggTrash') {
-      if (!isAdmin(req)) return sendText(res, 403, 'admin only');
-      const galleryAbs = resolveGallery(grandparent);
-      if (!galleryAbs) return notFound(res);
-      return serveStaticFile(req, res, path.join(galleryAbs, 'ggTrash', fileName));
-    }
+    // (The legacy /<gallery>/.../ggTrash/<file> route is gone — trash lives in
+    //  STATE_DIR/trash now and is only accessible via the /api/trash/* endpoints.)
 
     // 3) anything else needs the parent to be a real (non-reserved) gallery folder
     const parentAbs = resolveGallery(segs.slice(0, -1));
@@ -1151,12 +1223,9 @@ async function handle(req, res) {
   // ?build= retired (sprite-only architecture; no per-client thumb requests)
   if (q.get('buildall') === '1') return handleBuildAll(req, res, abs);
   if (q.has('clearcache'))  return adminAction(req, res, () => clearcache(abs));
-  if (q.has('exploretrash')) return adminAction(req, res, () => exploretrash(abs));
   if (q.has('movetotrash')) return adminAction(req, res, () => movetotrash(abs, q.get('movetotrash')));
-  if (q.has('restorefile')) return adminAction(req, res, () => restorefile(abs, q.get('restorefile')));
-  if (q.has('deletefile'))  return adminAction(req, res, () => deletefile(abs, q.get('deletefile')));
-  if (q.has('restoreall'))  return adminAction(req, res, () => restoreall(abs));
-  if (q.has('emptytrash'))  return adminAction(req, res, () => emptytrash(abs));
+  // exploretrash/restorefile/deletefile/restoreall/emptytrash are now global, served
+  // out of /api/trash/* (single trash, see below). Old per-folder query routes removed.
   if (q.has('build-status')) {
     return sendJson(res, 200, buildQueue.progressFor(abs));
   }
@@ -1217,9 +1286,9 @@ async function handleBuildAll(req, res, abs) {
   // the source is recoverable. Only after a hard-delete (or after the orphan sweep notices
   // a file genuinely gone) do we reclaim the cache.
   const presence = new Set(images);
-  const trashDir = path.join(abs, 'ggTrash');
-  if (fs.existsSync(trashDir)) {
-    for (const f of fs.readdirSync(trashDir)) presence.add(f);
+  const tslice = trashSliceDir(abs);
+  if (fs.existsSync(tslice)) {
+    for (const f of fs.readdirSync(tslice)) presence.add(f);
   }
   for (const sub of ['thumbcache', 'previewcache']) {
     const dir = path.join(abs, sub);
@@ -1251,63 +1320,83 @@ async function clearcache(abs) {
   }
   return 'caches cleared';
 }
+// Global trash: STATE_DIR/trash/<rel-from-galleries-root>/<filename>. Same fs as the
+// galleries (both under /var/lib/goodgallery), so renames stay atomic. Restore puts the
+// file back at its original location and recreates the parent gallery folder if it has
+// since been removed. Cached .v thumbs and preview JPEGs persist while the file is in
+// trash, so restore is instant.
 async function movetotrash(abs, filename) {
   if (!filename || !isImage(filename)) throw new Error('bad filename');
-  const trash = path.join(abs, 'ggTrash');
-  await fsp.mkdir(trash, { recursive: true });
   const src = path.join(abs, filename);
-  const dst = path.join(trash, filename);
-  if (fs.existsSync(dst)) throw new Error('file with same name already in trash');
+  const dst = trashPathFor(abs, filename);
+  await fsp.mkdir(path.dirname(dst), { recursive: true });
+  if (fs.existsSync(dst)) {
+    // Collision: a file with the same name was already trashed from this folder. Append
+    // a timestamp suffix so we don't lose either.
+    const ext = path.extname(filename);
+    const base = filename.slice(0, -ext.length);
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const dst2 = path.join(path.dirname(dst), `${base}.trashed-${stamp}${ext}`);
+    await fsp.rename(src, dst2);
+    return `${filename} moved to trash (renamed to avoid collision)`;
+  }
   await fsp.rename(src, dst);
-  // Intentionally KEEP the cached .v thumbnail (and preview JPEG, if any). Restore is
-  // then instant — no need to re-resize a recoverable original. Hard delete cleans them.
   return `${filename} moved to trash`;
 }
-async function exploretrash(abs) {
-  const trash = path.join(abs, 'ggTrash');
-  if (!fs.existsSync(trash)) return 'empty';
-  const files = (await fsp.readdir(trash)).filter(f => isImage(f));
-  return JSON.stringify({ files });
-}
-async function restorefile(abs, filename) {
-  if (!filename || !isImage(filename)) throw new Error('bad filename');
-  const src = path.join(abs, 'ggTrash', filename);
-  const dst = path.join(abs, filename);
-  if (!fs.existsSync(src)) throw new Error('not in trash');
-  if (fs.existsSync(dst)) throw new Error('file with same name in gallery');
+
+async function restoreByPath(relPath) {
+  const src = safeTrashPath(relPath);
+  if (!src || !fs.existsSync(src)) throw new Error('not in trash');
+  const dst = path.join(GALLERIES_ROOT, relPath);
+  if (fs.existsSync(dst)) throw new Error(`a file at ${relPath} already exists`);
+  await fsp.mkdir(path.dirname(dst), { recursive: true });
   await fsp.rename(src, dst);
-  return `${filename} restored`;
-}
-async function deletefile(abs, filename) {
-  if (!filename || !isImage(filename)) throw new Error('bad filename');
-  const src = path.join(abs, 'ggTrash', filename);
-  if (!fs.existsSync(src)) throw new Error('not in trash');
-  await fsp.unlink(src);
-  // Permanent delete: reclaim the cached intermediate + preview.
-  for (const cf of [
-    path.join(abs, 'thumbcache',   filename + '.resized.v'),
-    path.join(abs, 'previewcache', filename + '.resized.jpg'),
-  ]) { try { await fsp.unlink(cf); } catch {} }
-  return `${filename} deleted`;
-}
-async function restoreall(abs) {
-  const trash = path.join(abs, 'ggTrash');
-  if (!fs.existsSync(trash)) return 'nothing to restore';
-  let n = 0;
-  for (const f of await fsp.readdir(trash)) {
-    if (!isImage(f)) continue;
-    const dst = path.join(abs, f);
-    if (fs.existsSync(dst)) continue;
-    await fsp.rename(path.join(trash, f), dst); n++;
+  // Clean up empty trash subdirs left behind
+  let parent = path.dirname(src);
+  while (parent.startsWith(TRASH_DIR + path.sep)) {
+    try { await fsp.rmdir(parent); } catch { break; }  // rmdir refuses non-empty dirs
+    parent = path.dirname(parent);
   }
-  return `${n} restored`;
+  return `restored ${relPath}`;
 }
-async function emptytrash(abs) {
-  const trash = path.join(abs, 'ggTrash');
-  if (!fs.existsSync(trash)) return 'already empty';
+
+async function deleteByPath(relPath) {
+  const src = safeTrashPath(relPath);
+  if (!src || !fs.existsSync(src)) throw new Error('not in trash');
+  await fsp.unlink(src);
+  // Reclaim the cached intermediate + preview at the original location.
+  const segs = relPath.split('/').filter(Boolean);
+  const filename = segs.pop();
+  const galleryAbs = path.join(GALLERIES_ROOT, ...segs);
+  for (const cf of [
+    path.join(galleryAbs, 'thumbcache',   filename + '.resized.v'),
+    path.join(galleryAbs, 'previewcache', filename + '.resized.jpg'),
+  ]) { try { await fsp.unlink(cf); } catch {} }
+  // GC empty trash subdirs
+  let parent = path.dirname(src);
+  while (parent.startsWith(TRASH_DIR + path.sep)) {
+    try { await fsp.rmdir(parent); } catch { break; }
+    parent = path.dirname(parent);
+  }
+  return `deleted ${relPath}`;
+}
+
+async function restoreAllTrash() {
+  const list = await listAllTrash();
+  let ok = 0, fail = 0;
+  for (const item of list) {
+    try { await restoreByPath(item.relPath); ok++; } catch { fail++; }
+  }
+  return `restored ${ok}` + (fail ? ` (${fail} failed)` : '');
+}
+
+async function emptyAllTrash() {
+  const list = await listAllTrash();
   let n = 0;
-  for (const f of await fsp.readdir(trash)) { await fsp.unlink(path.join(trash, f)); n++; }
-  return `${n} permanently deleted`;
+  for (const item of list) {
+    try { await deleteByPath(item.relPath); n++; } catch {}
+  }
+  return `permanently deleted ${n}`;
 }
 
 // ---------- upload (admin) ----------
@@ -1375,6 +1464,30 @@ function splitMultipart(buf, boundary) {
 }
 
 // ---------- admin auth API ----------
+async function handleTrashAPI(req, res, pathname, method) {
+  if (!isAdmin(req)) return sendJson(res, 401, { error: 'admin only' });
+  if (method === 'GET' && pathname === '/api/trash') {
+    return sendJson(res, 200, { files: await listAllTrash() });
+  }
+  if (method === 'POST' && pathname === '/api/trash/restore') {
+    let body; try { body = JSON.parse(await readBody(req, 64 * 1024)); } catch { return badRequest(res); }
+    try { return sendJson(res, 200, { ok: true, message: await restoreByPath(body.path) }); }
+    catch (e) { return sendJson(res, 400, { error: e.message }); }
+  }
+  if (method === 'POST' && pathname === '/api/trash/delete') {
+    let body; try { body = JSON.parse(await readBody(req, 64 * 1024)); } catch { return badRequest(res); }
+    try { return sendJson(res, 200, { ok: true, message: await deleteByPath(body.path) }); }
+    catch (e) { return sendJson(res, 400, { error: e.message }); }
+  }
+  if (method === 'POST' && pathname === '/api/trash/restoreAll') {
+    return sendJson(res, 200, { ok: true, message: await restoreAllTrash() });
+  }
+  if (method === 'POST' && pathname === '/api/trash/empty') {
+    return sendJson(res, 200, { ok: true, message: await emptyAllTrash() });
+  }
+  return notFound(res);
+}
+
 async function handleAdminAPI(req, res, pathname, method) {
   if (method === 'GET' && pathname === '/api/admin/probe') {
     return sendJson(res, isAdmin(req) ? 200 : 401, { admin: isAdmin(req) });
@@ -1527,6 +1640,7 @@ const server = http.createServer((req, res) => {
 (async () => {
   const swept = await sweepOrphanTmps(GALLERIES_ROOT);
   if (swept) console.log(`Swept ${swept} orphan tmp file(s) at startup.`);
+  await migrateLegacyTrash();
   startWatcher();
   buildQueue.scanAll(GALLERIES_ROOT).then(n => {
     if (n) console.log(`Startup scan queued ${n} build job(s) (concurrency=${BUILD_CONCURRENCY}).`);

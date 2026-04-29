@@ -273,31 +273,40 @@
   }
   function ggRequestBuildAll() { requestbuildall(); }
   function ggExploreTrash() {
-    gghttp('GET', 'exploretrash=1', function (t) {
-      var place = $('thumbs');
-      var data = null; try { data = JSON.parse(t); } catch (_) {}
-      if (!data || !data.files || !data.files.length) {
-        place.innerHTML = '<div style="padding:24px;text-align:center;color:#888">Trash is empty.</div>';
-        return;
-      }
-      var rows = data.files.map(function (f) {
-        var ef = encodeURIComponent(f);
-        return '<div style="display:flex;align-items:center;gap:8px;padding:6px 12px;border-bottom:1px solid #222">' +
-               '<button onclick="ggRestoreFile(\'' + ef + '\')">Restore</button>' +
-               '<button onclick="ggDeleteFile(\'' + ef + '\')">Delete</button>' +
-               '<span>' + f + '</span></div>';
-      }).join('');
-      place.innerHTML = '<div style="display:flex;flex-direction:column;align-items:stretch;width:100%;max-width:640px;margin:0 auto">' +
-        '<h3 style="text-align:center;color:#bbb">Trash (' + data.files.length + ')</h3>' +
-        rows +
-        '<div style="display:flex;gap:8px;justify-content:center;padding:12px"><button onclick="ggRestoreAll()">Restore all</button><button onclick="ggEmptyTrash()">Empty trash</button></div>' +
-        '</div>';
-    });
+    fetch('/api/trash', { headers: adminHeader() })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        var place = $('thumbs');
+        if (!data || !data.files || !data.files.length) {
+          place.innerHTML = '<div style="padding:24px;text-align:center;color:#888">Trash is empty.</div>';
+          return;
+        }
+        var rows = data.files.map(function (f) {
+          var fromFolder = f.relPath.indexOf('/') >= 0 ? f.relPath.slice(0, f.relPath.lastIndexOf('/')) : '';
+          var origin = fromFolder ? '/' + fromFolder : '/';
+          return '<div style="display:flex;align-items:center;gap:8px;padding:6px 12px;border-bottom:1px solid #222">' +
+                 '<button onclick="ggRestoreFile(\'' + f.relPath.replace(/\'/g, "\\'") + '\')">Restore</button>' +
+                 '<button onclick="ggDeleteFile(\''  + f.relPath.replace(/\'/g, "\\'") + '\')">Delete</button>' +
+                 '<span>' + f.name + ' <small style="color:#888">from ' + origin + '</small></span></div>';
+        }).join('');
+        place.innerHTML = '<div style="display:flex;flex-direction:column;align-items:stretch;width:100%;max-width:720px;margin:0 auto">' +
+          '<h3 style="text-align:center;color:#bbb">Trash (' + data.files.length + ')</h3>' +
+          rows +
+          '<div style="display:flex;gap:8px;justify-content:center;padding:12px"><button onclick="ggRestoreAll()">Restore all</button><button onclick="ggEmptyTrash()">Empty trash</button></div>' +
+          '</div>';
+      });
   }
-  function ggRestoreFile(ef) { gghttp('POST', 'restorefile=' + ef, function(t){ note(t); ggExploreTrash(); }); }
-  function ggDeleteFile(ef)  { if (!confirm('Permanently delete ' + decodeURIComponent(ef) + '?')) return; gghttp('POST', 'deletefile=' + ef, function(t){ note(t); ggExploreTrash(); }); }
-  function ggRestoreAll()    { gghttp('POST', 'restoreall=1', function(t){ note(t); ggExploreTrash(); }); }
-  function ggEmptyTrash()    { if (!confirm('Permanently delete ALL trashed files?')) return; gghttp('POST', 'emptytrash=1', function(t){ note(t); ggExploreTrash(); }); }
+  function trashApi(action, body) {
+    return fetch('/api/trash/' + action, {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, adminHeader()),
+      body: body ? JSON.stringify(body) : undefined,
+    }).then(r => r.json()).then(j => { note(j.message || j.error || 'ok'); });
+  }
+  function ggRestoreFile(p) { trashApi('restore', { path: p }).then(ggExploreTrash); }
+  function ggDeleteFile(p)  { if (!confirm('Permanently delete ' + p + '?')) return; trashApi('delete', { path: p }).then(ggExploreTrash); }
+  function ggRestoreAll()   { trashApi('restoreAll').then(ggExploreTrash); }
+  function ggEmptyTrash()   { if (!confirm('Permanently delete ALL trashed files?')) return; trashApi('empty').then(ggExploreTrash); }
 
   // ---------- touch swipe ----------
   function setupTouch() {
