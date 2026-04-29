@@ -1,0 +1,814 @@
+// Goodgallery 2.0 — Node.js rewrite of the 2014 PHP build.
+// Zero runtime npm dependencies. Image resizing via vipsthumbnail (libvips).
+//
+// Preserves the 2014 URL/data layout:
+//   GALLERIES_ROOT/<path...>/<image>            originals
+//   GALLERIES_ROOT/<path...>/thumbcache/<image>.resized.jpg
+//   GALLERIES_ROOT/<path...>/previewcache/<image>.resized.jpg
+//   GALLERIES_ROOT/<path...>/ggTrash/<image>    soft-deleted
+//
+// New: folder hierarchy. Each folder is its own gallery; subfolders appear
+// as cards in the parent. Folder URL = the path itself, ending with `/`.
+
+import http from 'http';
+import https from 'https';
+import fs from 'fs';
+import fsp from 'fs/promises';
+import path from 'path';
+import crypto from 'crypto';
+import { spawn } from 'child_process';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname  = path.dirname(__filename);
+
+// ---------- config ----------
+const PORT             = parseInt(process.env.PORT || '3000', 10);
+const HOST             = process.env.HOST || '0.0.0.0';
+const GALLERIES_ROOT   = path.resolve(process.env.GALLERIES_ROOT || '/var/lib/goodgallery/galleries');
+const STATE_DIR        = path.resolve(process.env.STATE_DIR     || '/var/lib/goodgallery');
+const PUBLIC_DIR       = path.join(__dirname, 'public');
+const PASSKEY_FILE     = path.join(STATE_DIR, 'passkey.json');
+const SITE_TITLE       = process.env.SITE_TITLE || 'Goodgallery';
+const THUMBS_PER_PAGE  = parseInt(process.env.THUMBS_PER_PAGE || '50', 10);
+const THUMB_DIM        = parseInt(process.env.THUMB_DIM || '160', 10);    // 2x of 2014 default — retina/mobile
+const PREVIEW_DIM      = parseInt(process.env.PREVIEW_DIM || '2000', 10); // generous; only used for big originals
+const THUMB_QUALITY    = parseInt(process.env.THUMB_QUALITY || '82', 10);
+const PREVIEW_QUALITY  = parseInt(process.env.PREVIEW_QUALITY || '85', 10);
+// Originals smaller than this skip preview generation — the client uses the original directly.
+// Browsers scale well now; the only point of a "preview" is to shrink huge files.
+const PREVIEW_SIZE_THRESHOLD = parseInt(process.env.PREVIEW_SIZE_THRESHOLD || String(500 * 1024), 10);
+const SESSION_DURATION = 24 * 60 * 60 * 1000;
+const RP_NAME          = SITE_TITLE;
+
+// reserved on-disk names that are NOT user content
+const RESERVED = new Set(['thumbcache', 'previewcache', 'ggTrash']);
+const SUPPORTED_EXT = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.avif']);
+
+// ---------- bootstrap ----------
+fs.mkdirSync(GALLERIES_ROOT, { recursive: true });
+fs.mkdirSync(STATE_DIR, { recursive: true });
+
+// ---------- in-memory state ----------
+const sessions         = new Map();  // token  -> { createdAt }
+const pendingChallenges = new Map(); // chalId -> { challenge, timestamp }
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of pendingChallenges) if (now - v.timestamp > 5 * 60 * 1000) pendingChallenges.delete(k);
+  for (const [k, v] of sessions)         if (now - v.createdAt  > SESSION_DURATION) sessions.delete(k);
+}, 60 * 1000);
+
+// ---------- helpers ----------
+function hxEscape(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function jsString(s) {
+  // safe to drop into a JS double-quoted string literal
+  return JSON.stringify(String(s));
+}
+function parseCookies(h) {
+  const out = {};
+  if (!h) return out;
+  for (const part of h.split(';')) {
+    const i = part.indexOf('=');
+    if (i < 0) continue;
+    out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+  }
+  return out;
+}
+function sendJson(res, code, obj) {
+  const body = Buffer.from(JSON.stringify(obj));
+  res.writeHead(code, { 'Content-Type': 'application/json', 'Content-Length': body.length });
+  res.end(body);
+}
+function sendText(res, code, text, type = 'text/plain; charset=utf-8') {
+  const body = Buffer.from(text);
+  res.writeHead(code, { 'Content-Type': type, 'Content-Length': body.length });
+  res.end(body);
+}
+function notFound(res, msg = 'not found') { sendText(res, 404, msg); }
+function badRequest(res, msg = 'bad request') { sendText(res, 400, msg); }
+
+// safely resolve a URL path (already URL-decoded segments) to an absolute path under GALLERIES_ROOT.
+// returns null if the path escapes the root or contains reserved/hidden segments.
+function resolveGallery(segments, { allowReserved = false } = {}) {
+  for (const s of segments) {
+    if (!s) continue;
+    if (s === '.' || s === '..') return null;
+    if (s.startsWith('.')) return null;
+    if (!allowReserved && RESERVED.has(s)) return null;
+    if (/[\x00-\x1f/\\]/.test(s)) return null;
+  }
+  const abs = path.resolve(GALLERIES_ROOT, ...segments);
+  if (abs !== GALLERIES_ROOT && !abs.startsWith(GALLERIES_ROOT + path.sep)) return null;
+  return abs;
+}
+
+function isImage(name) {
+  return SUPPORTED_EXT.has(path.extname(name).toLowerCase());
+}
+
+function readBody(req, limit = 32 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    req.on('data', c => {
+      total += c.length;
+      if (total > limit) { req.destroy(); reject(new Error('body too large')); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+// ---------- listing ----------
+async function listFolder(absDir, { withSizes = false } = {}) {
+  let entries;
+  try { entries = await fsp.readdir(absDir, { withFileTypes: true }); }
+  catch { return { folders: [], images: [], sizes: [] }; }
+
+  const folders = [];
+  const images  = [];
+  for (const e of entries) {
+    if (e.name.startsWith('.')) continue;
+    if (e.isDirectory()) {
+      if (RESERVED.has(e.name)) continue;
+      folders.push(e.name);
+    } else if (e.isFile() && isImage(e.name)) {
+      images.push(e.name);
+    }
+  }
+  const cmp = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' }).compare;
+  folders.sort(cmp);
+  images.sort(cmp);
+  let sizes = [];
+  if (withSizes) {
+    sizes = await Promise.all(images.map(async n => {
+      try { const st = await fsp.stat(path.join(absDir, n)); return st.size; }
+      catch { return 0; }
+    }));
+  }
+  return { folders, images, sizes };
+}
+
+// ---------- image build via vipsthumbnail ----------
+// vipsthumbnail handles sizing + orientation + JPEG output. Atomic via .tmp rename.
+function vipsThumb(srcAbs, dstAbs, dim, quality) {
+  return new Promise((resolve, reject) => {
+    // vipsthumbnail picks output format from the extension *before* the bracketed options.
+    // Use "__tmp.jpg" suffix (instead of ".jpg.tmp") so vips still sees ".jpg".
+    const tmp = dstAbs + '.__tmp.jpg';
+    const args = [
+      srcAbs,
+      '--size', `${dim}x${dim}>`,
+      '--output', `${tmp}[Q=${quality},strip,optimize_coding,interlace]`,
+    ];
+    const p = spawn('vipsthumbnail', args);
+    let err = '';
+    p.stderr.on('data', d => { err += d; });
+    p.on('error', reject);
+    p.on('close', code => {
+      if (code !== 0) { fs.promises.unlink(tmp).catch(()=>{}); reject(new Error('vipsthumbnail failed: ' + err.trim())); return; }
+      fs.promises.rename(tmp, dstAbs).then(resolve, reject);
+    });
+  });
+}
+
+async function ensureBuilt(folderAbs, filename) {
+  if (!isImage(filename)) throw new Error('unsupported');
+  const src = path.join(folderAbs, filename);
+  let st;
+  try { st = await fsp.stat(src); } catch { throw new Error('missing original'); }
+  const thumbDir = path.join(folderAbs, 'thumbcache');
+  await fsp.mkdir(thumbDir, { recursive: true });
+  const thumbOut = path.join(thumbDir, filename + '.resized.jpg');
+  let did = 0;
+  if (!fs.existsSync(thumbOut)) { await vipsThumb(src, thumbOut, THUMB_DIM, THUMB_QUALITY); did++; }
+  // Preview only for large originals — for small ones the client uses the original directly.
+  if (st.size >= PREVIEW_SIZE_THRESHOLD) {
+    const previewDir = path.join(folderAbs, 'previewcache');
+    await fsp.mkdir(previewDir, { recursive: true });
+    const previewOut = path.join(previewDir, filename + '.resized.jpg');
+    if (!fs.existsSync(previewOut)) { await vipsThumb(src, previewOut, PREVIEW_DIM, PREVIEW_QUALITY); did++; }
+  }
+  return did;
+}
+
+// ---------- auth: passkey state ----------
+function getPasskey() {
+  try { return JSON.parse(fs.readFileSync(PASSKEY_FILE, 'utf8')); }
+  catch { return null; }
+}
+function savePasskey(pk) {
+  fs.writeFileSync(PASSKEY_FILE + '.tmp', JSON.stringify(pk, null, 2));
+  fs.renameSync(PASSKEY_FILE + '.tmp', PASSKEY_FILE);
+}
+function newSession() {
+  const token = crypto.randomBytes(32).toString('base64url');
+  sessions.set(token, { createdAt: Date.now() });
+  return token;
+}
+function isAdmin(req) {
+  const auth = req.headers['authorization'] || '';
+  if (!auth.startsWith('Bearer ')) return false;
+  const tok = auth.slice(7).trim();
+  const s = sessions.get(tok);
+  if (!s) return false;
+  if (Date.now() - s.createdAt > SESSION_DURATION) { sessions.delete(tok); return false; }
+  return true;
+}
+
+// ---------- WebAuthn primitives (lifted from sendinator) ----------
+function b64uToBuf(s) {
+  const b64 = s.replace(/-/g, '+').replace(/_/g, '/');
+  const pad = b64 + '='.repeat((4 - b64.length % 4) % 4);
+  return Buffer.from(pad, 'base64');
+}
+function bufToB64u(b) { return Buffer.from(b).toString('base64url'); }
+
+function parseAuthenticatorData(authData) {
+  const rpIdHash = authData.slice(0, 32);
+  const flags = authData[32];
+  const signCount = authData.readUInt32BE(33);
+  const result = { rpIdHash, flags, signCount };
+  if (flags & 0x40) {
+    const aaguid = authData.slice(37, 53);
+    const credIdLen = authData.readUInt16BE(53);
+    const credentialId = authData.slice(55, 55 + credIdLen);
+    const publicKeyBytes = authData.slice(55 + credIdLen);
+    result.aaguid = aaguid;
+    result.credentialId = credentialId;
+    result.publicKeyBytes = publicKeyBytes;
+  }
+  return result;
+}
+function decodeCBOR(buffer) {
+  let offset = 0;
+  function read() {
+    const first = buffer[offset++];
+    const major = first >> 5;
+    const additional = first & 0x1f;
+    let value;
+    if (additional < 24) value = additional;
+    else if (additional === 24) value = buffer[offset++];
+    else if (additional === 25) { value = buffer.readUInt16BE(offset); offset += 2; }
+    else if (additional === 26) { value = buffer.readUInt32BE(offset); offset += 4; }
+    else if (additional === 27) { value = Number(buffer.readBigUInt64BE(offset)); offset += 8; }
+    else throw new Error('bad CBOR additional ' + additional);
+    switch (major) {
+      case 0: return value;
+      case 1: return -1 - value;
+      case 2: { const b = buffer.slice(offset, offset + value); offset += value; return b; }
+      case 3: { const t = buffer.slice(offset, offset + value).toString('utf8'); offset += value; return t; }
+      case 4: { const a = []; for (let i = 0; i < value; i++) a.push(read()); return a; }
+      case 5: { const m = {}; for (let i = 0; i < value; i++) { const k = read(); m[k] = read(); } return m; }
+      default: throw new Error('bad CBOR major ' + major);
+    }
+  }
+  return read();
+}
+function coseToPublicKey(coseKey) {
+  const kty = coseKey[1], alg = coseKey[3];
+  if (kty === 2 && alg === -7) {
+    const x = coseKey[-2], y = coseKey[-3];
+    return { algorithm: 'ES256', publicKey: Buffer.concat([Buffer.from([0x04]), x, y]) };
+  }
+  throw new Error(`Unsupported COSE key kty=${kty} alg=${alg}`);
+}
+function verifyES256Signature(publicKeyUncompressed, signature, data) {
+  const header = Buffer.from([
+    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,
+    0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00
+  ]);
+  const derKey = Buffer.concat([header, publicKeyUncompressed]);
+  const pem = '-----BEGIN PUBLIC KEY-----\n' +
+              derKey.toString('base64').match(/.{1,64}/g).join('\n') +
+              '\n-----END PUBLIC KEY-----';
+  const verify = crypto.createVerify('SHA256');
+  verify.update(data);
+  verify.end();
+  return verify.verify(pem, signature);
+}
+
+// ---------- gallery HTML render ----------
+function galleryHTML({ urlPath, folders, images, sizes, isAdminFlag, hasPasskey }) {
+  // urlPath has leading and trailing /, e.g. "/" or "/vacation/2024/"
+  const breadcrumbs = (() => {
+    const parts = urlPath.split('/').filter(Boolean);
+    let acc = '/';
+    const out = [`<a href="/">${hxEscape(SITE_TITLE)}</a>`];
+    for (const p of parts) {
+      acc += encodeURIComponent(p) + '/';
+      out.push(`<a href="${hxEscape(acc)}">${hxEscape(p)}</a>`);
+    }
+    return out.join(' / ');
+  })();
+
+  const folderCards = folders.map(name => {
+    const href = encodeURIComponent(name) + '/';
+    return `<a class="folder" href="${hxEscape(href)}"><span class="folder-icon">📁</span><span class="folder-name">${hxEscape(name)}</span></a>`;
+  }).join('');
+
+  // images[] is 1-indexed in the original; we keep the same convention to preserve old JS
+  const imagesJsArray = 'var images = [null,' + images.map(n => jsString(n)).join(',') + '];';
+  const sizesJsArray  = 'var imagesz = [0,'   + (sizes || []).join(',') + '];';
+  const lastImageValue = images.length;
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>${hxEscape(SITE_TITLE)} — ${hxEscape(urlPath)}</title>
+<link rel="stylesheet" href="/_static/goodgallery.css" />
+</head>
+<body onkeydown="keycheck(event)" onkeyup="unlockkeys(event)">
+
+<header id="topbar">
+  <nav id="breadcrumb">${breadcrumbs}</nav>
+  <span id="adminbadge"></span>
+  <a id="adminlink" href="/_admin/" title="Admin">⚙</a>
+</header>
+
+<div id="adminnotify"></div>
+
+${folders.length ? `<section id="folders">${folderCards}</section>` : ''}
+
+<div id="prevnext">
+  <button onclick="leftbutton()">‹ Prev</button>
+  <a href="#:" onclick="displaythumbs();return false;"> Thumbnails </a>
+  <button onclick="rightbutton()">Next ›</button>
+</div>
+
+<div id="counter"></div>
+<div id="realtime"></div>
+<div id="thumbs"></div>
+
+<div id="preloader"><a id="preimages">·</a></div>
+
+<div id="photodiv">
+  <a id="photospot" onclick="togglefullres()"></a>
+</div>
+
+<div id="login"></div>
+
+<footer id="bottomlink">
+  <a href="https://lagbag.com/goodgallery">GoodGallery</a> · ${images.length} image${images.length===1?'':'s'}${folders.length?` · ${folders.length} folder${folders.length===1?'':'s'}`:''}
+</footer>
+
+<script>
+${imagesJsArray}
+${sizesJsArray}
+var lastimagevalue   = ${lastImageValue};
+var thumbsperpage    = ${THUMBS_PER_PAGE};
+var xhrpush          = 4;
+var isadmin          = ${isAdminFlag ? 1 : 0};
+var hasPasskey       = ${hasPasskey ? 'true' : 'false'};
+var folderURL        = ${jsString(urlPath)};
+var previewThreshold = ${PREVIEW_SIZE_THRESHOLD};
+</script>
+<script src="/_static/gallery.js"></script>
+
+</body>
+</html>`;
+}
+
+// ---------- request handler ----------
+async function handle(req, res) {
+  const u = new URL(req.url, `http://${req.headers.host}`);
+  const method = req.method;
+  const pathname = decodeURIComponent(u.pathname);
+
+  // --- static files (no caching restriction during dev)
+  if (pathname.startsWith('/_static/')) {
+    return serveStatic(req, res, pathname.slice('/_static/'.length));
+  }
+  if (pathname === '/_admin' || pathname === '/_admin/') {
+    return serveStaticFile(req, res, path.join(PUBLIC_DIR, 'admin.html'));
+  }
+
+  // --- API
+  if (pathname.startsWith('/api/admin/')) return handleAdminAPI(req, res, pathname, method);
+
+  // --- gallery view (any other path is treated as a folder under GALLERIES_ROOT)
+  // Normalize: must end with /, otherwise 301-redirect (but only if it's a real directory)
+  const segs = pathname.split('/').filter(Boolean);
+  const abs = resolveGallery(segs, { allowReserved: true });
+  if (abs === null) return notFound(res, 'invalid path');
+
+  // image / cache file?
+  if (!pathname.endsWith('/')) {
+    // file (or dir-needs-redirect) under a gallery folder.
+    const fileName  = segs[segs.length - 1];
+    const dirOfFile = segs[segs.length - 2];
+    const grandparent = segs.slice(0, -2);
+
+    // 1) cache file: /<gallery>/.../{thumbcache,previewcache}/<file>.resized.jpg
+    if ((dirOfFile === 'thumbcache' || dirOfFile === 'previewcache') && fileName.endsWith('.resized.jpg')) {
+      const galleryAbs = resolveGallery(grandparent);
+      if (!galleryAbs) return notFound(res);
+      const cacheFile = path.join(galleryAbs, dirOfFile, fileName);
+      return serveFileWithFallback(req, res, cacheFile, async () => {
+        const originalName = fileName.slice(0, -'.resized.jpg'.length);
+        try { await ensureBuilt(galleryAbs, originalName); return cacheFile; }
+        catch { return null; }
+      });
+    }
+
+    // 2) trash file: /<gallery>/.../ggTrash/<file>
+    if (dirOfFile === 'ggTrash') {
+      if (!isAdmin(req)) return sendText(res, 403, 'admin only');
+      const galleryAbs = resolveGallery(grandparent);
+      if (!galleryAbs) return notFound(res);
+      return serveStaticFile(req, res, path.join(galleryAbs, 'ggTrash', fileName));
+    }
+
+    // 3) anything else needs the parent to be a real (non-reserved) gallery folder
+    const parentAbs = resolveGallery(segs.slice(0, -1));
+    if (parentAbs === null) return notFound(res);
+
+    if (isImage(fileName)) {
+      return serveStaticFile(req, res, path.join(parentAbs, fileName));
+    }
+
+    try {
+      const st = fs.statSync(abs);
+      if (st.isDirectory()) { res.writeHead(301, { Location: pathname + '/' }); return res.end(); }
+    } catch {}
+    return notFound(res);
+  }
+
+  // Reject gallery views into reserved/internal directories.
+  if (segs.some(s => RESERVED.has(s))) return notFound(res, 'reserved');
+  // Verify gallery dir exists
+  let st;
+  try { st = fs.statSync(abs); } catch { return notFound(res, 'no such gallery'); }
+  if (!st.isDirectory()) return notFound(res, 'not a folder');
+
+  // gallery action queries (?build=, ?buildall=1, etc.) — POST or GET.
+  const q = u.searchParams;
+  if (q.has('build')) return handleBuild(req, res, abs, q);
+  if (q.get('buildall') === '1') return handleBuildAll(req, res, abs);
+  if (q.has('clearcache'))  return adminAction(req, res, () => clearcache(abs));
+  if (q.has('exploretrash')) return adminAction(req, res, () => exploretrash(abs));
+  if (q.has('movetotrash')) return adminAction(req, res, () => movetotrash(abs, q.get('movetotrash')));
+  if (q.has('restorefile')) return adminAction(req, res, () => restorefile(abs, q.get('restorefile')));
+  if (q.has('deletefile'))  return adminAction(req, res, () => deletefile(abs, q.get('deletefile')));
+  if (q.has('restoreall'))  return adminAction(req, res, () => restoreall(abs));
+  if (q.has('emptytrash'))  return adminAction(req, res, () => emptytrash(abs));
+  if (q.get('api') === 'list') {
+    const { folders, images } = await listFolder(abs);
+    return sendJson(res, 200, { folders, images });
+  }
+  if (q.has('mkdir') && method === 'POST') {
+    if (!isAdmin(req)) return sendText(res, 403, 'admin only');
+    const name = q.get('mkdir').trim();
+    if (!name || /[\/\\\x00]/.test(name) || name.startsWith('.') || RESERVED.has(name))
+      return badRequest(res, 'invalid name');
+    await fsp.mkdir(path.join(abs, name), { recursive: false }).catch(() => {});
+    return sendJson(res, 200, { ok: true });
+  }
+  if (q.has('upload') && method === 'POST') {
+    if (!isAdmin(req)) return sendText(res, 403, 'admin only');
+    return handleUpload(req, res, abs, q);
+  }
+
+  // Render gallery page
+  const { folders, images, sizes } = await listFolder(abs, { withSizes: true });
+  const html = galleryHTML({
+    urlPath: pathname,
+    folders,
+    images,
+    sizes,
+    isAdminFlag: isAdmin(req),
+    hasPasskey: !!getPasskey(),
+  });
+  return sendText(res, 200, html, 'text/html; charset=utf-8');
+}
+
+// ---------- build endpoints ----------
+async function handleBuild(req, res, abs, q) {
+  const filename = q.get('build');
+  const inum = parseInt(q.get('inum') || '0', 10);
+  if (!filename || !isImage(filename)) return badRequest(res, 'bad filename');
+  try {
+    await ensureBuilt(abs, filename);
+    return sendText(res, 200, String(inum));
+  } catch (e) {
+    return sendText(res, 200, 'build failed: ' + e.message);
+  }
+}
+
+async function handleBuildAll(req, res, abs) {
+  const { images } = await listFolder(abs);
+  // shuffle so partial completions still cover the gallery (matches 2014 behavior)
+  for (let i = images.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [images[i], images[j]] = [images[j], images[i]];
+  }
+  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+  for (const name of images) {
+    try {
+      const did = await ensureBuilt(abs, name);
+      if (did) res.write(name + ' built\n');
+    } catch (e) {
+      res.write(name + ' FAILED: ' + e.message + '\n');
+    }
+  }
+  // Sweep orphan caches (cache file with no matching original)
+  const presence = new Set(images);
+  for (const sub of ['thumbcache', 'previewcache']) {
+    const dir = path.join(abs, sub);
+    if (!fs.existsSync(dir)) continue;
+    for (const f of fs.readdirSync(dir)) {
+      if (f.endsWith('.tmp')) { try { fs.unlinkSync(path.join(dir, f)); } catch {} continue; }
+      if (!f.endsWith('.resized.jpg')) continue;
+      const original = f.slice(0, -'.resized.jpg'.length);
+      if (!presence.has(original)) { try { fs.unlinkSync(path.join(dir, f)); } catch {} }
+    }
+  }
+  res.end('1');
+}
+
+// ---------- admin actions on a folder ----------
+async function adminAction(req, res, fn) {
+  if (!isAdmin(req)) return sendText(res, 403, 'admin only');
+  try { const out = await fn(); sendText(res, 200, out == null ? 'ok' : String(out)); }
+  catch (e) { sendText(res, 500, 'error: ' + e.message); }
+}
+async function clearcache(abs) {
+  for (const sub of ['thumbcache', 'previewcache']) {
+    const dir = path.join(abs, sub);
+    if (!fs.existsSync(dir)) continue;
+    for (const f of fs.readdirSync(dir)) { try { fs.unlinkSync(path.join(dir, f)); } catch {} }
+  }
+  return 'caches cleared';
+}
+async function movetotrash(abs, filename) {
+  if (!filename || !isImage(filename)) throw new Error('bad filename');
+  const trash = path.join(abs, 'ggTrash');
+  await fsp.mkdir(trash, { recursive: true });
+  const src = path.join(abs, filename);
+  const dst = path.join(trash, filename);
+  if (fs.existsSync(dst)) throw new Error('file with same name already in trash');
+  await fsp.rename(src, dst);
+  // also move cache files so they don't dangle
+  for (const sub of ['thumbcache', 'previewcache']) {
+    const cf = path.join(abs, sub, filename + '.resized.jpg');
+    try { await fsp.unlink(cf); } catch {}
+  }
+  return `${filename} moved to trash`;
+}
+async function exploretrash(abs) {
+  const trash = path.join(abs, 'ggTrash');
+  if (!fs.existsSync(trash)) return 'empty';
+  const files = (await fsp.readdir(trash)).filter(f => isImage(f));
+  return JSON.stringify({ files });
+}
+async function restorefile(abs, filename) {
+  if (!filename || !isImage(filename)) throw new Error('bad filename');
+  const src = path.join(abs, 'ggTrash', filename);
+  const dst = path.join(abs, filename);
+  if (!fs.existsSync(src)) throw new Error('not in trash');
+  if (fs.existsSync(dst)) throw new Error('file with same name in gallery');
+  await fsp.rename(src, dst);
+  return `${filename} restored`;
+}
+async function deletefile(abs, filename) {
+  if (!filename || !isImage(filename)) throw new Error('bad filename');
+  const src = path.join(abs, 'ggTrash', filename);
+  if (!fs.existsSync(src)) throw new Error('not in trash');
+  await fsp.unlink(src);
+  return `${filename} deleted`;
+}
+async function restoreall(abs) {
+  const trash = path.join(abs, 'ggTrash');
+  if (!fs.existsSync(trash)) return 'nothing to restore';
+  let n = 0;
+  for (const f of await fsp.readdir(trash)) {
+    if (!isImage(f)) continue;
+    const dst = path.join(abs, f);
+    if (fs.existsSync(dst)) continue;
+    await fsp.rename(path.join(trash, f), dst); n++;
+  }
+  return `${n} restored`;
+}
+async function emptytrash(abs) {
+  const trash = path.join(abs, 'ggTrash');
+  if (!fs.existsSync(trash)) return 'already empty';
+  let n = 0;
+  for (const f of await fsp.readdir(trash)) { await fsp.unlink(path.join(trash, f)); n++; }
+  return `${n} permanently deleted`;
+}
+
+// ---------- upload (admin) ----------
+// Phase-1 upload: a single file in a multipart/form-data POST. Will be replaced by
+// sendinator-style chunked uploads in a later iteration.
+async function handleUpload(req, res, abs, q) {
+  const ct = req.headers['content-type'] || '';
+  const m = ct.match(/^multipart\/form-data;\s*boundary=(.+)$/i);
+  if (!m) return badRequest(res, 'expected multipart/form-data');
+  const boundary = '--' + m[1];
+  const body = await readBody(req, 1024 * 1024 * 1024);
+
+  // Find first part with filename=
+  const parts = splitMultipart(body, boundary);
+  const filePart = parts.find(p => /filename="([^"]+)"/.test(p.headers['content-disposition'] || ''));
+  if (!filePart) return badRequest(res, 'no file');
+  const fnMatch = (filePart.headers['content-disposition'] || '').match(/filename="([^"]+)"/);
+  const filename = path.basename(fnMatch[1]);
+  if (!isImage(filename)) return badRequest(res, 'unsupported file type');
+  if (filename.startsWith('.') || RESERVED.has(filename)) return badRequest(res, 'invalid filename');
+  const dst = path.join(abs, filename);
+  if (fs.existsSync(dst)) return sendText(res, 409, 'already exists');
+  await fsp.writeFile(dst + '.tmp', filePart.body);
+  await fsp.rename(dst + '.tmp', dst);
+  // pre-build asynchronously; don't block the response
+  ensureBuilt(abs, filename).catch(()=>{});
+  return sendJson(res, 200, { ok: true, filename });
+}
+
+function splitMultipart(buf, boundary) {
+  const sep = Buffer.from('\r\n' + boundary);
+  // First boundary may not have leading CRLF
+  const firstSep = Buffer.from(boundary);
+  const out = [];
+  let start = buf.indexOf(firstSep);
+  if (start < 0) return out;
+  start += firstSep.length;
+  while (start < buf.length) {
+    if (buf[start] === 0x2d && buf[start + 1] === 0x2d) break; // -- = end
+    // skip optional CRLF
+    if (buf[start] === 0x0d && buf[start + 1] === 0x0a) start += 2;
+    const end = buf.indexOf(sep, start);
+    if (end < 0) break;
+    const partBuf = buf.slice(start, end);
+    const headerEnd = partBuf.indexOf(Buffer.from('\r\n\r\n'));
+    if (headerEnd < 0) break;
+    const hdrText = partBuf.slice(0, headerEnd).toString('utf8');
+    const headers = {};
+    for (const line of hdrText.split('\r\n')) {
+      const i = line.indexOf(':');
+      if (i > 0) headers[line.slice(0, i).toLowerCase()] = line.slice(i + 1).trim();
+    }
+    const body = partBuf.slice(headerEnd + 4);
+    out.push({ headers, body });
+    start = end + sep.length;
+  }
+  return out;
+}
+
+// ---------- admin auth API ----------
+async function handleAdminAPI(req, res, pathname, method) {
+  if (method === 'GET' && pathname === '/api/admin/status') {
+    return sendJson(res, 200, { passkeyExists: !!getPasskey() });
+  }
+  if (method === 'POST' && pathname === '/api/admin/register/start') {
+    if (getPasskey()) return sendJson(res, 400, { error: 'passkey already registered' });
+    const challenge = crypto.randomBytes(32);
+    const challengeId = crypto.randomBytes(16).toString('base64url');
+    pendingChallenges.set(challengeId, { challenge, timestamp: Date.now() });
+    res.setHeader('Set-Cookie', `webauthn_challenge=${challengeId}; HttpOnly; SameSite=Strict; Path=/; Max-Age=300`);
+    return sendJson(res, 200, {
+      challenge: bufToB64u(challenge),
+      rp: { name: RP_NAME },
+      user: { id: bufToB64u(crypto.randomBytes(16)), name: 'admin', displayName: 'Goodgallery Admin' },
+      pubKeyCredParams: [{ type: 'public-key', alg: -7 }],
+      authenticatorSelection: { residentKey: 'preferred', userVerification: 'preferred' },
+      timeout: 60000,
+      attestation: 'none'
+    });
+  }
+  if (method === 'POST' && pathname === '/api/admin/register/finish') {
+    if (getPasskey()) return sendJson(res, 400, { error: 'passkey already registered' });
+    let body;
+    try { body = JSON.parse(await readBody(req, 1024 * 1024)); } catch { return badRequest(res); }
+    const cookies = parseCookies(req.headers.cookie);
+    const ch = pendingChallenges.get(cookies['webauthn_challenge']);
+    if (!ch) return sendJson(res, 400, { error: 'challenge expired' });
+    pendingChallenges.delete(cookies['webauthn_challenge']);
+
+    const attestationBuffer = b64uToBuf(body.response.attestationObject);
+    const attestation = decodeCBOR(attestationBuffer);
+    const authData = parseAuthenticatorData(attestation.authData);
+    const clientData = JSON.parse(b64uToBuf(body.response.clientDataJSON).toString('utf8'));
+    if (clientData.type !== 'webauthn.create') return sendJson(res, 400, { error: 'bad clientData type' });
+    const expectedChallenge = bufToB64u(ch.challenge);
+    if (clientData.challenge !== expectedChallenge) return sendJson(res, 400, { error: 'challenge mismatch' });
+
+    const coseKey = decodeCBOR(authData.publicKeyBytes);
+    const { algorithm, publicKey } = coseToPublicKey(coseKey);
+
+    savePasskey({
+      credentialId: bufToB64u(authData.credentialId),
+      publicKey: bufToB64u(publicKey),
+      algorithm,
+      signCount: authData.signCount,
+      origin: clientData.origin,
+      createdAt: Date.now(),
+    });
+    const token = newSession();
+    console.log('Admin passkey registered. Origin:', clientData.origin);
+    return sendJson(res, 200, { success: true, token });
+  }
+  if (method === 'POST' && pathname === '/api/admin/login/start') {
+    const pk = getPasskey();
+    if (!pk) return sendJson(res, 400, { error: 'no passkey registered' });
+    const challenge = crypto.randomBytes(32);
+    const challengeId = crypto.randomBytes(16).toString('base64url');
+    pendingChallenges.set(challengeId, { challenge, timestamp: Date.now() });
+    res.setHeader('Set-Cookie', `webauthn_challenge=${challengeId}; HttpOnly; SameSite=Strict; Path=/; Max-Age=300`);
+    return sendJson(res, 200, {
+      challenge: bufToB64u(challenge),
+      timeout: 60000,
+      userVerification: 'preferred',
+      allowCredentials: [{ type: 'public-key', id: pk.credentialId }],
+    });
+  }
+  if (method === 'POST' && pathname === '/api/admin/login/finish') {
+    const pk = getPasskey();
+    if (!pk) return sendJson(res, 400, { error: 'no passkey' });
+    let body;
+    try { body = JSON.parse(await readBody(req, 1024 * 1024)); } catch { return badRequest(res); }
+    const cookies = parseCookies(req.headers.cookie);
+    const ch = pendingChallenges.get(cookies['webauthn_challenge']);
+    if (!ch) return sendJson(res, 400, { error: 'challenge expired' });
+    pendingChallenges.delete(cookies['webauthn_challenge']);
+
+    if (body.id !== pk.credentialId) return sendJson(res, 400, { error: 'unknown credential' });
+    const clientDataBuf = b64uToBuf(body.response.clientDataJSON);
+    const authDataBuf   = b64uToBuf(body.response.authenticatorData);
+    const sigBuf        = b64uToBuf(body.response.signature);
+    const clientData = JSON.parse(clientDataBuf.toString('utf8'));
+    if (clientData.type !== 'webauthn.get') return sendJson(res, 400, { error: 'bad clientData type' });
+    if (clientData.challenge !== bufToB64u(ch.challenge)) return sendJson(res, 400, { error: 'challenge mismatch' });
+
+    const clientDataHash = crypto.createHash('sha256').update(clientDataBuf).digest();
+    const signedData = Buffer.concat([authDataBuf, clientDataHash]);
+    const publicKey = b64uToBuf(pk.publicKey);
+    if (!verifyES256Signature(publicKey, sigBuf, signedData)) return sendJson(res, 400, { error: 'bad signature' });
+
+    const parsed = parseAuthenticatorData(authDataBuf);
+    if (parsed.signCount > pk.signCount) { pk.signCount = parsed.signCount; savePasskey(pk); }
+    return sendJson(res, 200, { success: true, token: newSession() });
+  }
+  return notFound(res);
+}
+
+// ---------- static file serving ----------
+function contentType(file) {
+  const ext = path.extname(file).toLowerCase();
+  switch (ext) {
+    case '.html': return 'text/html; charset=utf-8';
+    case '.css':  return 'text/css; charset=utf-8';
+    case '.js':   return 'text/javascript; charset=utf-8';
+    case '.json': return 'application/json';
+    case '.svg':  return 'image/svg+xml';
+    case '.jpg': case '.jpeg': return 'image/jpeg';
+    case '.png':  return 'image/png';
+    case '.gif':  return 'image/gif';
+    case '.webp': return 'image/webp';
+    case '.avif': return 'image/avif';
+    default: return 'application/octet-stream';
+  }
+}
+function serveStatic(req, res, rel) {
+  if (rel.includes('..')) return notFound(res);
+  return serveStaticFile(req, res, path.join(PUBLIC_DIR, rel));
+}
+function serveStaticFile(req, res, abs) {
+  fs.stat(abs, (err, st) => {
+    if (err || !st.isFile()) return notFound(res);
+    const headers = {
+      'Content-Type': contentType(abs),
+      'Content-Length': st.size,
+      'Last-Modified': st.mtime.toUTCString(),
+    };
+    if (req.headers['if-modified-since'] && new Date(req.headers['if-modified-since']).getTime() >= st.mtime.getTime()) {
+      res.writeHead(304); return res.end();
+    }
+    res.writeHead(200, headers);
+    fs.createReadStream(abs).pipe(res);
+  });
+}
+async function serveFileWithFallback(req, res, abs, recover) {
+  if (fs.existsSync(abs)) return serveStaticFile(req, res, abs);
+  const recovered = await recover();
+  if (recovered && fs.existsSync(recovered)) return serveStaticFile(req, res, recovered);
+  return notFound(res);
+}
+
+// ---------- start ----------
+const server = http.createServer((req, res) => {
+  handle(req, res).catch(err => {
+    console.error('[handler error]', req.method, req.url, err);
+    if (!res.headersSent) sendText(res, 500, 'internal error');
+  });
+});
+server.listen(PORT, HOST, () => {
+  console.log(`Goodgallery listening on http://${HOST}:${PORT}`);
+  console.log(`  galleries root: ${GALLERIES_ROOT}`);
+  console.log(`  state dir:      ${STATE_DIR}`);
+});

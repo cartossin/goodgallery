@@ -1,0 +1,423 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Goodgallery — Admin</title>
+<link rel="stylesheet" href="/_static/goodgallery.css" />
+<style>
+  body { padding: 16px; max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 22px; font-weight: 500; margin: 8px 0 16px; }
+  .panel { background: #141414; border: 1px solid #2a2a2a; border-radius: 6px; padding: 16px; margin-bottom: 14px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
+  input[type=text], input[type=password] {
+    background: #000; color: #cfcfcf; border: 1px solid #444;
+    padding: 8px 10px; font: inherit; flex: 1; min-width: 160px; border-radius: 3px;
+  }
+  .err { color: #ff8585; min-height: 1.2em; }
+  .ok  { color: #9bff9b; }
+  .hidden { display: none !important; }
+  ul.files { list-style: none; padding: 0; margin: 0; max-height: 280px; overflow: auto; border: 1px solid #2a2a2a; border-radius: 4px; }
+  ul.files li { padding: 6px 10px; border-bottom: 1px solid #1f1f1f; display: flex; justify-content: space-between; gap: 8px; align-items: center; font-size: 13px; }
+  ul.files li:last-child { border-bottom: 0; }
+  .progress { height: 4px; background: #222; border-radius: 2px; overflow: hidden; margin-top: 4px; }
+  .progress > div { height: 100%; background: #4caf50; width: 0%; transition: width .15s; }
+  .pathbar { font-family: ui-monospace, Menlo, monospace; padding: 8px 10px; background: #000; border: 1px solid #2a2a2a; border-radius: 3px; word-break: break-all; }
+  .drop { border: 2px dashed #444; border-radius: 6px; padding: 24px; text-align: center; color: #888; }
+  .drop.over { border-color: #cfcfcf; color: #cfcfcf; background: #1a1a1a; }
+  small { color: #888; }
+</style>
+</head>
+<body onkeyup="unlockkeys(event)" onkeydown="keycheck(event)">
+
+<h1>Goodgallery Admin</h1>
+
+<div id="authPanel" class="panel">
+  <div id="authTitle" style="font-size:18px;margin-bottom:6px">Admin</div>
+  <div id="authDesc" style="color:#888;margin-bottom:10px">Checking…</div>
+  <button id="authBtn" disabled>Please wait…</button>
+  <div id="authError" class="err" style="margin-top:8px"></div>
+  <div style="margin-top:8px"><small>Requires HTTPS (or localhost) and a Chromium-based browser for WebAuthn + the File System APIs used during mass upload.</small></div>
+</div>
+
+<div id="adminMain" class="hidden">
+
+  <div class="panel">
+    <div class="row">
+      <strong>Folder:</strong>
+      <span id="cwd" class="pathbar">/</span>
+      <button id="upBtn">↑ up</button>
+      <button id="reloadBtn">↻ reload</button>
+      <button id="logoutBtn" style="margin-left:auto">Log out</button>
+    </div>
+    <div class="row">
+      <input id="newDirName" type="text" placeholder="new subfolder name" />
+      <button id="mkDirBtn">+ folder</button>
+    </div>
+    <div id="dirError" class="err"></div>
+  </div>
+
+  <div class="panel">
+    <strong>Subfolders</strong>
+    <ul id="folders" class="files"><li><small>Loading…</small></li></ul>
+  </div>
+
+  <div class="panel">
+    <strong>Upload</strong>
+    <div id="drop" class="drop" tabindex="0">
+      <div>Drop image files (or a folder) here, or
+        <button id="pickBtn">pick files</button>
+        <button id="pickFolderBtn">pick folder</button>
+      </div>
+      <input id="filePicker" type="file" multiple accept="image/*" hidden />
+      <input id="folderPicker" type="file" webkitdirectory hidden />
+    </div>
+    <div id="uploadList"></div>
+  </div>
+
+  <div class="panel">
+    <strong>Images in this folder</strong>
+    <span id="imgCount" style="color:#888;font-size:12px;margin-left:8px"></span>
+    <ul id="images" class="files"><li><small>Loading…</small></li></ul>
+    <div class="row" style="margin-top:8px">
+      <button id="validateBtn">Validate / build all</button>
+      <button id="clearCacheBtn">Clear cache</button>
+      <button id="exploreTrashBtn">Explore trash</button>
+    </div>
+    <pre id="actionLog" style="font-size:12px;color:#9bff9b;max-height:120px;overflow:auto;margin-top:8px"></pre>
+  </div>
+
+</div>
+
+<script>
+// ---------- WebAuthn helpers ----------
+function b64ToBuf(s) {
+  s = s.replace(/-/g,'+').replace(/_/g,'/');
+  s += '='.repeat((4 - s.length % 4) % 4);
+  var bin = atob(s); var out = new Uint8Array(bin.length);
+  for (var i=0;i<bin.length;i++) out[i] = bin.charCodeAt(i);
+  return out.buffer;
+}
+function bufToB64(buf) {
+  var b = new Uint8Array(buf), s = '';
+  for (var i=0;i<b.length;i++) s += String.fromCharCode(b[i]);
+  return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+
+var sessionToken = localStorage.getItem('ggSession') || null;
+var cwdPath = '/'; // gallery folder we're administrating
+
+function authHeaders() { return sessionToken ? { 'Authorization': 'Bearer ' + sessionToken } : {}; }
+
+function unlockkeys(){}
+function keycheck(){}
+
+async function checkAuth() {
+  var t = document.getElementById('authTitle');
+  var d = document.getElementById('authDesc');
+  var b = document.getElementById('authBtn');
+  var err = document.getElementById('authError');
+
+  if (!window.PublicKeyCredential) {
+    t.textContent = 'WebAuthn unavailable';
+    d.textContent = 'Open this page over HTTPS or via http://localhost.';
+    b.style.display = 'none';
+    return;
+  }
+
+  if (sessionToken) {
+    var ok = await fetch('/api/admin/probe', { headers: authHeaders() }).then(r => r.ok).catch(() => false);
+    if (ok) { showMain(); return; }
+    // probe endpoint may not exist; try a benign admin-only call
+    var ok2 = await fetch('/?api=list', { headers: authHeaders() }).then(r => r.ok).catch(() => false);
+    if (ok2) { showMain(); return; }
+    sessionToken = null; localStorage.removeItem('ggSession');
+  }
+
+  var status = await fetch('/api/admin/status').then(r => r.json()).catch(() => null);
+  if (!status) { err.textContent = 'Cannot reach server.'; return; }
+  if (!status.passkeyExists) {
+    t.textContent = 'First-time setup';
+    d.textContent = 'Create a passkey to claim admin access. Anyone who beats you to this loses you the gallery, so do this immediately.';
+    b.textContent = 'Create passkey';
+    b.disabled = false;
+    b.onclick = registerPasskey;
+  } else {
+    t.textContent = 'Sign in';
+    d.textContent = 'Authenticate with your passkey.';
+    b.textContent = 'Sign in with passkey';
+    b.disabled = false;
+    b.onclick = loginPasskey;
+  }
+}
+
+async function registerPasskey() {
+  var b = document.getElementById('authBtn');
+  var err = document.getElementById('authError');
+  b.disabled = true; err.textContent = '';
+  try {
+    var opts = await fetch('/api/admin/register/start', { method: 'POST' }).then(r => r.json());
+    if (opts.error) throw new Error(opts.error);
+    opts.challenge = b64ToBuf(opts.challenge);
+    opts.user.id = b64ToBuf(opts.user.id);
+    var cred = await navigator.credentials.create({ publicKey: opts });
+    var verify = await fetch('/api/admin/register/finish', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: cred.id,
+        rawId: bufToB64(cred.rawId),
+        type: cred.type,
+        response: {
+          clientDataJSON: bufToB64(cred.response.clientDataJSON),
+          attestationObject: bufToB64(cred.response.attestationObject),
+        },
+      }),
+    }).then(r => r.json());
+    if (!verify.success) throw new Error(verify.error || 'register failed');
+    sessionToken = verify.token;
+    localStorage.setItem('ggSession', sessionToken);
+    showMain();
+  } catch (e) {
+    err.textContent = e.message || 'register failed';
+  } finally {
+    b.disabled = false;
+  }
+}
+
+async function loginPasskey() {
+  var b = document.getElementById('authBtn');
+  var err = document.getElementById('authError');
+  b.disabled = true; err.textContent = '';
+  try {
+    var opts = await fetch('/api/admin/login/start', { method: 'POST' }).then(r => r.json());
+    if (opts.error) throw new Error(opts.error);
+    opts.challenge = b64ToBuf(opts.challenge);
+    if (opts.allowCredentials) {
+      opts.allowCredentials = opts.allowCredentials.map(c => ({ ...c, id: b64ToBuf(c.id) }));
+    }
+    var cred = await navigator.credentials.get({ publicKey: opts });
+    var verify = await fetch('/api/admin/login/finish', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: cred.id,
+        rawId: bufToB64(cred.rawId),
+        type: cred.type,
+        response: {
+          clientDataJSON: bufToB64(cred.response.clientDataJSON),
+          authenticatorData: bufToB64(cred.response.authenticatorData),
+          signature: bufToB64(cred.response.signature),
+          userHandle: cred.response.userHandle ? bufToB64(cred.response.userHandle) : null,
+        },
+      }),
+    }).then(r => r.json());
+    if (!verify.success) throw new Error(verify.error || 'login failed');
+    sessionToken = verify.token;
+    localStorage.setItem('ggSession', sessionToken);
+    showMain();
+  } catch (e) {
+    err.textContent = e.message || 'login failed';
+  } finally {
+    b.disabled = false;
+  }
+}
+
+function showMain() {
+  document.getElementById('authPanel').classList.add('hidden');
+  document.getElementById('adminMain').classList.remove('hidden');
+  loadFolder();
+}
+
+// ---------- folder browse / actions ----------
+function setCWD(p) {
+  if (!p.startsWith('/')) p = '/' + p;
+  if (!p.endsWith('/')) p += '/';
+  cwdPath = p;
+  document.getElementById('cwd').textContent = p;
+  history.replaceState(null, '', '/_admin/?p=' + encodeURIComponent(p));
+}
+
+async function loadFolder() {
+  var url = cwdPath + '?api=list';
+  var r = await fetch(url, { headers: authHeaders() });
+  if (!r.ok) {
+    if (r.status === 404) {
+      // folder vanished; reset to root
+      setCWD('/'); return loadFolder();
+    }
+    return;
+  }
+  var data = await r.json();
+  var folEl = document.getElementById('folders');
+  var imgEl = document.getElementById('images');
+  folEl.innerHTML = data.folders.length
+    ? data.folders.map(n => `<li><a href="#" data-name="${escapeHtml(n)}">📁 ${escapeHtml(n)}</a></li>`).join('')
+    : '<li><small>(no subfolders)</small></li>';
+  folEl.querySelectorAll('a').forEach(a => a.addEventListener('click', e => {
+    e.preventDefault();
+    setCWD(cwdPath + a.getAttribute('data-name') + '/');
+    loadFolder();
+  }));
+  document.getElementById('imgCount').textContent = '(' + data.images.length + ')';
+  imgEl.innerHTML = data.images.length
+    ? data.images.map(n => `<li><a href="${escapeHtml(cwdPath + encodeURIComponent(n))}" target="_blank">${escapeHtml(n)}</a><button data-trash="${escapeHtml(n)}">trash</button></li>`).join('')
+    : '<li><small>(empty)</small></li>';
+  imgEl.querySelectorAll('button[data-trash]').forEach(b => b.addEventListener('click', () => trashImage(b.getAttribute('data-trash'))));
+}
+
+function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+async function trashImage(name) {
+  if (!confirm('Move ' + name + ' to trash?')) return;
+  var r = await fetch(cwdPath + '?movetotrash=' + encodeURIComponent(name), { method: 'POST', headers: authHeaders() });
+  log(await r.text());
+  loadFolder();
+}
+
+function log(s) {
+  var el = document.getElementById('actionLog');
+  el.textContent = (el.textContent + '\n' + s).split('\n').slice(-200).join('\n');
+  el.scrollTop = el.scrollHeight;
+}
+
+document.getElementById('upBtn').addEventListener('click', () => {
+  if (cwdPath === '/') return;
+  var parts = cwdPath.split('/').filter(Boolean);
+  parts.pop();
+  setCWD('/' + parts.join('/') + (parts.length ? '/' : ''));
+  loadFolder();
+});
+document.getElementById('reloadBtn').addEventListener('click', loadFolder);
+document.getElementById('logoutBtn').addEventListener('click', () => {
+  localStorage.removeItem('ggSession'); sessionToken = null; location.reload();
+});
+document.getElementById('mkDirBtn').addEventListener('click', async () => {
+  var name = document.getElementById('newDirName').value.trim();
+  if (!name) return;
+  var r = await fetch(cwdPath + '?mkdir=' + encodeURIComponent(name), { method: 'POST', headers: authHeaders() });
+  if (!r.ok) document.getElementById('dirError').textContent = await r.text();
+  else { document.getElementById('newDirName').value = ''; document.getElementById('dirError').textContent = ''; loadFolder(); }
+});
+
+document.getElementById('validateBtn').addEventListener('click', async () => {
+  log('validating...');
+  var r = await fetch(cwdPath + '?buildall=1', { headers: authHeaders() });
+  log(await r.text());
+});
+document.getElementById('clearCacheBtn').addEventListener('click', async () => {
+  if (!confirm('Clear all cached thumbs/previews in ' + cwdPath + '?')) return;
+  var r = await fetch(cwdPath + '?clearcache=1', { method: 'POST', headers: authHeaders() });
+  log(await r.text());
+});
+document.getElementById('exploreTrashBtn').addEventListener('click', async () => {
+  var r = await fetch(cwdPath + '?exploretrash=1', { headers: authHeaders() });
+  log(await r.text());
+});
+
+// ---------- upload ----------
+var drop = document.getElementById('drop');
+['dragenter','dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave','drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
+drop.addEventListener('drop', async e => {
+  var items = e.dataTransfer && e.dataTransfer.items;
+  if (items && items.length && items[0].webkitGetAsEntry) {
+    for (var i=0;i<items.length;i++) {
+      var entry = items[i].webkitGetAsEntry();
+      if (entry) await uploadEntry(entry, cwdPath);
+    }
+    loadFolder();
+  } else if (e.dataTransfer.files) {
+    await uploadFiles(Array.from(e.dataTransfer.files), cwdPath);
+    loadFolder();
+  }
+});
+document.getElementById('pickBtn').addEventListener('click', () => document.getElementById('filePicker').click());
+document.getElementById('pickFolderBtn').addEventListener('click', () => document.getElementById('folderPicker').click());
+document.getElementById('filePicker').addEventListener('change', async e => {
+  await uploadFiles(Array.from(e.target.files), cwdPath); e.target.value = ''; loadFolder();
+});
+document.getElementById('folderPicker').addEventListener('change', async e => {
+  // each File has webkitRelativePath like "MyFolder/sub/img.jpg"
+  var byFolder = new Map();
+  for (var f of e.target.files) {
+    var rel = f.webkitRelativePath || f.name;
+    var parts = rel.split('/');
+    var name = parts.pop();
+    var dir = cwdPath + parts.map(encodeURIComponent).join('/') + (parts.length ? '/' : '');
+    if (!byFolder.has(dir)) byFolder.set(dir, []);
+    byFolder.get(dir).push({ file: f, name });
+  }
+  // create needed folders depth-first
+  for (var dir of [...byFolder.keys()].sort()) {
+    var pathSegs = dir.replace(/^\/|\/$/g,'').split('/');
+    var here = '/';
+    for (var seg of pathSegs) {
+      if (!seg) continue;
+      var dec = decodeURIComponent(seg);
+      await fetch(here + '?mkdir=' + encodeURIComponent(dec), { method: 'POST', headers: authHeaders() });
+      here += seg + '/';
+    }
+  }
+  for (var [dir, items] of byFolder) {
+    await uploadFiles(items.map(it => it.file), dir);
+  }
+  e.target.value = '';
+  loadFolder();
+});
+
+async function uploadEntry(entry, parentPath) {
+  if (entry.isFile) {
+    var file = await new Promise(res => entry.file(res));
+    await uploadFiles([file], parentPath);
+  } else if (entry.isDirectory) {
+    var dirPath = parentPath + encodeURIComponent(entry.name) + '/';
+    await fetch(parentPath + '?mkdir=' + encodeURIComponent(entry.name), { method: 'POST', headers: authHeaders() });
+    var reader = entry.createReader();
+    var readBatch = () => new Promise(res => reader.readEntries(res));
+    while (true) {
+      var batch = await readBatch();
+      if (!batch.length) break;
+      for (var ent of batch) await uploadEntry(ent, dirPath);
+    }
+  }
+}
+
+async function uploadFiles(files, dir) {
+  var list = document.getElementById('uploadList');
+  for (var f of files) {
+    if (!f.type.startsWith('image/')) continue;
+    var row = document.createElement('div');
+    row.style = 'padding:6px 0;border-bottom:1px solid #1f1f1f';
+    row.innerHTML = '<div style="display:flex;justify-content:space-between"><span></span><small></small></div><div class="progress"><div></div></div>';
+    row.querySelector('span').textContent = (dir === cwdPath ? '' : dir.slice(cwdPath.length)) + f.name;
+    list.appendChild(row);
+    var bar = row.querySelector('.progress > div');
+    var sm  = row.querySelector('small');
+    try {
+      var fd = new FormData(); fd.append('file', f, f.name);
+      await new Promise((resolve, reject) => {
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', dir + '?upload=1');
+        xhr.setRequestHeader('Authorization', 'Bearer ' + sessionToken);
+        xhr.upload.onprogress = e => { if (e.lengthComputable) bar.style.width = (e.loaded / e.total * 100) + '%'; };
+        xhr.onload = () => { if (xhr.status >= 200 && xhr.status < 300) resolve(); else reject(new Error(xhr.responseText || ('http ' + xhr.status))); };
+        xhr.onerror = () => reject(new Error('network'));
+        xhr.send(fd);
+      });
+      bar.style.width = '100%'; sm.textContent = 'OK'; sm.style.color = '#9bff9b';
+    } catch (e) {
+      sm.textContent = 'FAIL: ' + e.message; sm.style.color = '#ff8585';
+    }
+  }
+}
+
+// initial path from query
+var qp = new URLSearchParams(location.search).get('p');
+if (qp) cwdPath = qp;
+document.getElementById('cwd').textContent = cwdPath;
+
+checkAuth();
+</script>
+</body>
+</html>

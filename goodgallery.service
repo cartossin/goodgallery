@@ -1,0 +1,17 @@
+[Unit]
+Description=Goodgallery
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/goodgallery
+ExecStart=/usr/bin/node /opt/goodgallery/server.js
+Restart=on-failure
+RestartSec=2
+Environment=NODE_ENV=production
+Environment=PORT=3000
+Environment=GALLERIES_ROOT=/var/lib/goodgallery/galleries
+Environment=STATE_DIR=/var/lib/goodgallery
+
+[Install]
+WantedBy=multi-user.target

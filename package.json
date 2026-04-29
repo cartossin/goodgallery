@@ -1,0 +1,13 @@
+{
+  "name": "goodgallery",
+  "version": "2.0.0-dev",
+  "type": "module",
+  "description": "Fast, scalable photo gallery — Node.js rewrite of the 2014 PHP Goodgallery",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "license": "MIT",
+  "dependencies": {}
+}
