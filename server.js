@@ -361,6 +361,25 @@ function vipsHeightThumb(srcAbs, dstAbs, height, quality) {
   });
 }
 
+// Run a vips subcommand; verify the named output file exists; bubble useful diagnostics.
+function runStep(cmd, args, expectedOutput) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(cmd, args);
+    let err = '', out = '';
+    proc.stdout.on('data', d => { out += d; });
+    proc.stderr.on('data', d => { err += d; });
+    proc.on('error', reject);
+    proc.on('close', code => {
+      const exists = fs.existsSync(expectedOutput);
+      if (code !== 0 || !exists) {
+        console.warn(`[runStep] ${cmd} ${args.slice(0,2).join(' ')}: code=${code}, expectedOutput=${expectedOutput}, exists=${exists}, stderr=${err.trim()||'(empty)'}, stdout=${out.trim()||'(empty)'}`);
+        return reject(new Error(`${cmd} ${args[0]} produced no output (code=${code}): ${err.trim() || '(silent)'}`));
+      }
+      resolve();
+    });
+  });
+}
+
 function runVips(cmd, args, tmp, finalPath) {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args);
@@ -501,29 +520,27 @@ async function buildSpriteForFolder(galleryAbs) {
       // size, top-left aligned, padded with --background. So a 320x200 thumb in a 600x200
       // cell becomes 320 wide of image + 280 wide of black padding to its right — and the
       // CSS slice on the client only reveals the leftmost \`actualW\` pixels.
-      await new Promise((resolve, reject) => {
-        console.log(`[sprite] building ${spriteFile}: ${chunk.length} thumbs, cell ${cellW}x${cellH}`);
-        const proc = spawn('vips', [
-          'arrayjoin',
-          inputPaths.join(' '),
-          `${tmp}[Q=92,strip,optimize_coding,interlace]`,
-          '--across', String(SPRITE_ACROSS),
-          '--hspacing', String(cellW),
-          '--vspacing', String(cellH),
-          '--background', '0 0 0',
-        ]);
-        let err = '';
-        proc.stderr.on('data', d => { err += d; });
-        proc.on('error', reject);
-        proc.on('close', code => {
-          const tmpExists = fs.existsSync(tmp);
-          if (code !== 0 || err.trim() || !tmpExists) {
-            console.warn(`[sprite] vips arrayjoin: code=${code}, tmpExists=${tmpExists}, stderr=${err.trim() || '(empty)'}`);
-          }
-          if (code !== 0) { fs.promises.unlink(tmp).catch(()=>{}); reject(new Error('arrayjoin failed: ' + err.trim())); return; }
-          fs.promises.rename(tmp, spriteAbs).then(resolve, reject);
-        });
-      });
+      // Two-stage build: arrayjoin → .v intermediate (vips' raw format), then jpegsave →
+      // final .jpg. Splitting the steps is more robust than the bracket-options trick on
+      // the output path (which appears to silently no-op in some spawn contexts).
+      const vTmp = tmp + '.v';
+      console.log(`[sprite] building ${spriteFile}: ${chunk.length} thumbs (cell ${cellW}x${cellH})`);
+      await runStep('vips', [
+        'arrayjoin', inputPaths.join(' '), vTmp,
+        '--across', String(SPRITE_ACROSS),
+        '--hspacing', String(cellW),
+        '--vspacing', String(cellH),
+        '--background', '0 0 0',
+      ], vTmp);
+      await runStep('vips', [
+        'jpegsave', vTmp, tmp,
+        '--Q', '92',
+        '--strip',
+        '--optimize-coding',
+        '--interlace',
+      ], tmp);
+      await fsp.unlink(vTmp).catch(()=>{});
+      await fsp.rename(tmp, spriteAbs);
       sprites.push({ file: spriteFile, count: chunk.length });
       const baseOffset = c * cellsPerSprite;
       chunk.forEach((name, i) => {
@@ -535,8 +552,10 @@ async function buildSpriteForFolder(galleryAbs) {
         };
       });
     }
-  } finally {
-    await fsp.rm(stagingDir, { recursive: true, force: true });
+  }
+  // (staging dir cleaned by next run; leaving it on failure for post-mortem)
+  finally {
+    // skip cleanup to allow post-mortem on failures; next run rms before re-creating
   }
 
   const meta = {
