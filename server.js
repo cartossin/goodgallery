@@ -951,6 +951,7 @@ function galleryHTML({ urlPath, folders, images, spriteMeta, isAdminFlag, hasPas
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>${hxEscape(SITE_TITLE)} — ${hxEscape(urlPath)}</title>
 <link rel="stylesheet" href="/_static/goodgallery.css" />
+<link rel="icon" type="image/svg+xml" href="/_static/favicon.svg" />
 </head>
 <body onkeydown="keycheck(event)" onkeyup="unlockkeys(event)">
 
