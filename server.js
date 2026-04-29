@@ -404,6 +404,10 @@ async function ensureBuilt(folderAbs, filename) {
   const src = path.join(folderAbs, filename);
   let st;
   try { st = await fsp.stat(src); } catch { throw new Error('missing original'); }
+  // (debug: log when we touch a file so the user can see preview-vs-original decisions)
+  if (process.env.GG_DEBUG_BUILDS) {
+    console.log('[build]', filename, 'size=' + st.size, 'preview=' + (st.size >= PREVIEW_SIZE_THRESHOLD));
+  }
   const thumbDir = path.join(folderAbs, 'thumbcache');
   await fsp.mkdir(thumbDir, { recursive: true });
   // Lossless .v intermediate (gd2 analog) — sprite atlas is the only lossy step.

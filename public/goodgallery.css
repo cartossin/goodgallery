@@ -62,7 +62,7 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   scrollbar-width: thin;
 }
 #breadcrumb a { padding: 2px 4px; }
-#breadcrumb a:not(:last-child)::after { content: '›'; padding-left: 8px; color: var(--muted); }
+#breadcrumb a:not(:last-child)::after { content: ' / '; padding: 0 6px; color: var(--muted); }
 #adminlink { font-size: 18px; padding: 4px 8px; opacity: 0.6; }
 #adminlink:hover { opacity: 1; }
 
