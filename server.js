@@ -1044,6 +1044,9 @@ async function handle(req, res) {
   if (pathname.startsWith('/_static/')) {
     return serveStatic(req, res, pathname.slice('/_static/'.length));
   }
+  if (pathname === '/favicon.ico' || pathname === '/favicon.svg') {
+    return serveStaticFile(req, res, path.join(PUBLIC_DIR, 'favicon.svg'));
+  }
   if (pathname === '/_admin' || pathname === '/_admin/') {
     return serveStaticFile(req, res, path.join(PUBLIC_DIR, 'admin.html'));
   }
