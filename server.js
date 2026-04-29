@@ -49,6 +49,38 @@ const SUPPORTED_EXT = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.avif'
 fs.mkdirSync(GALLERIES_ROOT, { recursive: true });
 fs.mkdirSync(STATE_DIR, { recursive: true });
 
+
+// Recognize tmp files left behind by killed write paths. Sweep these on startup and on
+// maintenance ops. Keep this function in one place so every writer pays the same tax.
+function isOrphanTmp(name) {
+  return name.endsWith('.__tmp.jpg') || name.endsWith('.tmp');
+}
+
+async function sweepOrphanTmps(rootDir) {
+  let removed = 0;
+  async function walk(dir) {
+    let entries;
+    try { entries = await fsp.readdir(dir, { withFileTypes: true }); }
+    catch { return; }
+    for (const e of entries) {
+      if (e.name.startsWith('.')) continue;
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) { await walk(full); continue; }
+      if (e.isFile() && isOrphanTmp(e.name)) {
+        try { await fsp.unlink(full); removed++; } catch {}
+      }
+    }
+  }
+  await walk(rootDir);
+  // Also sweep stale state-dir tmps (passkey.json.tmp etc.)
+  try {
+    for (const e of await fsp.readdir(STATE_DIR)) {
+      if (isOrphanTmp(e)) { try { await fsp.unlink(path.join(STATE_DIR, e)); removed++; } catch {} }
+    }
+  } catch {}
+  return removed;
+}
+
 // ---------- in-memory state ----------
 const sessions         = new Map();  // token  -> { createdAt }
 const pendingChallenges = new Map(); // chalId -> { challenge, timestamp }
@@ -523,7 +555,7 @@ async function handleBuildAll(req, res, abs) {
     const dir = path.join(abs, sub);
     if (!fs.existsSync(dir)) continue;
     for (const f of fs.readdirSync(dir)) {
-      if (f.endsWith('.tmp')) { try { fs.unlinkSync(path.join(dir, f)); } catch {} continue; }
+      if (isOrphanTmp(f)) { try { fs.unlinkSync(path.join(dir, f)); } catch {} continue; }
       if (!f.endsWith('.resized.jpg')) continue;
       const original = f.slice(0, -'.resized.jpg'.length);
       if (!presence.has(original)) { try { fs.unlinkSync(path.join(dir, f)); } catch {} }
@@ -623,8 +655,15 @@ async function handleUpload(req, res, abs, q) {
   if (filename.startsWith('.') || RESERVED.has(filename)) return badRequest(res, 'invalid filename');
   const dst = path.join(abs, filename);
   if (fs.existsSync(dst)) return sendText(res, 409, 'already exists');
-  await fsp.writeFile(dst + '.tmp', filePart.body);
-  await fsp.rename(dst + '.tmp', dst);
+  // Write through a tmp suffix that preserves the canonical extension, then rename.
+  const tmp = dst + '.__tmp' + path.extname(dst);
+  await new Promise((resolve, reject) => {
+    const ws = fs.createWriteStream(tmp);
+    ws.on('error', reject);
+    ws.on('finish', resolve);
+    ws.end(filePart.body);
+  });
+  await fsp.rename(tmp, dst);
   // pre-build asynchronously; don't block the response
   ensureBuilt(abs, filename).catch(()=>{});
   return sendJson(res, 200, { ok: true, filename });
@@ -807,8 +846,11 @@ const server = http.createServer((req, res) => {
     if (!res.headersSent) sendText(res, 500, 'internal error');
   });
 });
-server.listen(PORT, HOST, () => {
-  console.log(`Goodgallery listening on http://${HOST}:${PORT}`);
-  console.log(`  galleries root: ${GALLERIES_ROOT}`);
-  console.log(`  state dir:      ${STATE_DIR}`);
+sweepOrphanTmps(GALLERIES_ROOT).then(n => {
+  if (n) console.log(`Swept ${n} orphan tmp file(s) at startup.`);
+  server.listen(PORT, HOST, () => {
+    console.log(`Goodgallery listening on http://${HOST}:${PORT}`);
+    console.log(`  galleries root: ${GALLERIES_ROOT}`);
+    console.log(`  state dir:      ${STATE_DIR}`);
+  });
 });
