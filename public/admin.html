@@ -109,10 +109,10 @@ function bufToB64(buf) {
   return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
 }
 
-var sessionToken = localStorage.getItem('ggSession') || null;
+// Auth is an HttpOnly cookie set by the server on login finish. We never see the token
+// in JS, which means XSS can't read it; CSRF is mitigated by SameSite=Strict.
 var cwdPath = '/'; // gallery folder we're administrating
-
-function authHeaders() { return sessionToken ? { 'Authorization': 'Bearer ' + sessionToken } : {}; }
+function authHeaders() { return {}; }  // legacy stub — fetches use cookies automatically
 
 function unlockkeys(){}
 function keycheck(){}
@@ -130,11 +130,9 @@ async function checkAuth() {
     return;
   }
 
-  if (sessionToken) {
-    var ok = await fetch('/api/admin/probe', { headers: authHeaders() }).then(r => r.ok).catch(() => false);
-    if (ok) { showMain(); return; }
-    sessionToken = null; localStorage.removeItem('ggSession');
-  }
+  // Cookie is sent automatically with this request; if it's valid, skip to main.
+  var probe = await fetch('/api/admin/probe', { credentials: 'same-origin' }).then(r => r.ok).catch(() => false);
+  if (probe) { showMain(); return; }
 
   var status = await fetch('/api/admin/status').then(r => r.json()).catch(() => null);
   if (!status) { err.textContent = 'Cannot reach server.'; return; }
@@ -177,9 +175,7 @@ async function registerPasskey() {
       }),
     }).then(r => r.json());
     if (!verify.success) throw new Error(verify.error || 'register failed');
-    sessionToken = verify.token;
-    localStorage.setItem('ggSession', sessionToken);
-    showMain();
+    showMain();  // server set the HttpOnly session cookie
   } catch (e) {
     err.textContent = e.message || 'register failed';
   } finally {
@@ -215,9 +211,7 @@ async function loginPasskey() {
       }),
     }).then(r => r.json());
     if (!verify.success) throw new Error(verify.error || 'login failed');
-    sessionToken = verify.token;
-    localStorage.setItem('ggSession', sessionToken);
-    showMain();
+    showMain();  // server set the HttpOnly session cookie
   } catch (e) {
     err.textContent = e.message || 'login failed';
   } finally {
@@ -291,8 +285,9 @@ document.getElementById('upBtn').addEventListener('click', () => {
   loadFolder();
 });
 document.getElementById('reloadBtn').addEventListener('click', loadFolder);
-document.getElementById('logoutBtn').addEventListener('click', () => {
-  localStorage.removeItem('ggSession'); sessionToken = null; location.reload();
+document.getElementById('logoutBtn').addEventListener('click', async () => {
+  await fetch('/api/admin/logout', { method: 'POST', credentials: 'same-origin' });
+  location.reload();
 });
 document.getElementById('mkDirBtn').addEventListener('click', async () => {
   var name = document.getElementById('newDirName').value.trim();
@@ -518,7 +513,7 @@ async function uploadOneFile(file, dir, ui) {
       try {
         var r = await fetch('/api/upload/chunk/' + id + '/' + idx, {
           method: 'POST',
-          headers: Object.assign({ 'X-Chunk-Hash': hash }, authHeaders()),
+          headers: { 'X-Chunk-Hash': hash },
           body: buf,
         });
         if (!r.ok) {
@@ -549,7 +544,7 @@ async function uploadOneFile(file, dir, ui) {
 
 async function fetchJson(url, opts) {
   opts = opts || {};
-  opts.headers = Object.assign({}, opts.headers || {}, authHeaders());
+  opts.credentials = 'same-origin';  // send cookies
   var r = await fetch(url, opts);
   var j = null;
   try { j = await r.json(); } catch {}

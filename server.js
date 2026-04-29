@@ -967,6 +967,19 @@ function savePasskey(pk) {
   fs.writeFileSync(PASSKEY_FILE + '.tmp', JSON.stringify(pk, null, 2));
   fs.renameSync(PASSKEY_FILE + '.tmp', PASSKEY_FILE);
 }
+
+// HttpOnly session cookie helpers. Sent automatically by the browser; not readable by JS.
+const SESSION_COOKIE = 'ggSession';
+function setSessionCookie(req, res, token) {
+  const isSecure = req.headers['x-forwarded-proto'] === 'https' || (req.connection && req.connection.encrypted);
+  const flags = ['HttpOnly', 'SameSite=Strict', 'Path=/', `Max-Age=${Math.floor(SESSION_DURATION/1000)}`];
+  if (isSecure) flags.push('Secure');
+  res.setHeader('Set-Cookie', `${SESSION_COOKIE}=${token}; ${flags.join('; ')}`);
+}
+function clearSessionCookie(res) {
+  res.setHeader('Set-Cookie', `${SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`);
+}
+
 function newSession() {
   const token = crypto.randomBytes(32).toString('base64url');
   sessions.set(token, { createdAt: Date.now() });
@@ -974,12 +987,12 @@ function newSession() {
   return token;
 }
 function isAdmin(req) {
-  const auth = req.headers['authorization'] || '';
-  if (!auth.startsWith('Bearer ')) return false;
-  const tok = auth.slice(7).trim();
+  const cookies = parseCookies(req.headers.cookie);
+  const tok = cookies[SESSION_COOKIE];
+  if (!tok) return false;
   const s = sessions.get(tok);
   if (!s) return false;
-  if (Date.now() - s.createdAt > SESSION_DURATION) { sessions.delete(tok); return false; }
+  if (Date.now() - s.createdAt > SESSION_DURATION) { sessions.delete(tok); saveSessions(); return false; }
   return true;
 }
 
@@ -1495,6 +1508,14 @@ async function handleTrashAPI(req, res, pathname, method) {
 }
 
 async function handleAdminAPI(req, res, pathname, method) {
+  if (method === 'POST' && pathname === '/api/admin/logout') {
+    // Best-effort: drop server-side session if we know it, then expire the cookie.
+    const cookies = parseCookies(req.headers.cookie);
+    const tok = cookies[SESSION_COOKIE];
+    if (tok && sessions.delete(tok)) saveSessions();
+    clearSessionCookie(res);
+    return sendJson(res, 200, { ok: true });
+  }
   if (method === 'GET' && pathname === '/api/admin/probe') {
     return sendJson(res, isAdmin(req) ? 200 : 401, { admin: isAdmin(req) });
   }
@@ -1546,8 +1567,9 @@ async function handleAdminAPI(req, res, pathname, method) {
       createdAt: Date.now(),
     });
     const token = newSession();
+    setSessionCookie(req, res, token);
     console.log('Admin passkey registered. Origin:', clientData.origin);
-    return sendJson(res, 200, { success: true, token });
+    return sendJson(res, 200, { success: true });
   }
   if (method === 'POST' && pathname === '/api/admin/login/start') {
     const pk = getPasskey();
@@ -1588,7 +1610,9 @@ async function handleAdminAPI(req, res, pathname, method) {
 
     const parsed = parseAuthenticatorData(authDataBuf);
     if (parsed.signCount > pk.signCount) { pk.signCount = parsed.signCount; savePasskey(pk); }
-    return sendJson(res, 200, { success: true, token: newSession() });
+    const token = newSession();
+    setSessionCookie(req, res, token);
+    return sendJson(res, 200, { success: true });
   }
   return notFound(res);
 }

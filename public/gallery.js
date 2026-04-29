@@ -59,10 +59,8 @@
       .then(function (t) { onText(t); })
       .catch(function () { onText(''); });
   }
-  function adminHeader() {
-    var t = localStorage.getItem('ggSession');
-    return t ? { 'Authorization': 'Bearer ' + t } : {};
-  }
+  // (Auth is now an HttpOnly cookie — no client-side token handling needed.)
+  function adminHeader() { return {}; }
 
   // Server now owns validation/build. Fire-and-forget: ask the server to enqueue,
   // then poll status for feedback. No more client-driven loop.
@@ -505,22 +503,15 @@
     pollBuildStatus();
   }
 
-  // If a stored admin session exists, probe its validity with the server. Only enable
-  // the admin bar on a 200 response; otherwise drop the stale token. Avoids the
-  // confusing state where the UI thinks you're logged in but every admin call 401s.
+  // Probe the admin cookie. If valid, flip the in-page admin UI on; otherwise no-op.
+  // Cookie is HttpOnly so we can't read it from JS — the probe is the only way to know.
   function maybePromoteAdmin() {
-    var t = localStorage.getItem('ggSession');
-    if (!t || window.isadmin) return;
-    fetch('/api/admin/probe', { headers: { 'Authorization': 'Bearer ' + t } })
+    if (window.isadmin) return;
+    fetch('/api/admin/probe', { credentials: 'same-origin' })
       .then(function (r) {
-        if (r.ok) {
-          window.isadmin = 1;
-          showAdminBar();
-        } else {
-          localStorage.removeItem('ggSession');
-        }
+        if (r.ok) { window.isadmin = 1; showAdminBar(); }
       })
-      .catch(function () { /* network down — leave token alone, retry next load */ });
+      .catch(function () { /* offline — silently no-op */ });
   }
 
   // expose for inline handlers / other scripts
