@@ -140,7 +140,6 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   align-items: center;
   justify-content: center;
   padding: var(--thumb-pad);
-  border-radius: 2px;
 }
 #thumbs a:hover img { opacity: 0.8; }
 #thumbs img {
@@ -186,7 +185,6 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* Variable-width sprite thumbs (CSS-sliced from a single atlas JPEG) */
 #thumbs .sprite-thumb {
-  border-radius: 2px;
   background-color: var(--thumb-bg);
   background-repeat: no-repeat;
   margin: 1px;
