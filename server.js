@@ -31,7 +31,12 @@ const PUBLIC_DIR       = path.join(__dirname, 'public');
 const PASSKEY_FILE     = path.join(STATE_DIR, 'passkey.json');
 const SITE_TITLE       = process.env.SITE_TITLE || 'Goodgallery';
 const THUMBS_PER_PAGE  = parseInt(process.env.THUMBS_PER_PAGE || '50', 10);
-const THUMB_DIM        = parseInt(process.env.THUMB_DIM || '160', 10);    // 2x of 2014 default — retina/mobile
+// Thumbs are now cover-cropped to fixed square cells so they tile cleanly into a sprite
+// atlas. THUMB_CELL is the physical pixel size; CSS displays at half that for 2x retina.
+const THUMB_CELL       = parseInt(process.env.THUMB_CELL || '200', 10);
+const THUMB_DIM        = THUMB_CELL;  // alias for clarity in build path
+const SPRITE_ACROSS    = parseInt(process.env.SPRITE_ACROSS || '20', 10);   // cells per row
+const SPRITE_CAPACITY  = SPRITE_ACROSS * SPRITE_ACROSS;                     // thumbs per sprite
 const PREVIEW_DIM      = parseInt(process.env.PREVIEW_DIM || '2000', 10); // generous; only used for big originals
 const THUMB_QUALITY    = parseInt(process.env.THUMB_QUALITY || '82', 10);
 const PREVIEW_QUALITY  = parseInt(process.env.PREVIEW_QUALITY || '85', 10);
@@ -151,6 +156,12 @@ class BuildQueue {
         } finally {
           this._bumpProgress(galleryAbs, p => { p.inProgress--; });
           this.inFlight.delete(k);
+          // If this was the last in-flight job for the folder and there were any builds,
+          // (re)build the sprite atlas. Fire-and-forget; deduped per folder.
+          const after = this.progress.get(galleryAbs);
+          if (after && after.pending === 0 && after.inProgress === 0 && after.total > 0) {
+            maybeBuildSprite(galleryAbs);
+          }
         }
       }
     } finally { this.workers--; }
@@ -307,23 +318,43 @@ async function listFolder(absDir, { withSizes = false } = {}) {
 
 // ---------- image build via vipsthumbnail ----------
 // vipsthumbnail handles sizing + orientation + JPEG output. Atomic via .tmp rename.
+// Preserve-aspect thumb (used for previews of large originals).
 function vipsThumb(srcAbs, dstAbs, dim, quality) {
   return new Promise((resolve, reject) => {
-    // vipsthumbnail picks output format from the extension *before* the bracketed options.
-    // Use "__tmp.jpg" suffix (instead of ".jpg.tmp") so vips still sees ".jpg".
     const tmp = dstAbs + '.__tmp.jpg';
     const args = [
       srcAbs,
       '--size', `${dim}x${dim}>`,
       '--output', `${tmp}[Q=${quality},strip,optimize_coding,interlace]`,
     ];
-    const p = spawn('vipsthumbnail', args);
+    runVips('vipsthumbnail', args, tmp, dstAbs).then(resolve, reject);
+  });
+}
+
+// Cover-crop thumb (used for the gallery thumbnail grid → must be a uniform square so
+// the sprite atlas can tile them cleanly).
+function vipsCoverThumb(srcAbs, dstAbs, dim, quality) {
+  return new Promise((resolve, reject) => {
+    const tmp = dstAbs + '.__tmp.jpg';
+    const args = [
+      srcAbs,
+      '--size', `${dim}x${dim}`,
+      '--smartcrop', 'centre',
+      '--output', `${tmp}[Q=${quality},strip,optimize_coding,interlace]`,
+    ];
+    runVips('vipsthumbnail', args, tmp, dstAbs).then(resolve, reject);
+  });
+}
+
+function runVips(cmd, args, tmp, finalPath) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(cmd, args);
     let err = '';
     p.stderr.on('data', d => { err += d; });
     p.on('error', reject);
     p.on('close', code => {
-      if (code !== 0) { fs.promises.unlink(tmp).catch(()=>{}); reject(new Error('vipsthumbnail failed: ' + err.trim())); return; }
-      fs.promises.rename(tmp, dstAbs).then(resolve, reject);
+      if (code !== 0) { fs.promises.unlink(tmp).catch(()=>{}); reject(new Error(`${cmd} failed: ` + err.trim())); return; }
+      fs.promises.rename(tmp, finalPath).then(resolve, reject);
     });
   });
 }
@@ -337,7 +368,7 @@ async function ensureBuilt(folderAbs, filename) {
   await fsp.mkdir(thumbDir, { recursive: true });
   const thumbOut = path.join(thumbDir, filename + '.resized.jpg');
   let did = 0;
-  if (!fs.existsSync(thumbOut)) { await vipsThumb(src, thumbOut, THUMB_DIM, THUMB_QUALITY); did++; }
+  if (!fs.existsSync(thumbOut)) { await vipsCoverThumb(src, thumbOut, THUMB_CELL, THUMB_QUALITY); did++; }
   // Preview only for large originals — for small ones the client uses the original directly.
   if (st.size >= PREVIEW_SIZE_THRESHOLD) {
     const previewDir = path.join(folderAbs, 'previewcache');
@@ -346,6 +377,121 @@ async function ensureBuilt(folderAbs, filename) {
     if (!fs.existsSync(previewOut)) { await vipsThumb(src, previewOut, PREVIEW_DIM, PREVIEW_QUALITY); did++; }
   }
   return did;
+}
+
+
+// ---------- sprite atlas ----------
+async function readSpriteMeta(galleryAbs) {
+  try {
+    const raw = await fsp.readFile(path.join(galleryAbs, 'thumbcache', '_sprite.json'), 'utf8');
+    return JSON.parse(raw);
+  } catch { return null; }
+}
+
+function spriteIsCurrent(meta, images) {
+  if (!meta || !meta.imageMap) return false;
+  if (meta.imageCount !== images.length) return false;
+  // every image must be in the map
+  for (const f of images) if (!meta.imageMap[f]) return false;
+  // and the map shouldn't have stale entries
+  if (Object.keys(meta.imageMap).length !== images.length) return false;
+  return true;
+}
+
+async function buildSpriteForFolder(galleryAbs) {
+  const { images } = await listFolder(galleryAbs);
+  if (images.length === 0) return null;
+  const thumbDir = path.join(galleryAbs, 'thumbcache');
+  // require all individual thumbs to exist before we attempt a sprite. If any are missing,
+  // bail; the queue will trigger us again once they're built.
+  for (const f of images) {
+    if (!fs.existsSync(path.join(thumbDir, f + '.resized.jpg'))) return null;
+  }
+  await fsp.mkdir(thumbDir, { recursive: true });
+
+  // We hardlink each thumb into a private temp dir under sequential names so vips arrayjoin
+  // (which parses its input list as space-separated paths) works regardless of original
+  // filenames. Hardlinks are free on the same filesystem.
+  const numChunks = Math.ceil(images.length / SPRITE_CAPACITY);
+  const sprites = [];
+  const imageMap = {};
+  const stagingDir = path.join(thumbDir, '_sprite_staging');
+  await fsp.rm(stagingDir, { recursive: true, force: true });
+  await fsp.mkdir(stagingDir, { recursive: true });
+
+  try {
+    for (let c = 0; c < numChunks; c++) {
+      const chunk = images.slice(c * SPRITE_CAPACITY, (c + 1) * SPRITE_CAPACITY);
+      const inputPaths = [];
+      for (let i = 0; i < chunk.length; i++) {
+        const link = path.join(stagingDir, `${c}_${i}.jpg`);
+        try { await fsp.unlink(link); } catch {}
+        await fsp.link(path.join(thumbDir, chunk[i] + '.resized.jpg'), link);
+        inputPaths.push(link);
+      }
+      const spriteFile = `sprite-${c}.jpg`;
+      const spriteAbs = path.join(thumbDir, spriteFile);
+      const tmp = spriteAbs + '.__tmp.jpg';
+      // vips arrayjoin: first arg is space-separated list of inputs, second is output, then options.
+      // Specifying [Q=…] on the output path bakes the JPEG options.
+      await new Promise((resolve, reject) => {
+        const proc = spawn('vips', [
+          'arrayjoin',
+          inputPaths.join(' '),
+          `${tmp}[Q=80,strip,optimize_coding,interlace]`,
+          '--across', String(SPRITE_ACROSS),
+          '--background', '0 0 0',
+        ]);
+        let err = '';
+        proc.stderr.on('data', d => { err += d; });
+        proc.on('error', reject);
+        proc.on('close', code => {
+          if (code !== 0) { fs.promises.unlink(tmp).catch(()=>{}); reject(new Error('arrayjoin failed: ' + err.trim())); return; }
+          fs.promises.rename(tmp, spriteAbs).then(resolve, reject);
+        });
+      });
+      sprites.push({ file: spriteFile, count: chunk.length });
+      chunk.forEach((name, i) => {
+        imageMap[name] = { sprite: c, row: Math.floor(i / SPRITE_ACROSS), col: i % SPRITE_ACROSS };
+      });
+    }
+  } finally {
+    await fsp.rm(stagingDir, { recursive: true, force: true });
+  }
+
+  // Write _sprite.json last so readers either see no sprite metadata at all (and fall back
+  // to per-thumb URLs) or see a fully-consistent metadata pointing at completed sprite files.
+  const meta = {
+    cell: THUMB_CELL,
+    across: SPRITE_ACROSS,
+    capacity: SPRITE_CAPACITY,
+    sprites,
+    imageMap,
+    imageCount: images.length,
+    builtAt: Date.now(),
+  };
+  const metaPath = path.join(thumbDir, '_sprite.json');
+  await fsp.writeFile(metaPath + '.tmp', JSON.stringify(meta));
+  await fsp.rename(metaPath + '.tmp', metaPath);
+
+  // Garbage-collect old sprite-N.jpg files no longer referenced.
+  const referenced = new Set(sprites.map(s => s.file));
+  for (const e of await fsp.readdir(thumbDir)) {
+    if (/^sprite-\d+\.jpg$/.test(e) && !referenced.has(e)) {
+      try { await fsp.unlink(path.join(thumbDir, e)); } catch {}
+    }
+  }
+  return meta;
+}
+
+// Per-folder dedupe so we don't fire two arrayjoins concurrently for the same folder.
+const spriteInFlight = new Set();
+async function maybeBuildSprite(galleryAbs) {
+  if (spriteInFlight.has(galleryAbs)) return;
+  spriteInFlight.add(galleryAbs);
+  try { await buildSpriteForFolder(galleryAbs); }
+  catch (e) { console.warn('[sprite]', galleryAbs, e.message); }
+  finally { spriteInFlight.delete(galleryAbs); }
 }
 
 // ---------- auth: passkey state ----------
@@ -445,7 +591,7 @@ function verifyES256Signature(publicKeyUncompressed, signature, data) {
 }
 
 // ---------- gallery HTML render ----------
-function galleryHTML({ urlPath, folders, images, sizes, isAdminFlag, hasPasskey }) {
+function galleryHTML({ urlPath, folders, images, sizes, spriteMeta, isAdminFlag, hasPasskey }) {
   // urlPath has leading and trailing /, e.g. "/" or "/vacation/2024/"
   const breadcrumbs = (() => {
     const parts = urlPath.split('/').filter(Boolean);
@@ -520,6 +666,7 @@ var isadmin          = ${isAdminFlag ? 1 : 0};
 var hasPasskey       = ${hasPasskey ? 'true' : 'false'};
 var folderURL        = ${jsString(urlPath)};
 var previewThreshold = ${PREVIEW_SIZE_THRESHOLD};
+var spriteMeta       = ${spriteMeta ? JSON.stringify(spriteMeta) : 'null'};
 </script>
 <script src="/_static/gallery.js"></script>
 
@@ -567,6 +714,12 @@ async function handle(req, res) {
         try { await ensureBuilt(galleryAbs, originalName); return cacheFile; }
         catch { return null; }
       });
+    }
+    // sprite atlas files: /<gallery>/.../thumbcache/sprite-N.jpg
+    if (dirOfFile === 'thumbcache' && /^sprite-\d+\.jpg$/.test(fileName)) {
+      const galleryAbs = resolveGallery(grandparent);
+      if (!galleryAbs) return notFound(res);
+      return serveStaticFile(req, res, path.join(galleryAbs, 'thumbcache', fileName));
     }
 
     // 2) trash file: /<gallery>/.../ggTrash/<file>
@@ -632,11 +785,14 @@ async function handle(req, res) {
 
   // Render gallery page
   const { folders, images, sizes } = await listFolder(abs, { withSizes: true });
+  let spriteMeta = await readSpriteMeta(abs);
+  if (!spriteIsCurrent(spriteMeta, images)) spriteMeta = null;
   const html = galleryHTML({
     urlPath: pathname,
     folders,
     images,
     sizes,
+    spriteMeta,
     isAdminFlag: isAdmin(req),
     hasPasskey: !!getPasskey(),
   });
