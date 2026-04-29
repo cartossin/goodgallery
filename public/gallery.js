@@ -240,9 +240,7 @@
   // ---------- admin bar ----------
   function showAdminBar() {
     var bar = $('adminnotify');
-    var badge = $('adminbadge');
-    if (!window.isadmin) { bar.classList.remove('on'); badge.classList.remove('on'); return; }
-    badge.classList.add('on'); badge.textContent = 'admin';
+    if (!window.isadmin) { bar.classList.remove('on'); return; }
     bar.classList.add('on');
     var inImage = (decodeURIComponent(location.hash.slice(1)) || '').charAt(0) !== ':';
     bar.innerHTML = inImage

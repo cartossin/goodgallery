@@ -841,7 +841,6 @@ function galleryHTML({ urlPath, folders, images, spriteMeta, isAdminFlag, hasPas
 
 <header id="topbar">
   <nav id="breadcrumb">${breadcrumbs}</nav>
-  <span id="adminbadge"></span>
   <a id="adminlink" href="/_admin/" title="Admin">⚙</a>
 </header>
 
