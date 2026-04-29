@@ -156,12 +156,6 @@ class BuildQueue {
         } finally {
           this._bumpProgress(galleryAbs, p => { p.inProgress--; });
           this.inFlight.delete(k);
-          // If this was the last in-flight job for the folder and there were any builds,
-          // (re)build the sprite atlas. Fire-and-forget; deduped per folder.
-          const after = this.progress.get(galleryAbs);
-          if (after && after.pending === 0 && after.inProgress === 0 && after.total > 0) {
-            maybeBuildSprite(galleryAbs);
-          }
         }
       }
     } finally { this.workers--; }
@@ -331,15 +325,17 @@ function vipsThumb(srcAbs, dstAbs, dim, quality) {
   });
 }
 
-// Cover-crop thumb (used for the gallery thumbnail grid → must be a uniform square so
-// the sprite atlas can tile them cleanly).
-function vipsCoverThumb(srcAbs, dstAbs, dim, quality) {
+// Fixed-height, variable-width thumb (preserve aspect ratio). Matches the user's
+// preferred 2014/testgallery look — rows of thumbs at uniform height, no cropping.
+// Sprite atlas was tried but disabled because uniform-cell tiling required cover-cropping
+// every thumb to a square, which loses information at the edges of every image.
+// HTTP/2 multiplexing + 50/page pagination makes per-thumb requests fast enough.
+function vipsHeightThumb(srcAbs, dstAbs, height, quality) {
   return new Promise((resolve, reject) => {
     const tmp = dstAbs + '.__tmp.jpg';
     const args = [
       srcAbs,
-      '--size', `${dim}x${dim}`,
-      '--smartcrop', 'centre',
+      '--size', `99999x${height}>`,  // cap height, no effective width cap; only shrink
       '--output', `${tmp}[Q=${quality},strip,optimize_coding,interlace]`,
     ];
     runVips('vipsthumbnail', args, tmp, dstAbs).then(resolve, reject);
@@ -368,7 +364,7 @@ async function ensureBuilt(folderAbs, filename) {
   await fsp.mkdir(thumbDir, { recursive: true });
   const thumbOut = path.join(thumbDir, filename + '.resized.jpg');
   let did = 0;
-  if (!fs.existsSync(thumbOut)) { await vipsCoverThumb(src, thumbOut, THUMB_CELL, THUMB_QUALITY); did++; }
+  if (!fs.existsSync(thumbOut)) { await vipsHeightThumb(src, thumbOut, THUMB_CELL, THUMB_QUALITY); did++; }
   // Preview only for large originals — for small ones the client uses the original directly.
   if (st.size >= PREVIEW_SIZE_THRESHOLD) {
     const previewDir = path.join(folderAbs, 'previewcache');
@@ -1005,8 +1001,9 @@ async function handle(req, res) {
 
   // Render gallery page
   const { folders, images, sizes } = await listFolder(abs, { withSizes: true });
-  let spriteMeta = await readSpriteMeta(abs);
-  if (!spriteIsCurrent(spriteMeta, images)) spriteMeta = null;
+  // Sprite atlas disabled: required cover-cropped (square) thumbs which the user
+  // prefers not to look at. Per-thumb rendering with HTTP/2 is fast enough.
+  let spriteMeta = null;
   const html = galleryHTML({
     urlPath: pathname,
     folders,
