@@ -36,10 +36,15 @@ const THUMBS_PER_PAGE  = parseInt(process.env.THUMBS_PER_PAGE || '50', 10);
 const THUMB_CELL       = parseInt(process.env.THUMB_CELL || '200', 10);
 const THUMB_DIM        = THUMB_CELL;  // alias for clarity in build path
 const SPRITE_ACROSS      = parseInt(process.env.SPRITE_ACROSS || '20', 10);   // cells per row (target)
-// Cap each sprite atlas by total pixel area, not cell count. With variable-width cells
-// (panoramas etc.), a fixed-count cap could produce a 100MP atlas; this keeps individual
-// sprite files well-bounded. 16M px = ~4kx4k = a few MB JPEG at Q=92.
-const MAX_SPRITE_PIXELS  = parseInt(process.env.MAX_SPRITE_PIXELS || String(16 * 1024 * 1024), 10);
+// Cap each sprite atlas by **target file size**, not cell count or pixel area. With
+// variable-width cells the cell-count axis is meaningless, and pixel area is too far from
+// the user's mental model ("I want sprites under 4MB so a tab loading the gallery is
+// snappy"). We translate target bytes -> pixel cap with an empirical bytes/pixel constant
+// measured at our JPEG quality on typical photo content. Tweak BYTES_PER_PIXEL_Q92 if
+// your galleries are mostly flat-color (lower) or extreme detail (higher).
+const MAX_SPRITE_BYTES   = parseInt(process.env.MAX_SPRITE_BYTES || String(4 * 1024 * 1024), 10);
+const BYTES_PER_PIXEL_Q92 = parseFloat(process.env.BYTES_PER_PIXEL_Q92 || '0.30');
+const MAX_SPRITE_PIXELS   = Math.max(1, Math.floor(MAX_SPRITE_BYTES / BYTES_PER_PIXEL_Q92));
 const PREVIEW_DIM      = parseInt(process.env.PREVIEW_DIM || '2000', 10); // generous; only used for big originals
 const THUMB_QUALITY    = parseInt(process.env.THUMB_QUALITY || '82', 10);
 const PREVIEW_QUALITY  = parseInt(process.env.PREVIEW_QUALITY || '85', 10);
@@ -202,11 +207,16 @@ function startWatcher() {
       if (rel.split('/').some(seg => seg.startsWith('.') || RESERVED.has(seg))) return;
       if (isOrphanTmp(rel)) return;
       const full = path.join(GALLERIES_ROOT, rel);
+      const dir = path.dirname(full);
+      // Any change in the directory makes the sprite metadata potentially stale; drop the
+      // cached entry so the next pageview rechecks (sprite rebuild also invalidates by
+      // refreshing the cached value).
+      spriteMetaCache.delete(dir);
       fs.stat(full, (err, st) => {
         if (err || !st.isFile()) return;
         const base = path.basename(full);
         if (!isImage(base) || isOrphanTmp(base)) return;
-        buildQueue.enqueue(path.dirname(full), base);
+        buildQueue.enqueue(dir, base);
       });
     });
     console.log('Watching', GALLERIES_ROOT, 'recursively for new images.');
@@ -411,11 +421,20 @@ function readJpegDims(absPath) {
 }
 
 // ---------- sprite atlas ----------
+// In-memory cache: spriteMeta lives in RAM after first read. Per-page-view cost drops
+// from one syscall + JSON.parse to a Map.get(). On write we proactively update the cache
+// so the next pageview is hot. Process restart loses the cache; the first request rebuilds.
+const spriteMetaCache = new Map(); // galleryAbs -> meta (or null if file is missing)
+
 async function readSpriteMeta(galleryAbs) {
+  if (spriteMetaCache.has(galleryAbs)) return spriteMetaCache.get(galleryAbs);
+  let meta = null;
   try {
     const raw = await fsp.readFile(path.join(galleryAbs, 'thumbcache', '_sprite.json'), 'utf8');
-    return JSON.parse(raw);
-  } catch { return null; }
+    meta = JSON.parse(raw);
+  } catch {}
+  spriteMetaCache.set(galleryAbs, meta);
+  return meta;
 }
 
 function spriteIsCurrent(meta, images) {
@@ -527,6 +546,7 @@ async function buildSpriteForFolder(galleryAbs) {
   const metaPath = path.join(thumbDir, '_sprite.json');
   await fsp.writeFile(metaPath + '.tmp', JSON.stringify(meta));
   await fsp.rename(metaPath + '.tmp', metaPath);
+  spriteMetaCache.set(galleryAbs, meta);  // hot the cache so the next pageview is zero-I/O
 
   // GC old sprite files no longer referenced.
   const referenced = new Set(sprites.map(s => s.file));
