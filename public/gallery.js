@@ -25,8 +25,6 @@
   var keyslocked = 0;
   var hashmirror = '';
   var monitortimerid = null;
-  var waitingfor = 0;
-  var xhrqueue = 0;
 
   // Build cache URLs that live under the current folder URL.
   // For files smaller than previewThreshold we just use the original — modern browsers
@@ -34,10 +32,10 @@
   function thumbURL(name)         { return folderURL + 'thumbcache/'   + encodeURIComponent(name) + '.resized.jpg'; }
   function previewCacheURL(name)  { return folderURL + 'previewcache/' + encodeURIComponent(name) + '.resized.jpg'; }
   function originalURL(name)      { return folderURL + encodeURIComponent(name); }
-  function previewSrc(i) {
-    var sz = (window.imagesz && imagesz[i]) || 0;
-    return sz >= window.previewThreshold ? previewCacheURL(images[i]) : originalURL(images[i]);
-  }
+  // Server transparently serves the original when no preview file exists, so the client
+  // never has to know which to ask for. Avoids embedding per-image sizes in the page —
+  // important at 60k scale where that'd mean 60k stats per render.
+  function previewSrc(i) { return previewCacheURL(images[i]); }
 
   function $(id) { return document.getElementById(id); }
   function setText(id, t) { var e = $(id); if (e) e.textContent = t; }
@@ -70,50 +68,22 @@
     return t ? { 'Authorization': 'Bearer ' + t } : {};
   }
 
-  function rawrequestbuild(qs) {
-    if (xhrqueue >= window.xhrpush) {
-      setTimeout(function () { rawrequestbuild(qs); }, 250);
-      return;
-    }
-    xhrqueue += 1;
-    gghttp('GET', qs, fnWhenDone);
-  }
-
-  function requestbuild(filenumber) {
-    waitingfor += 1;
-    note('Adding new photo to cache: ' + images[filenumber] + ' — still waiting for ' + waitingfor + ' request' + (waitingfor === 1 ? '' : 's'));
-    var filename = images[filenumber];
-    rawrequestbuild('build=' + encodeURIComponent(filename) + '&inum=' + filenumber + '&nocache=' + Math.random());
-  }
-
-  function fnWhenDone(text) {
-    xhrqueue -= 1;
-    waitingfor -= 1;
-    var n = parseInt(text, 10);
-    if (!isNaN(n) && images[n]) {
-      note(images[n] + ' added — still waiting for ' + waitingfor + ' request' + (waitingfor === 1 ? '' : 's'));
-      var el = document.getElementById('img-' + n);
-      if (el) el.src = el.src; // refresh
-    } else if (text === '') {
-      note('Server did not respond. Will retry as the gallery is browsed.');
-    } else {
-      note('Server: ' + text.slice(0, 200));
-    }
-    if (monitortimerid) clearTimeout(monitortimerid);
-    monitortimerid = setTimeout(clearmonitor, 5000);
-  }
-
   // Server now owns validation/build. Fire-and-forget: ask the server to enqueue,
   // then poll status for feedback. No more client-driven loop.
+  // Server owns validation/build. requestbuildall fires it explicitly and waits-with-poll
+  // for completion (then reloads). On a fresh page load we just monitor whatever is
+  // currently active — never reload, so we don't loop on stale historical totals.
   function requestbuildall() {
     note('Asking server to validate gallery…');
     fetch(folderURL + '?buildall=1', { credentials: 'same-origin', headers: adminHeader() })
       .then(function (r) { return r.text(); })
-      .then(function () { pollBuildStatus(); })
+      .then(function () { pollBuildStatus({ reloadOnComplete: true }); })
       .catch(function () { note('(could not reach server)'); });
   }
   var statusTimer = null;
-  function pollBuildStatus() {
+  function pollBuildStatus(opts) {
+    opts = opts || {};
+    var reloadOnComplete = !!opts.reloadOnComplete;
     if (statusTimer) { clearTimeout(statusTimer); statusTimer = null; }
     fetch(folderURL + '?build-status', { headers: adminHeader() })
       .then(function (r) { return r.json(); })
@@ -121,8 +91,8 @@
         var active = (p.pending || 0) + (p.inProgress || 0);
         if (active > 0) {
           note('Building thumbnails — ' + active + ' remaining (' + p.done + '/' + p.total + ' done)');
-          statusTimer = setTimeout(pollBuildStatus, 700);
-        } else if (p.total > 0) {
+          statusTimer = setTimeout(function () { pollBuildStatus({ reloadOnComplete: reloadOnComplete }); }, 700);
+        } else if (reloadOnComplete && p.total > 0) {
           note('Build complete (' + p.done + '/' + p.total + '). Reloading…');
           setTimeout(function () { location.reload(); }, 800);
         } else {
@@ -172,8 +142,7 @@
     location.hash = hashmirror;
 
     var photo = $('photospot');
-    photo.innerHTML = '<img src="' + previewSrc(inum) + '" id="img-' + inum +
-      '" alt="' + name + '" onerror="ggRequestBuild(' + inum + ')">';
+    photo.innerHTML = '<img src="' + previewSrc(inum) + '" id="img-' + inum + '" alt="' + name + '">';
 
     var pre = $('preimages');
     pre.innerHTML =
@@ -227,7 +196,7 @@
           'background-size:' + (spriteMeta.across * dispPx) + 'px auto;"></a>';
       } else {
         html += '<a href="#' + encodeURIComponent(name) + '" data-i="' + i + '">';
-        html += '<img src="' + thumbURL(name) + '" id="img-' + i + '" alt="' + name + '" loading="lazy" onerror="ggRequestBuild(' + i + ')">';
+        html += '<img src="' + thumbURL(name) + '" id="img-' + i + '" alt="' + name + '" loading="lazy">';
         html += '</a>';
       }
       if (count === window.thumbsperpage || i === lastimagevalue) { thumbpage[page] = html; page++; count = 0; }
@@ -390,15 +359,13 @@
     pollBuildStatus();
   }
 
+  // If a stored admin session exists, optimistically flip the on-page badge. Server
+  // still enforces every admin action — this is purely cosmetic until next page load.
   function maybePromoteAdmin() {
-    var t = localStorage.getItem('ggSession');
-    if (!t || window.isadmin) return;
-    fetch('/api/admin/keys-probe', { headers: { 'Authorization': 'Bearer ' + t } }).catch(function(){});
-    // We can't promote ourselves without a re-render. The admin panel handles login;
-    // when admin is needed on the gallery page itself, just expose actions client-side
-    // (the server still enforces). For UX, flip the badge optimistically:
-    window.isadmin = 1;
-    showAdminBar();
+    if (localStorage.getItem('ggSession') && !window.isadmin) {
+      window.isadmin = 1;
+      showAdminBar();
+    }
   }
 
   // expose for inline handlers / other scripts
@@ -411,7 +378,6 @@
   window.startimage = startimage;
   window.preview = preview;
   window.togglefullres = togglefullres;
-  window.ggRequestBuild = requestbuild;
   window.ggMoveToTrash = ggMoveToTrash;
   window.ggClearCache = ggClearCache;
   window.ggRequestBuildAll = ggRequestBuildAll;

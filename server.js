@@ -591,7 +591,7 @@ function verifyES256Signature(publicKeyUncompressed, signature, data) {
 }
 
 // ---------- gallery HTML render ----------
-function galleryHTML({ urlPath, folders, images, sizes, spriteMeta, isAdminFlag, hasPasskey }) {
+function galleryHTML({ urlPath, folders, images, spriteMeta, isAdminFlag, hasPasskey }) {
   // urlPath has leading and trailing /, e.g. "/" or "/vacation/2024/"
   const breadcrumbs = (() => {
     const parts = urlPath.split('/').filter(Boolean);
@@ -611,7 +611,6 @@ function galleryHTML({ urlPath, folders, images, sizes, spriteMeta, isAdminFlag,
 
   // images[] is 1-indexed in the original; we keep the same convention to preserve old JS
   const imagesJsArray = 'var images = [null,' + images.map(n => jsString(n)).join(',') + '];';
-  const sizesJsArray  = 'var imagesz = [0,'   + (sizes || []).join(',') + '];';
   const lastImageValue = images.length;
 
   return `<!doctype html>
@@ -658,14 +657,12 @@ ${folders.length ? `<section id="folders">${folderCards}</section>` : ''}
 
 <script>
 ${imagesJsArray}
-${sizesJsArray}
 var lastimagevalue   = ${lastImageValue};
 var thumbsperpage    = ${THUMBS_PER_PAGE};
 var xhrpush          = 4;
 var isadmin          = ${isAdminFlag ? 1 : 0};
 var hasPasskey       = ${hasPasskey ? 'true' : 'false'};
 var folderURL        = ${jsString(urlPath)};
-var previewThreshold = ${PREVIEW_SIZE_THRESHOLD};
 var spriteMeta       = ${spriteMeta ? JSON.stringify(spriteMeta) : 'null'};
 </script>
 <script src="/_static/gallery.js"></script>
@@ -709,11 +706,18 @@ async function handle(req, res) {
       const galleryAbs = resolveGallery(grandparent);
       if (!galleryAbs) return notFound(res);
       const cacheFile = path.join(galleryAbs, dirOfFile, fileName);
-      return serveFileWithFallback(req, res, cacheFile, async () => {
-        const originalName = fileName.slice(0, -'.resized.jpg'.length);
-        try { await ensureBuilt(galleryAbs, originalName); return cacheFile; }
-        catch { return null; }
-      });
+      const originalName = fileName.slice(0, -'.resized.jpg'.length);
+      if (fs.existsSync(cacheFile)) return serveStaticFile(req, res, cacheFile);
+      // Miss: trigger build (idempotent; skips preview generation for files <500KB).
+      try { await ensureBuilt(galleryAbs, originalName); } catch {}
+      if (fs.existsSync(cacheFile)) return serveStaticFile(req, res, cacheFile);
+      // For previewcache misses on small files, transparently serve the original.
+      // Browsers scale fine; downsampling tiny files in advance is wasted I/O.
+      if (dirOfFile === 'previewcache') {
+        const original = path.join(galleryAbs, originalName);
+        if (fs.existsSync(original)) return serveStaticFile(req, res, original);
+      }
+      return notFound(res);
     }
     // sprite atlas files: /<gallery>/.../thumbcache/sprite-N.jpg
     if (dirOfFile === 'thumbcache' && /^sprite-\d+\.jpg$/.test(fileName)) {
