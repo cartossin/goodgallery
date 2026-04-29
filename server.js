@@ -35,8 +35,11 @@ const THUMBS_PER_PAGE  = parseInt(process.env.THUMBS_PER_PAGE || '50', 10);
 // atlas. THUMB_CELL is the physical pixel size; CSS displays at half that for 2x retina.
 const THUMB_CELL       = parseInt(process.env.THUMB_CELL || '200', 10);
 const THUMB_DIM        = THUMB_CELL;  // alias for clarity in build path
-const SPRITE_ACROSS    = parseInt(process.env.SPRITE_ACROSS || '20', 10);   // cells per row
-const SPRITE_CAPACITY  = SPRITE_ACROSS * SPRITE_ACROSS;                     // thumbs per sprite
+const SPRITE_ACROSS      = parseInt(process.env.SPRITE_ACROSS || '20', 10);   // cells per row (target)
+// Cap each sprite atlas by total pixel area, not cell count. With variable-width cells
+// (panoramas etc.), a fixed-count cap could produce a 100MP atlas; this keeps individual
+// sprite files well-bounded. 16M px = ~4kx4k = a few MB JPEG at Q=92.
+const MAX_SPRITE_PIXELS  = parseInt(process.env.MAX_SPRITE_PIXELS || String(16 * 1024 * 1024), 10);
 const PREVIEW_DIM      = parseInt(process.env.PREVIEW_DIM || '2000', 10); // generous; only used for big originals
 const THUMB_QUALITY    = parseInt(process.env.THUMB_QUALITY || '82', 10);
 const PREVIEW_QUALITY  = parseInt(process.env.PREVIEW_QUALITY || '85', 10);
@@ -445,18 +448,26 @@ async function buildSpriteForFolder(galleryAbs) {
   });
   const cellW = Math.min(SPRITE_CELL_W_MAX, Math.max(THUMB_CELL, ...widths));
   const cellH = THUMB_CELL;
+  // Dynamic capacity: never let a sprite exceed MAX_SPRITE_PIXELS in area, never let it
+  // exceed SPRITE_ACROSS² in cell count. For wallpaper galleries (366px cells) this is
+  // ~225/sprite; for square thumb galleries (200px) it's the full 400/sprite.
+  const cellArea = cellW * cellH;
+  const cellsPerSprite = Math.max(1, Math.min(
+    SPRITE_ACROSS * SPRITE_ACROSS,
+    Math.floor(MAX_SPRITE_PIXELS / cellArea)
+  ));
 
   const stagingDir = path.join(thumbDir, '_sprite_staging');
   await fsp.rm(stagingDir, { recursive: true, force: true });
   await fsp.mkdir(stagingDir, { recursive: true });
 
-  const numChunks = Math.ceil(images.length / SPRITE_CAPACITY);
+  const numChunks = Math.ceil(images.length / cellsPerSprite);
   const sprites = [];
   const imageMap = {};
 
   try {
     for (let c = 0; c < numChunks; c++) {
-      const chunk = images.slice(c * SPRITE_CAPACITY, (c + 1) * SPRITE_CAPACITY);
+      const chunk = images.slice(c * cellsPerSprite, (c + 1) * cellsPerSprite);
       const inputPaths = [];
       for (let i = 0; i < chunk.length; i++) {
         const link = path.join(stagingDir, `${c}_${i}.jpg`);
@@ -475,7 +486,7 @@ async function buildSpriteForFolder(galleryAbs) {
         const proc = spawn('vips', [
           'arrayjoin',
           inputPaths.join(' '),
-          `${tmp}[Q=80,strip,optimize_coding,interlace]`,
+          `${tmp}[Q=92,strip,optimize_coding,interlace]`,
           '--across', String(SPRITE_ACROSS),
           '--hspacing', String(cellW),
           '--vspacing', String(cellH),
@@ -490,7 +501,7 @@ async function buildSpriteForFolder(galleryAbs) {
         });
       });
       sprites.push({ file: spriteFile, count: chunk.length });
-      const baseOffset = c * SPRITE_CAPACITY;
+      const baseOffset = c * cellsPerSprite;
       chunk.forEach((name, i) => {
         imageMap[name] = {
           sprite: c,
@@ -507,7 +518,7 @@ async function buildSpriteForFolder(galleryAbs) {
   const meta = {
     cellW, cellH,
     across: SPRITE_ACROSS,
-    capacity: SPRITE_CAPACITY,
+    cellsPerSprite,
     sprites,
     imageMap,
     imageCount: images.length,
