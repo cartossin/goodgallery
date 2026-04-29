@@ -81,6 +81,126 @@ async function sweepOrphanTmps(rootDir) {
   return removed;
 }
 
+
+// ---------- build queue ----------
+// Server-side build orchestration. Replaces the 2014 PHP-era pattern where the browser
+// looped against ?buildall=1 to babysit a per-request executor. Node is a long-running
+// process: it can own the queue, watch the filesystem, and just *do* the work.
+//
+// Design rules:
+//   - Bounded concurrency (default min(4, CPU)) — never fork-bomb on a 60k mass upload.
+//   - Per (folder,file) dedupe — repeated triggers for the same file collapse into one job.
+//   - Idempotent — if the thumb already exists ensureBuilt is a no-op.
+//   - Crash-safe — atomicity is enforced inside ensureBuilt; the queue itself is in-memory
+//     and is rebuilt from disk state on the next startup scan, so a process kill loses
+//     only the in-memory progress counters, never on-disk integrity.
+import os from 'os';
+const BUILD_CONCURRENCY = Math.max(1, Math.min(4, os.cpus().length));
+
+class BuildQueue {
+  constructor(concurrency) {
+    this.concurrency = concurrency;
+    this.queue = [];
+    this.inFlight = new Set();
+    this.workers = 0;
+    this.progress = new Map();
+  }
+  _key(g, f) { return g + '\0' + f; }
+  _bumpProgress(g, fn) {
+    const p = this.progress.get(g) || { pending: 0, inProgress: 0, done: 0, total: 0, recent: [] };
+    fn(p);
+    this.progress.set(g, p);
+  }
+  enqueue(galleryAbs, filename) {
+    const k = this._key(galleryAbs, filename);
+    if (this.inFlight.has(k)) return false;
+    this.inFlight.add(k);
+    this.queue.push({ galleryAbs, filename });
+    this._bumpProgress(galleryAbs, p => { p.pending++; p.total++; });
+    this._kick();
+    return true;
+  }
+  async enqueueFolder(galleryAbs) {
+    const { images } = await listFolder(galleryAbs);
+    let n = 0;
+    for (const f of images) if (this.enqueue(galleryAbs, f)) n++;
+    return n;
+  }
+  _kick() {
+    while (this.workers < this.concurrency && this.queue.length) {
+      this.workers++;
+      this._runOne();
+    }
+  }
+  async _runOne() {
+    try {
+      while (this.queue.length) {
+        const { galleryAbs, filename } = this.queue.shift();
+        const k = this._key(galleryAbs, filename);
+        this._bumpProgress(galleryAbs, p => { p.pending--; p.inProgress++; });
+        try {
+          await ensureBuilt(galleryAbs, filename);
+          this._bumpProgress(galleryAbs, p => {
+            p.done++;
+            p.recent.unshift(filename);
+            if (p.recent.length > 10) p.recent.length = 10;
+          });
+        } catch (e) {
+          this._bumpProgress(galleryAbs, p => { p.lastError = filename + ': ' + e.message; });
+          console.warn('[build]', filename, 'in', galleryAbs, '-', e.message);
+        } finally {
+          this._bumpProgress(galleryAbs, p => { p.inProgress--; });
+          this.inFlight.delete(k);
+        }
+      }
+    } finally { this.workers--; }
+  }
+  progressFor(galleryAbs) {
+    const p = this.progress.get(galleryAbs);
+    if (!p) return { pending: 0, inProgress: 0, done: 0, total: 0, recent: [] };
+    return { pending: p.pending, inProgress: p.inProgress, done: p.done, total: p.total, recent: p.recent.slice(), lastError: p.lastError };
+  }
+  async scanAll(root) {
+    let totalQueued = 0;
+    const walk = async (dir) => {
+      let entries;
+      try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { return; }
+      for (const e of entries) {
+        if (e.name.startsWith('.') || RESERVED.has(e.name)) continue;
+        if (e.isDirectory()) await walk(path.join(dir, e.name));
+      }
+      totalQueued += await this.enqueueFolder(dir);
+    };
+    await walk(root);
+    return totalQueued;
+  }
+}
+
+const buildQueue = new BuildQueue(BUILD_CONCURRENCY);
+
+// ---------- filesystem watcher ----------
+// Detect new images dropped via scp/rsync/mv and queue them. fs.watch supports recursive
+// on Linux as of Node 20.11+ (this CT runs 20.19).
+function startWatcher() {
+  try {
+    fs.watch(GALLERIES_ROOT, { recursive: true }, (eventType, rel) => {
+      if (!rel) return;
+      if (rel.split('/').some(seg => seg.startsWith('.') || RESERVED.has(seg))) return;
+      if (isOrphanTmp(rel)) return;
+      const full = path.join(GALLERIES_ROOT, rel);
+      fs.stat(full, (err, st) => {
+        if (err || !st.isFile()) return;
+        const base = path.basename(full);
+        if (!isImage(base) || isOrphanTmp(base)) return;
+        buildQueue.enqueue(path.dirname(full), base);
+      });
+    });
+    console.log('Watching', GALLERIES_ROOT, 'recursively for new images.');
+  } catch (e) {
+    console.warn('fs.watch failed:', e.message, '— file additions will only be picked up on next startup scan.');
+  }
+}
+
 // ---------- in-memory state ----------
 const sessions         = new Map();  // token  -> { createdAt }
 const pendingChallenges = new Map(); // chalId -> { challenge, timestamp }
@@ -490,6 +610,9 @@ async function handle(req, res) {
   if (q.has('deletefile'))  return adminAction(req, res, () => deletefile(abs, q.get('deletefile')));
   if (q.has('restoreall'))  return adminAction(req, res, () => restoreall(abs));
   if (q.has('emptytrash'))  return adminAction(req, res, () => emptytrash(abs));
+  if (q.has('build-status')) {
+    return sendJson(res, 200, buildQueue.progressFor(abs));
+  }
   if (q.get('api') === 'list') {
     const { folders, images } = await listFolder(abs);
     return sendJson(res, 200, { folders, images });
@@ -534,22 +657,11 @@ async function handleBuild(req, res, abs, q) {
 }
 
 async function handleBuildAll(req, res, abs) {
+  // Fire-and-forget: enqueue + sweep orphans, return '1' so legacy clients consider it
+  // validated. Workers do the actual building in the background; clients can poll
+  // ?build-status for live progress instead of looping this endpoint.
   const { images } = await listFolder(abs);
-  // shuffle so partial completions still cover the gallery (matches 2014 behavior)
-  for (let i = images.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [images[i], images[j]] = [images[j], images[i]];
-  }
-  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-  for (const name of images) {
-    try {
-      const did = await ensureBuilt(abs, name);
-      if (did) res.write(name + ' built\n');
-    } catch (e) {
-      res.write(name + ' FAILED: ' + e.message + '\n');
-    }
-  }
-  // Sweep orphan caches (cache file with no matching original)
+  const queued = await buildQueue.enqueueFolder(abs);
   const presence = new Set(images);
   for (const sub of ['thumbcache', 'previewcache']) {
     const dir = path.join(abs, sub);
@@ -561,7 +673,7 @@ async function handleBuildAll(req, res, abs) {
       if (!presence.has(original)) { try { fs.unlinkSync(path.join(dir, f)); } catch {} }
     }
   }
-  res.end('1');
+  return sendText(res, 200, `queued ${queued} job(s)\n1`);
 }
 
 // ---------- admin actions on a folder ----------
@@ -846,11 +958,16 @@ const server = http.createServer((req, res) => {
     if (!res.headersSent) sendText(res, 500, 'internal error');
   });
 });
-sweepOrphanTmps(GALLERIES_ROOT).then(n => {
-  if (n) console.log(`Swept ${n} orphan tmp file(s) at startup.`);
+(async () => {
+  const swept = await sweepOrphanTmps(GALLERIES_ROOT);
+  if (swept) console.log(`Swept ${swept} orphan tmp file(s) at startup.`);
+  startWatcher();
+  buildQueue.scanAll(GALLERIES_ROOT).then(n => {
+    if (n) console.log(`Startup scan queued ${n} build job(s) (concurrency=${BUILD_CONCURRENCY}).`);
+  }).catch(e => console.warn('Startup scan error:', e.message));
   server.listen(PORT, HOST, () => {
     console.log(`Goodgallery listening on http://${HOST}:${PORT}`);
     console.log(`  galleries root: ${GALLERIES_ROOT}`);
     console.log(`  state dir:      ${STATE_DIR}`);
   });
-});
+})();

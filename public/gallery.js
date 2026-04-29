@@ -103,20 +103,33 @@
     monitortimerid = setTimeout(clearmonitor, 5000);
   }
 
+  // Server now owns validation/build. Fire-and-forget: ask the server to enqueue,
+  // then poll status for feedback. No more client-driven loop.
   function requestbuildall() {
-    note('Validating gallery, please wait…');
+    note('Asking server to validate gallery…');
     fetch(folderURL + '?buildall=1', { credentials: 'same-origin', headers: adminHeader() })
       .then(function (r) { return r.text(); })
-      .then(function (text) {
-        var trimmed = text.replace(/\s+$/, '');
-        if (trimmed.charAt(trimmed.length - 1) === '1') {
-          note('Gallery 100% built. Reloading…');
-          setTimeout(function () { location.reload(); }, 1500);
+      .then(function () { pollBuildStatus(); })
+      .catch(function () { note('(could not reach server)'); });
+  }
+  var statusTimer = null;
+  function pollBuildStatus() {
+    if (statusTimer) { clearTimeout(statusTimer); statusTimer = null; }
+    fetch(folderURL + '?build-status', { headers: adminHeader() })
+      .then(function (r) { return r.json(); })
+      .then(function (p) {
+        var active = (p.pending || 0) + (p.inProgress || 0);
+        if (active > 0) {
+          note('Building thumbnails — ' + active + ' remaining (' + p.done + '/' + p.total + ' done)');
+          statusTimer = setTimeout(pollBuildStatus, 700);
+        } else if (p.total > 0) {
+          note('Build complete (' + p.done + '/' + p.total + '). Reloading…');
+          setTimeout(function () { location.reload(); }, 800);
         } else {
-          requestbuildall();
+          note('');
         }
       })
-      .catch(function () { setTimeout(requestbuildall, 2000); });
+      .catch(function () {});
   }
 
   // ---------- nav helpers ----------
@@ -357,6 +370,7 @@
     }
 
     window.addEventListener('hashchange', refreshfromhash);
+    pollBuildStatus();
   }
 
   function maybePromoteAdmin() {
