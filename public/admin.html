@@ -129,9 +129,6 @@ async function checkAuth() {
   if (sessionToken) {
     var ok = await fetch('/api/admin/probe', { headers: authHeaders() }).then(r => r.ok).catch(() => false);
     if (ok) { showMain(); return; }
-    // probe endpoint may not exist; try a benign admin-only call
-    var ok2 = await fetch('/?api=list', { headers: authHeaders() }).then(r => r.ok).catch(() => false);
-    if (ok2) { showMain(); return; }
     sessionToken = null; localStorage.removeItem('ggSession');
   }
 
@@ -270,7 +267,7 @@ async function loadFolder() {
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 async function trashImage(name) {
-  if (!confirm('Move ' + name + ' to trash?')) return;
+  // No confirm — trash is reversible (Explore Trash button restores).
   var r = await fetch(cwdPath + '?movetotrash=' + encodeURIComponent(name), { method: 'POST', headers: authHeaders() });
   log(await r.text());
   loadFolder();

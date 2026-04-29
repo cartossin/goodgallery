@@ -260,10 +260,10 @@
 
   // ---------- admin actions (delegated to globals) ----------
   function ggMoveToTrash() {
-    if (!confirm('Move ' + images[inum] + ' to trash?')) return;
+    // No confirm — trash is reversible (see Explore Trash). Show a quick note for feedback.
+    note('Moving ' + images[inum] + ' to trash…');
     gghttp('POST', 'movetotrash=' + encodeURIComponent(images[inum]), function (t) {
-      note(t || '(no response)');
-      // shift to next image after a brief moment
+      note(t || 'moved to trash');
       setTimeout(function () { location.reload(); }, 600);
     });
   }
@@ -363,13 +363,22 @@
     pollBuildStatus();
   }
 
-  // If a stored admin session exists, optimistically flip the on-page badge. Server
-  // still enforces every admin action — this is purely cosmetic until next page load.
+  // If a stored admin session exists, probe its validity with the server. Only enable
+  // the admin bar on a 200 response; otherwise drop the stale token. Avoids the
+  // confusing state where the UI thinks you're logged in but every admin call 401s.
   function maybePromoteAdmin() {
-    if (localStorage.getItem('ggSession') && !window.isadmin) {
-      window.isadmin = 1;
-      showAdminBar();
-    }
+    var t = localStorage.getItem('ggSession');
+    if (!t || window.isadmin) return;
+    fetch('/api/admin/probe', { headers: { 'Authorization': 'Bearer ' + t } })
+      .then(function (r) {
+        if (r.ok) {
+          window.isadmin = 1;
+          showAdminBar();
+        } else {
+          localStorage.removeItem('ggSession');
+        }
+      })
+      .catch(function () { /* network down — leave token alone, retry next load */ });
   }
 
   // expose for inline handlers / other scripts

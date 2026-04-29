@@ -227,8 +227,33 @@ function startWatcher() {
 }
 
 // ---------- in-memory state ----------
-const sessions         = new Map();  // token  -> { createdAt }
+const sessions         = new Map();  // token -> { createdAt }
 const pendingChallenges = new Map(); // chalId -> { challenge, timestamp }
+
+// Persist sessions across server restarts. Without this, every restart silently
+// invalidates every admin's localStorage token, leaving the UI in a confused state
+// where the client believes it's logged in but every admin call returns 401.
+const SESSIONS_FILE = path.join(STATE_DIR, 'sessions.json');
+function loadSessions() {
+  try {
+    const raw = fs.readFileSync(SESSIONS_FILE, 'utf8');
+    const obj = JSON.parse(raw);
+    const now = Date.now();
+    for (const [tok, data] of Object.entries(obj)) {
+      if (now - data.createdAt < SESSION_DURATION) sessions.set(tok, data);
+    }
+    if (sessions.size) console.log(`Restored ${sessions.size} admin session(s) from disk.`);
+  } catch {}
+}
+function saveSessions() {
+  const obj = Object.fromEntries(sessions);
+  const tmp = SESSIONS_FILE + '.tmp';
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(obj));
+    fs.renameSync(tmp, SESSIONS_FILE);
+  } catch (e) { console.warn('saveSessions failed:', e.message); }
+}
+loadSessions();
 
 setInterval(() => {
   const now = Date.now();
@@ -869,6 +894,7 @@ function savePasskey(pk) {
 function newSession() {
   const token = crypto.randomBytes(32).toString('base64url');
   sessions.set(token, { createdAt: Date.now() });
+  saveSessions();
   return token;
 }
 function isAdmin(req) {
@@ -1350,6 +1376,9 @@ function splitMultipart(buf, boundary) {
 
 // ---------- admin auth API ----------
 async function handleAdminAPI(req, res, pathname, method) {
+  if (method === 'GET' && pathname === '/api/admin/probe') {
+    return sendJson(res, isAdmin(req) ? 200 : 401, { admin: isAdmin(req) });
+  }
   if (method === 'GET' && pathname === '/api/admin/status') {
     return sendJson(res, 200, { passkeyExists: !!getPasskey() });
   }
