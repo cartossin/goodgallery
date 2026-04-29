@@ -164,11 +164,11 @@ class BuildQueue {
         } finally {
           this._bumpProgress(galleryAbs, p => { p.inProgress--; });
           this.inFlight.delete(k);
-          // When the folder's queue drains and any builds occurred, (re)build the sprite
-          // atlas. Fire-and-forget; deduped per folder so concurrent triggers don't race.
+          // When the folder's queue drains, schedule (debounced) a sprite rebuild.
+          // Multiple drains in quick succession collapse into one rebuild after quiet.
           const after = this.progress.get(galleryAbs);
           if (after && after.pending === 0 && after.inProgress === 0 && after.total > 0) {
-            maybeBuildSprite(galleryAbs);
+            scheduleSpriteBuild(galleryAbs);
           }
         }
       }
@@ -590,6 +590,21 @@ async function maybeBuildSprite(galleryAbs) {
   try { await buildSpriteForFolder(galleryAbs); }
   catch (e) { console.warn('[sprite]', galleryAbs, e.message); }
   finally { spriteInFlight.delete(galleryAbs); }
+}
+
+// Debounce sprite rebuilds. Without this, dropping 1000 files into a folder triggers
+// 1000 sprite rebuilds (one per fs.watch + queue-drain). With this, we wait for the
+// dust to settle (5s of quiet) and rebuild once. Safe because the sprite is just a
+// derived cache — never being current for a few seconds isn't a correctness problem.
+const SPRITE_DEBOUNCE_MS = parseInt(process.env.SPRITE_DEBOUNCE_MS || '5000', 10);
+const spriteDebounceTimers = new Map();
+function scheduleSpriteBuild(galleryAbs) {
+  const existing = spriteDebounceTimers.get(galleryAbs);
+  if (existing) clearTimeout(existing);
+  spriteDebounceTimers.set(galleryAbs, setTimeout(() => {
+    spriteDebounceTimers.delete(galleryAbs);
+    maybeBuildSprite(galleryAbs);
+  }, SPRITE_DEBOUNCE_MS));
 }
 
 
