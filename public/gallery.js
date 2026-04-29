@@ -243,15 +243,15 @@
     return totalH;
   }
 
-  var ZOOM_KEY_PREFIX = 'ggZoom:';
-  function getZoom() {
-    var saved = localStorage.getItem(ZOOM_KEY_PREFIX + folderURL);
-    var t = saved !== null ? parseInt(saved, 10) : 0;  // default = fit-all
+  // Zoom is in-memory only — every fresh page load starts at fit-all (0). Dragging
+  // the slider updates this value but it never persists; reload resets the view.
+  var currentZoom = 0;
+  function getZoom() { return currentZoom; }
+  function setZoom(t) {
     if (isNaN(t) || t < 0) t = 0;
     if (t > 100) t = 100;
-    return t;
+    currentZoom = t;
   }
-  function setZoom(t) { localStorage.setItem(ZOOM_KEY_PREFIX + folderURL, String(t)); }
 
   function targetRowHeight(t) {
     if (!window.spriteMeta) return 100;
