@@ -552,10 +552,10 @@ async function buildSpriteForFolder(galleryAbs) {
         };
       });
     }
-  }
-  // (staging dir cleaned by next run; leaving it on failure for post-mortem)
-  finally {
-    // skip cleanup to allow post-mortem on failures; next run rms before re-creating
+  } finally {
+    // Clean up staging on success and failure. The next run rms it anyway, but this
+    // keeps thumbcache/ tidy for casual inspection.
+    await fsp.rm(stagingDir, { recursive: true, force: true });
   }
 
   const meta = {
