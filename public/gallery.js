@@ -148,17 +148,25 @@
   function isThumbView() { return focusedIdx === 0; }
   function leftbutton()  { if (focusedIdx > 0) shiftFocus(-1); }
   function rightbutton() { if (focusedIdx > 0) shiftFocus(+1); }
+  // commandedIdx tracks the most recently requested focus target. If a smooth-scroll
+  // animation is still playing when the user fires another shiftFocus (e.g. by mashing
+  // ArrowRight three times), each press accumulates against commandedIdx instead of
+  // the slowly-updating focusedIdx — so 3 fast presses jump 3 images and the animation
+  // chases the final target rather than gating the input.
+  var commandedIdx = 0;
   function shiftFocus(delta) {
     if (lastimagevalue < 1) return;
-    var next = focusedIdx + delta;
+    // Use commandedIdx if we're mid-animation (it's ahead of focusedIdx); otherwise
+    // use focusedIdx (canonical when scroll has settled).
+    var base = (focusInProgrammaticScroll && commandedIdx > 0) ? commandedIdx : focusedIdx;
+    var next = base + delta;
     if (next < 1) next = lastimagevalue;
     if (next > lastimagevalue) next = 1;
     if (focusedIdx > 0 && canvasEl) {
-      // Already in focus mode: smooth-scroll the strip to the new image.
+      commandedIdx = next;
       var stride = focusStride();
       focusInProgrammaticScroll = true;
       setFocusScrollPos((next - 1) * stride, true);
-      // history will catch up via drawFocusForScroll's centeredIdx tracking.
     } else {
       location.hash = encodeURIComponent(images[next]);
     }
@@ -724,7 +732,10 @@
     if (focusInProgrammaticScroll) {
       var stride2 = stride;
       var target = Math.round(pos / stride2) * stride2;
-      if (Math.abs(pos - target) < 1) focusInProgrammaticScroll = false;
+      if (Math.abs(pos - target) < 1) {
+        focusInProgrammaticScroll = false;
+        commandedIdx = focusedIdx;  // resync so the next shiftFocus reads from focusedIdx
+      }
     }
   }
 
@@ -1058,27 +1069,40 @@
       }
     }, { passive: false });
 
-    // Pinch-to-zoom in grid mode drives the zoom slider. The viewport meta is locked
-    // (user-scalable=no) so the browser will not intercept this gesture itself.
-    // Mapping is logarithmic: a doubling of finger distance moves the slider +25,
-    // a halving moves it -25 — analogous to a CSS transform: scale() feel.
+    // Pinch-to-zoom drives the slider regardless of where the gesture starts on
+    // the page. The handlers are bound at the document level for two reasons:
+    //   1. iOS Safari deliberately ignores user-scalable=no — the only reliable way
+    //      to block native pinch-zoom is preventDefault on every 2-finger touchmove
+    //      AND on Safari's gesture* events. Binding to #thumbs only would let a pinch
+    //      that started in the topbar/footer fall through to native browser zoom.
+    //   2. The user expects to pinch anywhere; a thumbs-bound handler felt arbitrary.
+    // Mapping is logarithmic: a doubling of finger distance moves the slider +25.
     var pinch = null;
     function dist(t1, t2) {
       var dx = t1.clientX - t2.clientX, dy = t1.clientY - t2.clientY;
       return Math.sqrt(dx * dx + dy * dy);
     }
-    thumbsEl.addEventListener('touchstart', function (e) {
+    // Safari-only "gesture*" events represent the pinch directly. Blocking them is
+    // the most reliable suppressor of browser pinch-zoom on iOS / desktop Safari.
+    function blockGesture(e) { e.preventDefault(); }
+    document.addEventListener('gesturestart',  blockGesture, { passive: false });
+    document.addEventListener('gesturechange', blockGesture, { passive: false });
+    document.addEventListener('gestureend',    blockGesture, { passive: false });
+
+    document.addEventListener('touchstart', function (e) {
       if (e.touches.length === 2) {
-        // v0 is the starting slider value. In focus mode that's 100; in grid it's whatever.
         pinch = { d0: dist(e.touches[0], e.touches[1]), v0: focusedIdx > 0 ? 100 : getZoom() };
+        e.preventDefault();
+      } else if (e.touches.length > 2) {
+        pinch = null;
         e.preventDefault();
       } else {
         pinch = null;
       }
     }, { passive: false });
-    thumbsEl.addEventListener('touchmove', function (e) {
+    document.addEventListener('touchmove', function (e) {
+      if (e.touches.length >= 2) e.preventDefault();  // unconditionally block native pinch zoom
       if (!pinch || e.touches.length !== 2) return;
-      e.preventDefault();
       var d = dist(e.touches[0], e.touches[1]);
       if (d < 1 || pinch.d0 < 1) return;
       var newVal = Math.max(0, Math.min(100, pinch.v0 + Math.log2(d / pinch.d0) * 25));
@@ -1088,10 +1112,10 @@
       pinch.d0 = d;
       pinch.v0 = focusedIdx > 0 ? 100 : newVal;
     }, { passive: false });
-    thumbsEl.addEventListener('touchend', function (e) {
+    document.addEventListener('touchend', function (e) {
       if (e.touches.length < 2) pinch = null;
     });
-    thumbsEl.addEventListener('touchcancel', function () { pinch = null; });
+    document.addEventListener('touchcancel', function () { pinch = null; });
   }
 
   // ---------- thumb click delegation ----------
