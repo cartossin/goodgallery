@@ -592,8 +592,13 @@
   // canvas is repainted with that image's bitmap. During scrubbing we paint the
   // main image from the same h50 atlas (instant, low-res); on idle Stage 2 will
   // upgrade to the highest available LoD.
-  var FILM_H = 70;        // filmstrip CSS-px height (atlas h=50 + 10px top/bottom pad)
-  var FILM_GAP = 4;
+  // Filmstrip thumbs are drawn from the h50 atlas but displayed at 60% size (30 CSS px).
+  // Browser downscales 50→30 cleanly; no separate atlas tier needed. Total filmstrip
+  // strip height = display size + 4px top/bottom padding so the white "centered" outline
+  // doesn't clip against the viewport edge.
+  var FILM_TILE_H = 30;
+  var FILM_H = FILM_TILE_H + 8;
+  var FILM_GAP = 3;
   var mainEl = null;      // main image canvas
   var filmstripEl = null; // filmstrip scroll container
   var filmCanvasEl = null;// canvas inside filmstrip
@@ -611,12 +616,13 @@
     var n = lastimagevalue;
     filmTilePos = new Float64Array(n);
     filmTileW = new Float64Array(n);
-    var atlasH = 50;  // matches the h50 atlas tier
     var x = 0;
     for (var i = 0; i < n; i++) {
       var name = images[i + 1];
       var loc = name && spriteMeta && spriteMeta.imageMap && spriteMeta.imageMap[name];
-      var w = loc ? Math.max(8, Math.round(loc.w * atlasH / CANONICAL_H)) : atlasH;
+      // Display width = aspect-preserving width at FILM_TILE_H. Floor at 6px so
+      // ultra-narrow images are still tappable.
+      var w = loc ? Math.max(6, Math.round(loc.w * FILM_TILE_H / CANONICAL_H)) : FILM_TILE_H;
       filmTilePos[i] = x;
       filmTileW[i] = w;
       x += w + FILM_GAP;
@@ -773,7 +779,7 @@
     var scrollLeft = filmstripEl.scrollLeft;
     var leftEdge = scrollLeft - filmPadL;
     var rightEdge = leftEdge + W;
-    var yPad = (FILM_H - atlasH) / 2;
+    var yPad = Math.round((FILM_H - FILM_TILE_H) / 2);
 
     var newCenterIdx = filmCenteredIdx1(scrollLeft, W);
     if (newCenterIdx !== focusedIdx) {
@@ -795,6 +801,10 @@
       }
       var aCellW = atlas.cellW, aCellH = atlas.cellH;
       var aPerSprite = atlas.cellsPerSprite, aAcross = atlas.across;
+      // Source from the atlas at its full h50 cell size; drawImage downscales to
+      // FILM_TILE_H (=30) for the displayed thumb. srcW = atlas-cell width for
+      // this image (loc.w * 50/CANONICAL_H == filmTileW * 50/FILM_TILE_H).
+      var srcScale = aCellH / FILM_TILE_H;
       for (var i = lo; i < n; i++) {
         var tx = filmTilePos[i];
         var tw = filmTileW[i];
@@ -806,12 +816,12 @@
         var col = posInSprite % aAcross;
         var bitmap = bitmaps[spriteIdx];
         if (!bitmap) continue;
-        var srcW = Math.round(tw);
-        ctx.drawImage(bitmap, col * aCellW, row * aCellH, srcW, aCellH, screenX, yPad, tw, atlasH);
+        var srcW = Math.round(tw * srcScale);
+        ctx.drawImage(bitmap, col * aCellW, row * aCellH, srcW, aCellH, screenX, yPad, tw, FILM_TILE_H);
         if (i + 1 === focusedIdx) {
           ctx.strokeStyle = '#fff';
-          ctx.lineWidth = 2;
-          ctx.strokeRect(screenX + 1, yPad + 1, tw - 2, atlasH - 2);
+          ctx.lineWidth = 1.5;
+          ctx.strokeRect(screenX + 0.5, yPad + 0.5, tw - 1, FILM_TILE_H - 1);
         }
       }
     });

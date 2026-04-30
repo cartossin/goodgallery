@@ -1182,10 +1182,6 @@ ${folders.length ? `<section id="folders">${folderCards}</section>` : ''}
 
 <div id="login"></div>
 
-<footer id="bottomlink">
-  <a href="https://lagbag.com/goodgallery">GoodGallery</a> · ${images.length} image${images.length===1?'':'s'}${folders.length?` · ${folders.length} folder${folders.length===1?'':'s'}`:''}
-</footer>
-
 <script>
 var images           = [null];
 var lastimagevalue   = ${lastImageValue};
