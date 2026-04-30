@@ -168,6 +168,15 @@
 
   // ---------- view ----------
 
+  // rAF-throttled re-layout. Slider input + window resize fire many events; this
+  // collapses them to one renderGallery per frame.
+  var rafPending = false;
+  function scheduleRender() {
+    if (rafPending) return;
+    rafPending = true;
+    requestAnimationFrame(function () { rafPending = false; renderGallery(); });
+  }
+
   function chromeHeight() {
     var top = document.getElementById('topbar');
     var foot = document.getElementById('bottomlink');
@@ -530,6 +539,22 @@
       return;
     }
 
+    // Anchor the zoom: find the image at the top-left of the viewport BEFORE re-layout
+    // so we can restore scroll position to keep it visually pinned. Only meaningful in
+    // grid mode (focusedIdx==0); focus mode owns scroll positioning explicitly.
+    var anchorName = null, anchorViewportOffset = 0;
+    if (focusedIdx === 0 && lastTileRects.length > 0 && thumbsEl.scrollTop > 0) {
+      var scrollY = thumbsEl.scrollTop;
+      for (var ai = 0; ai < lastTileRects.length; ai++) {
+        var at = lastTileRects[ai];
+        if (at.y + at.h > scrollY && at.x === 0) {
+          anchorName = at.name;
+          anchorViewportOffset = at.y - scrollY;  // negative if tile starts above viewport
+          break;
+        }
+      }
+    }
+
     // Compute layout
     var H = targetRowHeight(getZoom());
     currentRowHeight = H;  // drawCanvasForScroll uses this to pick the atlas
@@ -572,14 +597,24 @@
       y += rows[r].height + ROW_GAP;
     }
 
-    // Position scroll: in focus mode, center the focused tile in the viewport. In grid
-    // mode (no focus), reset to top.
+    // Position scroll. Three cases:
+    //   1. focus mode: center the focused tile in the viewport.
+    //   2. grid mode with anchor: keep the previously-top-left image pinned to the
+    //      same viewport offset (so zoom doesn't yank you back to the top of the list).
+    //   3. grid mode no anchor (first render or scrollTop already 0): leave at top.
+    var maxScroll = Math.max(0, totalH - viewportH);
     if (focusedIdx > 0 && focusedIdx <= lastTileRects.length) {
       var tile = lastTileRects[focusedIdx - 1];
-      var vH = viewportH;  // available viewport height
-      var target = tile.y + tile.h / 2 - vH / 2;
-      var maxScroll = Math.max(0, totalH - vH);
+      var target = tile.y + tile.h / 2 - viewportH / 2;
       thumbsEl.scrollTop = Math.max(0, Math.min(maxScroll, target));
+    } else if (anchorName) {
+      for (var ki = 0; ki < lastTileRects.length; ki++) {
+        if (lastTileRects[ki].name === anchorName) {
+          var newScroll = lastTileRects[ki].y - anchorViewportOffset;
+          thumbsEl.scrollTop = Math.max(0, Math.min(maxScroll, newScroll));
+          break;
+        }
+      }
     } else {
       thumbsEl.scrollTop = 0;
     }
