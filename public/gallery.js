@@ -710,28 +710,35 @@
 
     window.addEventListener('resize', scheduleRender);
 
-    // Async-load the binary imagemap; once it's parsed, populate per-image preview URLs
-    // and re-trigger the initial route to render. Without it (e.g. sprite not built yet)
-    // renderGallery falls through to the "Generating thumbnails…" placeholder.
-    if (window.imagemapURL && window.spriteMeta) {
-      loadImagemap().then(function () {
-        for (var i = 1; i <= lastimagevalue; i++) previewimages[i] = previewSrc(i);
-        refreshfromhash();
-      }).catch(function (e) {
-        console.warn('[imagemap] load failed:', e);
-      });
+    // Show a loading placeholder while the binary imagemap is in flight, then run the
+    // initial route once we have data. If there's no imagemap to load (e.g. sprite not
+    // built yet) we still want to render — fall through to renderGallery which has its
+    // own "Generating thumbnails…" placeholder for the spriteMeta=null case.
+    function runInitialRoute() {
+      var raw = decodeURIComponent(location.hash.slice(1) || '');
+      if (!raw || raw.charAt(0) === ':') {
+        displaythumbs();
+      } else if (lastimagevalue > 0) {
+        var found = 0;
+        for (var j = 1; j <= lastimagevalue; j++) if (raw === images[j]) { inum = j; found = 1; break; }
+        if (found) startimage(); else displaythumbs();
+      } else {
+        displaythumbs();
+      }
     }
 
-    // initial route: hash empty or ':N' → thumb view; #filename → image view
-    var raw = decodeURIComponent(location.hash.slice(1) || '');
-    if (!raw || raw.charAt(0) === ':') {
-      displaythumbs();
-    } else if (lastimagevalue > 0) {
-      var found = 0;
-      for (var j = 1; j <= lastimagevalue; j++) if (raw === images[j]) { inum = j; found = 1; break; }
-      if (found) startimage(); else displaythumbs();
+    if (window.imagemapURL && window.spriteMeta) {
+      var thumbsEl = $('thumbs');
+      if (thumbsEl) thumbsEl.innerHTML = '<div style="padding:32px;text-align:center;color:#888">Loading…</div>';
+      loadImagemap().then(function () {
+        for (var i = 1; i <= lastimagevalue; i++) previewimages[i] = previewSrc(i);
+        runInitialRoute();
+      }).catch(function (e) {
+        console.warn('[imagemap] load failed:', e);
+        runInitialRoute();  // attempt render anyway; may show "Generating…" or No images
+      });
     } else {
-      displaythumbs();
+      runInitialRoute();
     }
 
     window.addEventListener('hashchange', refreshfromhash);
