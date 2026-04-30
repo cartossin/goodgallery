@@ -150,13 +150,7 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   max-width: 320px;    /* sanity cap for ultra-wide panoramas */
 }
 
-#preloader { display: none; }
 
-#photodiv { padding: 12px 8px; text-align: center; }
-#photospot { display: inline-block; cursor: zoom-in; }
-#photospot img { max-height: 92vh; max-width: 100%; }
-#photodiv.fullres #photospot { cursor: zoom-out; }
-#photodiv.fullres #photospot img { max-height: none; max-width: none; }
 
 #login { padding: 14px; text-align: center; }
 #login form { display: inline-flex; gap: 8px; }

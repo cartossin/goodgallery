@@ -1185,12 +1185,6 @@ ${folders.length ? `<section id="folders">${folderCards}</section>` : ''}
 <div id="realtime"></div>
 <div id="thumbs"></div>
 
-<div id="preloader"><a id="preimages">·</a></div>
-
-<div id="photodiv">
-  <a id="photospot" onclick="togglefullres()"></a>
-</div>
-
 <div id="login"></div>
 
 <footer id="bottomlink">

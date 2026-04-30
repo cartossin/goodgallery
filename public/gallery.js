@@ -56,8 +56,9 @@
 
   var previewimages = [null];
   var thumbs        = [null];
-  var inum = 1;
-  var isfullres = 0;
+  var inum = 1;             // legacy alias for focusedIdx — keep for any old refs
+  var focusedIdx = 0;       // 0 = no focus (grid view); 1..N = focused image index (1-based)
+  var isfullres = 0;        // unused after viewer removal; kept to satisfy any leftover refs
   var keyslocked = 0;
   var hashmirror = '';
   var monitortimerid = null;
@@ -140,78 +141,36 @@
   function nextIndex(i) { return i === lastimagevalue ? 1 : i + 1; }
   function prevIndex(i) { return i === 1 ? lastimagevalue : i - 1; }
 
-  function nextimage()    { inum = nextIndex(inum); startimage(); }
-  function previousimage(){ inum = prevIndex(inum); startimage(); }
+  function nextimage()    { shiftFocus(+1); }
+  function previousimage(){ shiftFocus(-1); }
 
-  function isThumbView() {
-    var raw = decodeURIComponent(location.hash.slice(1) || '');
-    return !raw || raw.charAt(0) === ':';
+  function isThumbView() { return focusedIdx === 0; }
+  function leftbutton()  { if (focusedIdx > 0) shiftFocus(-1); }
+  function rightbutton() { if (focusedIdx > 0) shiftFocus(+1); }
+  function shiftFocus(delta) {
+    if (lastimagevalue < 1) return;
+    var next = focusedIdx + delta;
+    if (next < 1) next = lastimagevalue;
+    if (next > lastimagevalue) next = 1;
+    location.hash = encodeURIComponent(images[next]);
   }
-  function leftbutton()  { if (isThumbView()) return; previousimage(); }
-  function rightbutton() { if (isThumbView()) return; nextimage(); }
 
   // ---------- keys ----------
   function unlockkeys() { keyslocked = 0; }
   function keycheck(e) {
     if (keyslocked) return;
     var k = e.which || e.keyCode;
-    if (k === 37 && !isfullres) leftbutton();
-    else if (k === 39 && !isfullres) rightbutton();
-    else if (k === 13) togglefullres();
-    else if (k === 27 && isfullres) togglefullres();
+    if (k === 37) leftbutton();
+    else if (k === 39) rightbutton();
+    else if (k === 27 && focusedIdx > 0) { location.hash = ''; }  // ESC = back to grid
     keyslocked = 1;
   }
 
-  // ---------- view ----------
-  function startimage() {
-    showAdminBar();
-    setHTML('thumbs', '');
-    isfullres = 0;
-    document.body.classList.add('image-view');
-    document.body.classList.remove('thumb-view');
-    var pd = $('photodiv'); if (pd) pd.classList.remove('fullres');
-    var name = images[inum];
-    hashmirror = encodeURIComponent(name);
-    location.hash = hashmirror;
-
-    var photo = $('photospot');
-    photo.innerHTML = '<img src="' + previewSrc(inum) + '" id="img-' + inum + '" alt="' + name + '">';
-
-    var pre = $('preimages');
-    pre.innerHTML =
-      '<img src="' + previewSrc(nextIndex(inum)) + '">' +
-      '<img src="' + previewSrc(prevIndex(inum)) + '">';
-
-    setText('counter', inum + ' of ' + lastimagevalue + ' — ' + name);
-  }
-
-  function fullres() {
-    var name = images[inum];
-    var photo = $('photospot');
-    photo.innerHTML = '<img src="' + originalURL(name) + '">';
-  }
-  function togglefullres() {
+  // ---------- view ----------  function togglefullres() {
     if ((decodeURIComponent(location.hash.slice(1)) || '').charAt(0) === ':') return;
     var pd = $('photodiv');
     if (!isfullres) { isfullres = 1; pd.classList.add('fullres'); fullres(); }
     else { startimage(); }
-  }
-
-  function preview(i) { inum = i; startimage(); }
-
-  // ---- justified-rows layout + zoom slider ---------------------------------
-  // No pagination. The zoom slider drives a single value (target row height in CSS px).
-  // At slider=0, the height is computed so all thumbs fit in the viewport with no
-  // scroll. At slider=100, height is the atlas height (200 px). In between we
-  // interpolate geometrically (one slider notch ~doubles the size of the thumbs).
-  //
-  // For target row height H: w_disp = loc.w * H / cellH; greedy-pack into rows; each
-  // row except the last is justified by scaling uniformly to fill the viewport width.
-  var rafPending = false;
-  function scheduleRender() {
-    if (rafPending) return;
-    rafPending = true;
-    requestAnimationFrame(function () { rafPending = false; renderGallery(); });
   }
 
   function chromeHeight() {
@@ -293,6 +252,12 @@
 
   function targetRowHeight(t) {
     if (!window.spriteMeta) return 100;
+    if (focusedIdx > 0) {
+      // Focus mode: row height ~80% of available viewport. Justified-rows layout puts the
+      // focused image's row at this height; adjacent rows (above/below) and adjacent
+      // images in the same row peek in at the edges.
+      return Math.max(50, layoutHeight() * 0.8);
+    }
     var Hmin = fitAllHeight();
     var Hmax = CANONICAL_H;
     if (Hmax <= Hmin) return Hmax;
@@ -612,9 +577,17 @@
       y += rows[r].height + ROW_GAP;
     }
 
-    // Reset scroll position to top on layout change (otherwise zooming can leave you
-    // looking at empty space below the new shorter layout)
-    thumbsEl.scrollTop = 0;
+    // Position scroll: in focus mode, center the focused tile in the viewport. In grid
+    // mode (no focus), reset to top.
+    if (focusedIdx > 0 && focusedIdx <= lastTileRects.length) {
+      var tile = lastTileRects[focusedIdx - 1];
+      var vH = viewportH;  // available viewport height
+      var target = tile.y + tile.h / 2 - vH / 2;
+      var maxScroll = Math.max(0, totalH - vH);
+      thumbsEl.scrollTop = Math.max(0, Math.min(maxScroll, target));
+    } else {
+      thumbsEl.scrollTop = 0;
+    }
 
     // Trigger initial paint. drawCanvasForScroll picks the right atlas + lazy-loads it.
     drawCanvasForScroll();
@@ -623,12 +596,10 @@
   function buildthumbpages() { /* legacy stub — layout is now incremental via renderGallery */ }
 
   function displaythumbs() {
-    if (isfullres) togglefullres();
     showAdminBar();
+    focusedIdx = 0;
     if (location.hash) location.hash = '';
     hashmirror = '';
-    setHTML('photospot', '');
-    setHTML('preimages', '');
     setText('counter', '');
     document.body.classList.add('thumb-view');
     document.body.classList.remove('image-view');
@@ -640,12 +611,26 @@
     hashmirror = location.hash.slice(1);
     var raw = decodeURIComponent(hashmirror || '');
     if (!raw || raw.charAt(0) === ':') {
-      displaythumbs();  // empty hash or legacy ':N' both = thumb view
+      // Empty hash (or legacy ':N') = grid view. Clear any focus and re-render.
+      focusedIdx = 0;
+      document.body.classList.add('thumb-view');
+      document.body.classList.remove('image-view');
+      renderGallery();
     } else {
+      // #filename = focus on that image. Find by canonical name lookup.
       for (var i = 1; i <= lastimagevalue; i++) {
-        if (raw === images[i]) { inum = i; break; }
+        if (raw === images[i]) {
+          focusedIdx = i;
+          inum = i;  // keep legacy alias in sync
+          document.body.classList.add('image-view');
+          document.body.classList.remove('thumb-view');
+          renderGallery();
+          return;
+        }
       }
-      startimage();
+      // Unknown name — fall through to grid
+      focusedIdx = 0;
+      renderGallery();
     }
   }
 
@@ -823,9 +808,6 @@
   window.leftbutton = leftbutton;
   window.rightbutton = rightbutton;
   window.displaythumbs = displaythumbs;
-  window.startimage = startimage;
-  window.preview = preview;
-  window.togglefullres = togglefullres;
   window.ggMoveToTrash = ggMoveToTrash;
   window.ggClearCache = ggClearCache;
   window.ggRequestBuildAll = ggRequestBuildAll;
