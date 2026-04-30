@@ -564,7 +564,8 @@
     // Kick off the per-tile blob slicing in the background. Initial render shows
     // placeholder boxes; the slicing pass triggers a re-render when complete.
     if (window.spriteMeta && lastimagevalue > 0) {
-      requestIdleCallback ? requestIdleCallback(buildBlobCache, { timeout: 100 }) : setTimeout(buildBlobCache, 16);
+      var ric = (typeof requestIdleCallback !== 'undefined') ? requestIdleCallback : function (fn) { return setTimeout(fn, 16); };
+      ric(buildBlobCache, { timeout: 100 });
     }
 
     // initial route: hash empty or ':N' → thumb view; #filename → image view
