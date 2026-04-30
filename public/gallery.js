@@ -998,6 +998,39 @@
         thumbsEl.scrollLeft += e.deltaY;
       }
     }, { passive: false });
+
+    // Pinch-to-zoom in grid mode drives the zoom slider. The viewport meta is locked
+    // (user-scalable=no) so the browser will not intercept this gesture itself.
+    // Mapping is logarithmic: a doubling of finger distance moves the slider +25,
+    // a halving moves it -25 — analogous to a CSS transform: scale() feel.
+    var pinch = null;
+    function dist(t1, t2) {
+      var dx = t1.clientX - t2.clientX, dy = t1.clientY - t2.clientY;
+      return Math.sqrt(dx * dx + dy * dy);
+    }
+    thumbsEl.addEventListener('touchstart', function (e) {
+      if (e.touches.length === 2 && focusedIdx === 0) {
+        pinch = { d0: dist(e.touches[0], e.touches[1]), v0: getZoom() };
+        e.preventDefault();
+      } else {
+        pinch = null;
+      }
+    }, { passive: false });
+    thumbsEl.addEventListener('touchmove', function (e) {
+      if (!pinch || e.touches.length !== 2) return;
+      e.preventDefault();
+      var d = dist(e.touches[0], e.touches[1]);
+      if (d < 1 || pinch.d0 < 1) return;
+      var newVal = Math.max(0, Math.min(100, pinch.v0 + Math.log2(d / pinch.d0) * 25));
+      var sl = $('zoomSlider');
+      if (sl) sl.value = String(Math.round(newVal));
+      setZoom(newVal);
+      scheduleRender();
+    }, { passive: false });
+    thumbsEl.addEventListener('touchend', function (e) {
+      if (e.touches.length < 2) pinch = null;
+    });
+    thumbsEl.addEventListener('touchcancel', function () { pinch = null; });
   }
 
   // ---------- thumb click delegation ----------

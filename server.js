@@ -1152,7 +1152,7 @@ function galleryHTML({ urlPath, folders, images, spriteMeta, isAdminFlag, hasPas
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
 <title>${hxEscape(SITE_TITLE)} — ${hxEscape(urlPath)}</title>
 <link rel="stylesheet" href="/_static/goodgallery.css" />
 <link rel="icon" type="image/svg+xml" href="/_static/favicon.svg" />
