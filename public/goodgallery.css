@@ -129,11 +129,10 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 #realtime:empty { padding: 0; }
 
 #thumbs {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: center;
-  gap: 4px;
-  padding: 8px;
+  /* Was a flex grid back when each thumb was a DOM <img>. The renderer is now a
+     single canvas + spacer, so we just need the box to size+scroll cleanly. */
+  position: relative;
+  overflow: hidden;  /* JS toggles overflowX/Y per mode; default is no scrollbars */
 }
 #thumbs a {
   background: var(--thumb-bg);

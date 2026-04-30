@@ -153,7 +153,15 @@
     var next = focusedIdx + delta;
     if (next < 1) next = lastimagevalue;
     if (next > lastimagevalue) next = 1;
-    location.hash = encodeURIComponent(images[next]);
+    if (focusedIdx > 0 && canvasEl) {
+      // Already in focus mode: smooth-scroll the strip to the new image.
+      var stride = focusStride();
+      focusInProgrammaticScroll = true;
+      setFocusScrollPos((next - 1) * stride, true);
+      // history will catch up via drawFocusForScroll's centeredIdx tracking.
+    } else {
+      location.hash = encodeURIComponent(images[next]);
+    }
   }
 
   // ---------- keys ----------
@@ -417,6 +425,19 @@
   // inside renderGallery — those are the *result* of an anchor, not a user-initiated scroll.
   var suppressNextAnchorCapture = false;
   function onThumbsScroll() {
+    if (focusedIdx > 0) {
+      if (pendingScrollDraw) return;
+      pendingScrollDraw = true;
+      requestAnimationFrame(function () {
+        pendingScrollDraw = false;
+        drawFocusForScroll();
+      });
+      // Schedule a snap once scroll events go quiet. Resets on every scroll event,
+      // so iOS inertia + user drag gestures don't trigger snap until truly idle.
+      if (!focusInProgrammaticScroll) scheduleFocusSnap();
+      return;
+    }
+    // Grid mode
     if (suppressNextAnchorCapture) { suppressNextAnchorCapture = false; }
     else { captureAnchorFromScroll(); }
     if (pendingScrollDraw) return;
@@ -550,104 +571,192 @@
     }
   }
 
-  // Focus-mode layout. Two flavors keyed off viewport orientation:
-  //   landscape (w >= h): horizontal strip — neighbors peek in left/right.
-  //   portrait  (h > w):  vertical strip — neighbors stack above/below; image fills width.
-  // Both return lastTileRects-shaped data with x/y in viewport coords (no scroll).
-  function buildFocusLayout(viewportW, viewportH) {
-    if (viewportH > viewportW) return buildFocusLayoutVertical(viewportW, viewportH);
-    return buildFocusLayoutHorizontal(viewportW, viewportH);
+  // ============================================================================
+  // FOCUS MODE — native-scroll strip
+  // ============================================================================
+  // The canvas is sticky in the viewport. A 1px-thick spacer establishes scrollWidth
+  // (landscape) or scrollHeight (portrait) so the browser provides a real native
+  // scrollbar with proper inertia on iOS/macOS. As the user scrolls, drawFocusForScroll
+  // redraws the canvas; when scroll events stop coming, we snap to the nearest image
+  // with a smooth scrollTo. Because we're not consuming wheel/touch events, the user
+  // gets the full native scroll feel — momentum, rubber-band, the works.
+  function isPortraitFocus() { return layoutHeight() > layoutWidth(); }
+  function focusStride() {
+    // 70% of the primary axis: focused image gets the middle 60-70%, neighbors peek
+    // ~15% from each side. Each "image" claims one stride of scroll.
+    return isPortraitFocus() ? layoutHeight() * 0.55 : layoutWidth() * 0.7;
   }
-
-  function buildFocusLayoutHorizontal(viewportW, viewportH) {
-    var rects = [];
-    if (focusedIdx <= 0 || !window.spriteMeta || !spriteMeta.imageMap) return rects;
-    var GAP = 12;
-    var focusH = Math.max(50, viewportH * 0.78);
-    var name = images[focusedIdx];
-    var loc = spriteMeta.imageMap[name];
-    if (!loc) return rects;
-    var focusedW = Math.round(loc.w * focusH / CANONICAL_H);
-    var maxFocusedW = viewportW * 0.60;
-    if (focusedW > maxFocusedW) {
-      var scaleDown = maxFocusedW / focusedW;
-      focusH = focusH * scaleDown;
-      focusedW = Math.round(loc.w * focusH / CANONICAL_H);
-    }
-    var focusedX = Math.floor((viewportW - focusedW) / 2);
-    var focusedY = Math.floor((viewportH - focusH) / 2);
-    rects.push({ x: focusedX, y: focusedY, w: focusedW, h: Math.round(focusH), idx: focusedIdx, name: name });
-
-    var x = focusedX;
-    for (var i = focusedIdx - 1; i >= 1; i--) {
-      var nm = images[i];
-      var nl = spriteMeta.imageMap[nm];
-      if (!nl) continue;
-      var nw = Math.round(nl.w * focusH / CANONICAL_H);
-      x -= (nw + GAP);
-      if (x + nw < -50) break;
-      rects.push({ x: x, y: focusedY, w: nw, h: Math.round(focusH), idx: i, name: nm });
-    }
-    x = focusedX + focusedW;
-    for (var j = focusedIdx + 1; j <= lastimagevalue; j++) {
-      var nm2 = images[j];
-      var nl2 = spriteMeta.imageMap[nm2];
-      if (!nl2) continue;
-      x += GAP;
-      var nw2 = Math.round(nl2.w * focusH / CANONICAL_H);
-      if (x > viewportW + 50) break;
-      rects.push({ x: x, y: focusedY, w: nw2, h: Math.round(focusH), idx: j, name: nm2 });
-      x += nw2;
-    }
-    return rects;
-  }
-
-  // Vertical (portrait) focus strip. Focused image is fit to viewport — width is
-  // pinned to the edge (or close to it) and height is capped to leave room for the
-  // prev/next previews above and below. Neighbors are sized by the same scale, so
-  // a 16:9 photo and a 9:16 photo end up the same physical width on the device.
-  function buildFocusLayoutVertical(viewportW, viewportH) {
-    var rects = [];
-    if (focusedIdx <= 0 || !window.spriteMeta || !spriteMeta.imageMap) return rects;
-    var GAP = 12;
-    var name = images[focusedIdx];
-    var loc = spriteMeta.imageMap[name];
-    if (!loc) return rects;
-    var maxH = viewportH * 0.85;
-    var maxW = viewportW;
+  function focusImgRect(loc) {
+    // Returned size is "contain"-fit within (maxW × maxH). maxW depends on orientation:
+    // portrait gets full viewport width, landscape leaves a sliver of horizontal padding.
+    var W = layoutWidth(), H = layoutHeight();
+    var maxH = H * 0.85;
+    var maxW = isPortraitFocus() ? W : W * 0.85;
     var scale = Math.min(maxW / loc.w, maxH / CANONICAL_H);
-    var focusedW = Math.round(loc.w * scale);
-    var focusedH = Math.round(CANONICAL_H * scale);
-    var focusedX = Math.floor((viewportW - focusedW) / 2);
-    var focusedY = Math.floor((viewportH - focusedH) / 2);
-    rects.push({ x: focusedX, y: focusedY, w: focusedW, h: focusedH, idx: focusedIdx, name: name });
+    return { w: Math.round(loc.w * scale), h: Math.round(CANONICAL_H * scale) };
+  }
+  function focusScrollPos() {
+    var thumbsEl = $('thumbs');
+    if (!thumbsEl) return 0;
+    return isPortraitFocus() ? thumbsEl.scrollTop : thumbsEl.scrollLeft;
+  }
+  function setFocusScrollPos(v, smooth) {
+    var thumbsEl = $('thumbs');
+    if (!thumbsEl) return;
+    var opts = { behavior: smooth ? 'smooth' : 'auto' };
+    if (isPortraitFocus()) opts.top = v; else opts.left = v;
+    thumbsEl.scrollTo(opts);
+  }
 
-    var y = focusedY;
-    for (var i = focusedIdx - 1; i >= 1; i--) {
-      var nm = images[i];
-      var nl = spriteMeta.imageMap[nm];
-      if (!nl) continue;
-      var ns = Math.min(maxW / nl.w, maxH / CANONICAL_H);
-      var nw = Math.round(nl.w * ns);
-      var nh = Math.round(CANONICAL_H * ns);
-      y -= (nh + GAP);
-      if (y + nh < -50) break;
-      rects.push({ x: Math.floor((viewportW - nw) / 2), y: y, w: nw, h: nh, idx: i, name: nm });
+  // Snap-on-stop. Called via debounce after scroll events quiet down for ~150ms
+  // (long enough that iOS inertia has finished). Always smooth-scrolls to the nearest
+  // image's center, even if we're already close — the smooth animation feels nicer
+  // than a hard pixel snap.
+  var focusSnapTimer = null;
+  var focusInProgrammaticScroll = false;
+  function scheduleFocusSnap() {
+    if (focusSnapTimer) clearTimeout(focusSnapTimer);
+    focusSnapTimer = setTimeout(focusSnapNow, 150);
+  }
+  function focusSnapNow() {
+    focusSnapTimer = null;
+    if (focusedIdx <= 0) return;
+    var stride = focusStride();
+    var pos = focusScrollPos();
+    var target = Math.round(pos / stride) * stride;
+    if (Math.abs(pos - target) < 0.5) return;
+    focusInProgrammaticScroll = true;
+    setFocusScrollPos(target, true);
+    // The smooth-scroll animation generates more scroll events; clear the flag once
+    // we're within 1px of target (checked on every scroll tick).
+  }
+
+  // Draw the focus strip for the current scroll position. Iterates ±FOCUS_VISIBLE
+  // images around the centered one; off-screen tiles are skipped cheaply.
+  var FOCUS_VISIBLE = 2;  // images on each side that may contribute pixels to the canvas
+  function drawFocusForScroll() {
+    if (!canvasEl || !window.spriteMeta) return;
+    var thumbsEl = $('thumbs');
+    if (!thumbsEl) return;
+    var portrait = isPortraitFocus();
+    var W = layoutWidth(), H = layoutHeight();
+    var stride = focusStride();
+    var pos = focusScrollPos();
+    var virtualIdx0 = pos / stride;            // 0-based fractional position in strip
+    var centeredIdx1 = Math.round(virtualIdx0) + 1;  // 1-based
+    if (centeredIdx1 < 1) centeredIdx1 = 1;
+    if (centeredIdx1 > lastimagevalue) centeredIdx1 = lastimagevalue;
+
+    // Update focusedIdx + URL hash as the user scrolls past midpoints. Use replaceState
+    // (not assignment to location.hash) so we don't fire hashchange — that would re-enter
+    // the focus path and reset scroll.
+    if (centeredIdx1 !== focusedIdx) {
+      focusedIdx = centeredIdx1;
+      try { history.replaceState(null, '', '#' + encodeURIComponent(images[focusedIdx])); } catch (_) {}
+      // Trigger a fresh ±FOCUS_PREFETCH warmup centered on the new image.
+      var preTier = pickPerImageTier(currentRowHeight);
+      for (var pf = -FOCUS_PREFETCH; pf <= FOCUS_PREFETCH; pf++) {
+        var pidx = focusedIdx + pf;
+        while (pidx < 1) pidx += lastimagevalue;
+        while (pidx > lastimagevalue) pidx -= lastimagevalue;
+        if (images[pidx]) loadPerImageBitmap(images[pidx], preTier);
+      }
     }
-    y = focusedY + focusedH;
-    for (var j = focusedIdx + 1; j <= lastimagevalue; j++) {
-      var nm2 = images[j];
-      var nl2 = spriteMeta.imageMap[nm2];
-      if (!nl2) continue;
-      var ns2 = Math.min(maxW / nl2.w, maxH / CANONICAL_H);
-      var nw2 = Math.round(nl2.w * ns2);
-      var nh2 = Math.round(CANONICAL_H * ns2);
-      y += GAP;
-      if (y > viewportH + 50) break;
-      rects.push({ x: Math.floor((viewportW - nw2) / 2), y: y, w: nw2, h: nh2, idx: j, name: nm2 });
-      y += nh2;
+
+    // Clear stale frame counter check: drawing here is per-rAF, no async race issue.
+    var dpr = devicePixelRatio();
+    var ctx = canvasEl.getContext('2d', { alpha: false });
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = '#0a0a0a';
+    ctx.fillRect(0, 0, W, H);
+
+    // For each visible image, compute its on-screen position and draw it.
+    lastTileRects = [];
+    var tilesForCanvasEl = [];  // for hit-testing on click
+    for (var d = -FOCUS_VISIBLE; d <= FOCUS_VISIBLE; d++) {
+      var idx = focusedIdx + d;
+      if (idx < 1 || idx > lastimagevalue) continue;
+      var name = images[idx];
+      var loc = spriteMeta.imageMap[name];
+      if (!loc) continue;
+      var rect = focusImgRect(loc);
+      var center = (idx - 1 - virtualIdx0) * stride;  // signed offset from viewport center
+      var x, y;
+      if (portrait) {
+        x = Math.round((W - rect.w) / 2);
+        y = Math.round(H / 2 + center - rect.h / 2);
+      } else {
+        x = Math.round(W / 2 + center - rect.w / 2);
+        y = Math.round((H - rect.h) / 2);
+      }
+      // Off-screen cull
+      if (x + rect.w < -50 || x > W + 50) continue;
+      if (y + rect.h < -50 || y > H + 50) continue;
+      lastTileRects.push({ x: x, y: y, w: rect.w, h: rect.h, idx: idx, name: name });
     }
-    return rects;
+    window.__lastTileRects = lastTileRects;
+
+    // Update currentRowHeight off the centered image so tier selection adapts to viewport.
+    var centeredRect = lastTileRects.find(function (r) { return r.idx === focusedIdx; });
+    currentRowHeight = centeredRect ? centeredRect.h : 200;
+
+    var tier = pickPerImageTier(currentRowHeight);
+    var myFrame = ++renderFrame;
+    lastTileRects.forEach(function (t) {
+      loadPerImageBitmap(t.name, tier).then(function (bitmap) {
+        if (!canvasEl || !bitmap || renderFrame !== myFrame) return;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.drawImage(bitmap, 0, 0, bitmap.width, bitmap.height, t.x, t.y, t.w, t.h);
+      });
+    });
+
+    // After every draw, check whether the smooth-scroll animation has settled.
+    if (focusInProgrammaticScroll) {
+      var stride2 = stride;
+      var target = Math.round(pos / stride2) * stride2;
+      if (Math.abs(pos - target) < 1) focusInProgrammaticScroll = false;
+    }
+  }
+
+  // Configure #thumbs as a focus-mode strip and place the scroll position so the
+  // initial focusedIdx is centered. Idempotent: safe to call on every render.
+  function setupFocusStrip(thumbsEl) {
+    var portrait = isPortraitFocus();
+    var W = layoutWidth(), H = layoutHeight();
+    var stride = focusStride();
+    // Strip length = (N-1)*stride + 1 viewport, so every image can be centered.
+    var stripLen = Math.max(W, H) + Math.max(0, lastimagevalue - 1) * stride;
+    thumbsEl.style.position = 'relative';
+    thumbsEl.style.height = H + 'px';
+    thumbsEl.style.overflowX = portrait ? 'hidden' : 'auto';
+    thumbsEl.style.overflowY = portrait ? 'auto' : 'hidden';
+
+    ensureCanvasAndSpacer(thumbsEl);
+    var dpr = devicePixelRatio();
+    canvasEl.width = Math.round(W * dpr);
+    canvasEl.height = Math.round(H * dpr);
+    canvasEl.style.width = W + 'px';
+    canvasEl.style.height = H + 'px';
+    canvasEl.style.position = 'sticky';
+    canvasEl.style.top = '0';
+    canvasEl.style.left = '0';
+
+    // Spacer goes absolute so it can extend along whichever axis we're scrolling.
+    spacerEl.style.position = 'absolute';
+    spacerEl.style.top = '0';
+    spacerEl.style.left = '0';
+    if (portrait) {
+      spacerEl.style.width = '1px';
+      spacerEl.style.height = stripLen + 'px';
+    } else {
+      spacerEl.style.width = stripLen + 'px';
+      spacerEl.style.height = '1px';
+    }
+
+    // Position the strip so focusedIdx is centered. Suppress snap during this jump.
+    var target = (focusedIdx - 1) * stride;
+    focusInProgrammaticScroll = true;
+    setFocusScrollPos(target, false);
   }
 
   function renderGallery() {
@@ -675,34 +784,10 @@
     var W = layoutWidth();
     var viewportH = layoutHeight();
 
-    // ===== FOCUS MODE: horizontal strip layout =====
-    // Focused image centered, prev/next peek in at the edges. No scrolling.
+    // ===== FOCUS MODE: native-scroll strip =====
     if (focusedIdx > 0) {
-      thumbsEl.style.position = 'relative';
-      thumbsEl.style.overflowY = 'hidden';
-      thumbsEl.style.height = viewportH + 'px';
-      ensureCanvasAndSpacer(thumbsEl);
-      var dpr = devicePixelRatio();
-      canvasEl.width = Math.round(W * dpr);
-      canvasEl.height = Math.round(viewportH * dpr);
-      canvasEl.style.width = W + 'px';
-      canvasEl.style.height = viewportH + 'px';
-      spacerEl.style.height = '0px';
-      lastTileRects = buildFocusLayout(W, viewportH);
-      // Pick LoD tier off the focused image's height (the focused tile is element 0).
-      currentRowHeight = lastTileRects.length ? lastTileRects[0].h : 200;
-      window.__lastTileRects = lastTileRects;
-      // Preload +/-FOCUS_PREFETCH images so fast next/prev never blocks on a fetch.
-      // Wraps at boundaries to mirror shiftFocus().
-      var preTier = pickPerImageTier(currentRowHeight);
-      for (var pf = -FOCUS_PREFETCH; pf <= FOCUS_PREFETCH; pf++) {
-        var pidx = focusedIdx + pf;
-        while (pidx < 1) pidx += lastimagevalue;
-        while (pidx > lastimagevalue) pidx -= lastimagevalue;
-        if (images[pidx]) loadPerImageBitmap(images[pidx], preTier);
-      }
-      thumbsEl.scrollTop = 0;
-      drawCanvasForScroll();
+      setupFocusStrip(thumbsEl);
+      drawFocusForScroll();
       return;
     }
 
@@ -735,7 +820,12 @@
     canvasEl.height = Math.round(canvasH * dpr);
     canvasEl.style.width = W + 'px';
     canvasEl.style.height = canvasH + 'px';
+    // Reset spacer to in-flow block (focus mode flips it to absolute).
+    spacerEl.style.position = 'static';
+    spacerEl.style.width = '1px';
     spacerEl.style.height = Math.max(0, Math.ceil(totalH) - canvasH) + 'px';
+    // Reset thumbs to vertical-only scroll.
+    thumbsEl.style.overflowX = 'hidden';
 
     // Compute tile rects in LAYOUT coords (independent of scroll)
     lastTileRects = [];
@@ -890,47 +980,23 @@
     });
   }
 
-  // Touch + wheel nav for focus mode. Bound to #thumbs (where the canvas lives).
-  // Swipe direction follows the dominant viewport axis: horizontal in landscape,
-  // vertical in portrait. Wheel events are debounced so a continuous trackpad flick
-  // moves one image, not ten.
+  // No custom wheel/touch handlers in focus mode any more — the strip is a real
+  // native-scroll surface, so the browser drives prev/next via inertial scroll and
+  // we just snap-to-image when the user lets go (see onThumbsScroll/scheduleFocusSnap).
+  // In landscape we redirect vertical wheel to horizontal scroll so trackpad/mousewheel
+  // users without a horizontal axis can still navigate. Touch on iOS already gives both
+  // axes natively, so no touch handler is needed.
   function setupTouch() {
     var thumbsEl = $('thumbs');
     if (!thumbsEl) return;
-    var startX = 0, startY = 0, startT = 0;
-    thumbsEl.addEventListener('touchstart', function (e) {
-      var t = e.changedTouches[0];
-      startX = t.clientX; startY = t.clientY; startT = Date.now();
-    }, { passive: true });
-    thumbsEl.addEventListener('touchend', function (e) {
-      if (focusedIdx <= 0) return;
-      var t = e.changedTouches[0];
-      var dx = t.clientX - startX, dy = t.clientY - startY;
-      var dt = Date.now() - startT;
-      if (dt > 600) return;
-      var portrait = window.innerHeight > window.innerWidth;
-      if (portrait) {
-        if (Math.abs(dy) > 40 && Math.abs(dy) > Math.abs(dx) * 1.2) {
-          if (dy < 0) nextimage(); else previousimage();
-        }
-      } else {
-        if (Math.abs(dx) > 40 && Math.abs(dx) > Math.abs(dy) * 1.2) {
-          if (dx < 0) nextimage(); else previousimage();
-        }
-      }
-    }, { passive: true });
-
-    var wheelDeadline = 0;
     thumbsEl.addEventListener('wheel', function (e) {
-      if (focusedIdx <= 0) return;
-      var now = Date.now();
-      if (now < wheelDeadline) return;
-      var portrait = window.innerHeight > window.innerWidth;
-      var d = portrait ? e.deltaY : (e.deltaX || e.deltaY);
-      if (Math.abs(d) < 4) return;
-      e.preventDefault();
-      wheelDeadline = now + 250;
-      if (d > 0) nextimage(); else previousimage();
+      if (focusedIdx <= 0) return;        // grid mode: native vertical scroll handles it
+      if (isPortraitFocus()) return;      // portrait focus: native vertical scroll, fine
+      // Landscape focus: vertical wheel becomes horizontal scroll on the strip.
+      if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+        e.preventDefault();
+        thumbsEl.scrollLeft += e.deltaY;
+      }
     }, { passive: false });
   }
 
