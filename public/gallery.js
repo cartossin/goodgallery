@@ -293,67 +293,52 @@
     };
   }
 
-  // ---- per-tile blob cache (option A) ------------------------------------
-  // Slice each sprite atlas into N independent image blobs (one per thumb), so each
-  // <img> has its own self-contained source. Tradeoff vs. shared sprite img:
-  //   + Each tile is a tiny independent image — browsers (esp. Safari) composite these
-  //     much more efficiently than N elements all referencing the same big JPEG.
-  //   - One-time CPU cost: ~10ms per tile (create + drawImage + toBlob), so ~5–10s for
-  //     800 tiles. Done in the background after first paint, so user sees placeholder
-  //     boxes briefly then the imagery fills in.
-  //   - ~10–30MB extra memory for the blobs.
-  var blobCache = {};       // name -> blob: URL
-  var blobCacheReady = false;
-  var blobCacheBuilding = false;
+  // ---- single-canvas rendering (option C) -----------------------------
+  // One <canvas> for the entire thumb grid. drawImage from the loaded sprite ImageBitmap
+  // for each tile. Click handling via hit-test against `lastTileRects`. Tradeoffs: no
+  // native CSS hover, no per-tile links (back/forward still works since we set hash on
+  // click), no right-click-open-in-new-tab. In return: ~1 DOM node, GPU compositing,
+  // smooth on Safari.
+  var spriteBitmapPromises = null;     // resolved sprite ImageBitmaps (one per sprite-N.jpg)
+  var lastTileRects = [];              // [{x, y, w, h, name}] for click hit-testing
+  var canvasEl = null;
+  var canvasClickAttached = false;
 
-  function clearBlobCache() {
-    for (var k in blobCache) { try { URL.revokeObjectURL(blobCache[k]); } catch (e) {} }
-    blobCache = {};
-    blobCacheReady = false;
+  function loadSpriteBitmaps() {
+    if (spriteBitmapPromises || !window.spriteMeta) return spriteBitmapPromises;
+    spriteBitmapPromises = Promise.all(spriteMeta.sprites.map(function (sp) {
+      var url = folderURL + 'thumbcache/' + sp.file;
+      return fetch(url, { credentials: 'same-origin' })
+        .then(function (r) { return r.blob(); })
+        .then(function (b) { return createImageBitmap(b); });
+    }));
+    return spriteBitmapPromises;
   }
 
-  async function buildBlobCache() {
-    if (blobCacheBuilding || blobCacheReady) return;
-    if (!window.spriteMeta) return;
-    blobCacheBuilding = true;
-    var t0 = performance.now();
-    try {
-      // Fetch + decode each unique sprite atlas ONCE
-      var spriteBitmaps = await Promise.all(spriteMeta.sprites.map(async function (sp) {
-        var url = folderURL + 'thumbcache/' + sp.file;
-        var resp = await fetch(url, { credentials: 'same-origin' });
-        var blob = await resp.blob();
-        return await createImageBitmap(blob);
-      }));
-      var tFetch = performance.now() - t0;
+  function ensureCanvas(thumbsEl) {
+    if (canvasEl && canvasEl.parentNode === thumbsEl) return canvasEl;
+    thumbsEl.innerHTML = '';
+    canvasEl = document.createElement('canvas');
+    canvasEl.style.cursor = 'pointer';
+    canvasEl.style.display = 'block';
+    thumbsEl.appendChild(canvasEl);
+    if (!canvasClickAttached) {
+      canvasEl.addEventListener('click', onCanvasClick);
+      canvasClickAttached = true;
+    }
+    return canvasEl;
+  }
 
-      // Slice every tile in parallel — browsers throttle internally
-      var entries = Object.keys(spriteMeta.imageMap);
-      var cellW = spriteMeta.cellW, cellH = spriteMeta.cellH;
-      var canvas = document.createElement('canvas');
-      var ctx = canvas.getContext('2d', { alpha: false });
-      // Sequential is faster than parallel for canvas/toBlob — toBlob queues internally
-      // and excessive parallelism just bloats memory without speeding up encoding.
-      for (var i = 0; i < entries.length; i++) {
-        var name = entries[i];
-        var loc = spriteMeta.imageMap[name];
-        var sx = loc.col * cellW, sy = loc.row * cellH;
-        canvas.width = loc.w; canvas.height = cellH;
-        ctx.drawImage(spriteBitmaps[loc.sprite], sx, sy, loc.w, cellH, 0, 0, loc.w, cellH);
-        // Use a Promise-wrapped toBlob; Q=0.85 keeps tiles small without visible loss
-        var blob = await new Promise(function (res) { canvas.toBlob(res, 'image/jpeg', 0.85); });
-        if (blob) blobCache[name] = URL.createObjectURL(blob);
+  function onCanvasClick(e) {
+    var rect = e.currentTarget.getBoundingClientRect();
+    var x = e.clientX - rect.left;
+    var y = e.clientY - rect.top;
+    for (var i = 0; i < lastTileRects.length; i++) {
+      var t = lastTileRects[i];
+      if (x >= t.x && x < t.x + t.w && y >= t.y && y < t.y + t.h) {
+        location.hash = encodeURIComponent(t.name);
+        return;
       }
-      // Free decoded sprite bitmaps
-      for (var s of spriteBitmaps) { try { s.close(); } catch (e) {} }
-      var tTotal = performance.now() - t0;
-      console.log('[blobcache] ' + entries.length + ' tiles in ' + Math.round(tTotal) + 'ms (fetch+decode: ' + Math.round(tFetch) + 'ms, slice+encode: ' + Math.round(tTotal - tFetch) + 'ms)');
-      blobCacheReady = true;
-      scheduleRender();   // re-emit with blob URLs
-    } catch (e) {
-      console.warn('[blobcache] failed:', e);
-    } finally {
-      blobCacheBuilding = false;
     }
   }
 
@@ -376,38 +361,46 @@
     }
     var H = targetRowHeight(getZoom());
     var rows = layoutRows(H);
-    var html = '';
+    var W = layoutWidth();
+    // Compute total layout height
+    var totalH = 0;
+    for (var i = 0; i < rows.length; i++) totalH += rows[i].height + ROW_GAP;
+
+    var canvas = ensureCanvas(thumbsEl);
+    canvas.width = W; canvas.height = Math.ceil(totalH);
+    canvas.style.width = W + 'px';
+    canvas.style.height = Math.ceil(totalH) + 'px';
+    var ctx = canvas.getContext('2d', { alpha: false });
+    ctx.fillStyle = '#0a0a0a';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Compute tile rects (used for click hit-testing AND to know what to draw)
+    lastTileRects = [];
+    var y = 0;
     for (var r = 0; r < rows.length; r++) {
-      html += '<div class="row">';
+      var x = 0;
       for (var j = 0; j < rows[r].items.length; j++) {
         var it = rows[r].items[j];
-        var name = images[it.index];
-        var loc = spriteMeta.imageMap[name];
-        var spriteFile = spriteMeta.sprites[loc.sprite].file;
-        var spriteURL = folderURL + 'thumbcache/' + spriteFile;
-        var scale = it.h / spriteMeta.cellH;
-        var bgX = -loc.col * spriteMeta.cellW * scale;
-        var bgY = -loc.row * spriteMeta.cellH * scale;
-        var bgSizeW = spriteMeta.across * spriteMeta.cellW * scale;
-        // Self-contained per-tile <img>: each thumb has its own blob URL (sliced from
-        // the atlas in JS). The browser treats it as 800 small independent images rather
-        // than 800 references to one big image — Safari/WebKit composites this much more
-        // efficiently. Wrapper still does layout sizing; img fills it via width:100%.
-        var blobSrc = blobCache[name];
-        if (blobSrc) {
-          html += '<a class="sprite-thumb solo" href="#' + encodeURIComponent(name) + '" data-i="' + it.index + '" title="' + name + '" ' +
-            'style="width:' + it.w + 'px;height:' + it.h + 'px">' +
-            '<img src="' + blobSrc + '" alt=""></a>';
-        } else {
-          // Placeholder: just the wrapper with bg color while blob cache builds
-          html += '<a class="sprite-thumb placeholder" href="#' + encodeURIComponent(name) + '" data-i="' + it.index + '" title="' + name + '" ' +
-            'style="width:' + it.w + 'px;height:' + it.h + 'px"></a>';
-        }
+        lastTileRects.push({ x: x, y: y, w: it.w, h: it.h, idx: it.index, name: images[it.index] });
+        x += it.w + ROW_GAP;
       }
-      html += '</div>';
+      y += rows[r].height + ROW_GAP;
     }
-    thumbsEl.classList.add('layout');
-    thumbsEl.innerHTML = html;
+
+    // Draw — wait for sprite bitmaps then drawImage each tile
+    loadSpriteBitmaps().then(function (bitmaps) {
+      // Re-check we're still showing the same layout (zoom may have changed mid-fetch)
+      if (canvasEl !== canvas) return;
+      var cellW = spriteMeta.cellW, cellH = spriteMeta.cellH;
+      for (var k = 0; k < lastTileRects.length; k++) {
+        var t = lastTileRects[k];
+        var loc = spriteMeta.imageMap[t.name];
+        if (!loc) continue;
+        var bitmap = bitmaps[loc.sprite];
+        if (!bitmap) continue;
+        ctx.drawImage(bitmap, loc.col * cellW, loc.row * cellH, loc.w, cellH, t.x, t.y, t.w, t.h);
+      }
+    }).catch(function (e) { console.warn('[canvas] sprite load failed:', e); });
   }
 
   function buildthumbpages() { /* legacy stub — layout is now incremental via renderGallery */ }
@@ -559,14 +552,7 @@
       previewimages[i] = previewSrc(i);
     }
     window.addEventListener('resize', scheduleRender);
-    window.addEventListener('beforeunload', clearBlobCache);
-
-    // Kick off the per-tile blob slicing in the background. Initial render shows
-    // placeholder boxes; the slicing pass triggers a re-render when complete.
-    if (window.spriteMeta && lastimagevalue > 0) {
-      var ric = (typeof requestIdleCallback !== 'undefined') ? requestIdleCallback : function (fn) { return setTimeout(fn, 16); };
-      ric(buildBlobCache, { timeout: 100 });
-    }
+    // Sprite ImageBitmaps load lazily on first renderGallery; nothing to kick off here.
 
     // initial route: hash empty or ':N' → thumb view; #filename → image view
     var raw = decodeURIComponent(location.hash.slice(1) || '');

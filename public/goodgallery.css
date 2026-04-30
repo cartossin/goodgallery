@@ -184,42 +184,9 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   #photospot img { max-height: 78vh; }
 }
 
-/* Each thumb is an independent <img> sliced out of the sprite atlas in JS (option A).
-   Wrapper does layout sizing; img scales to fill it. Placeholders show until blob cache
-   is built (couple seconds after first paint). */
-#thumbs .sprite-thumb {
-  display: inline-block;
-  position: relative;
-  overflow: hidden;
-  background-color: var(--thumb-bg);
-  margin: 1px;
-}
-#thumbs .sprite-thumb > img {
-  display: block;
-  width: 100%;
-  height: 100%;
-  pointer-events: none;
-  user-select: none;
-}
-#thumbs .sprite-thumb:hover { opacity: 0.85; }
+/* Single-canvas thumb rendering — see gallery.js renderGallery(). */
 
 
-/* Justified rows layout */
-#thumbs.layout {
-  display: block;        /* override flex from old layout */
-  padding: 4px 0;
-  text-align: left;
-}
-#thumbs .row {
-  display: flex;
-  flex-wrap: nowrap;
-  gap: 2px;
-  margin-bottom: 2px;
-}
-#thumbs .row > .sprite-thumb {
-  margin: 0;
-  flex-shrink: 0;
-}
 
 /* prevent horizontal scroll due to row gap rounding */
 html, body { overflow-x: hidden; }
