@@ -164,9 +164,7 @@
     if (next > lastimagevalue) next = 1;
     if (focusedIdx > 0 && canvasEl) {
       commandedIdx = next;
-      var stride = focusStride();
-      focusInProgrammaticScroll = true;
-      setFocusScrollPos((next - 1) * stride, true);
+      startFocusChase();
     } else {
       location.hash = encodeURIComponent(images[next]);
     }
@@ -632,6 +630,45 @@
   // than a hard pixel snap.
   var focusSnapTimer = null;
   var focusInProgrammaticScroll = false;
+
+  // Continuous rAF chase toward (commandedIdx - 1) * stride. Each tick reads
+  // commandedIdx live, so additional shiftFocus calls (more arrow presses) just
+  // bump the target ahead — the existing chase keeps running toward the new
+  // target without restarting. step is proportional to remaining distance, so
+  // the strip naturally accelerates as commandedIdx gets further away.
+  var focusChaseRaf = null;
+  function startFocusChase() {
+    focusInProgrammaticScroll = true;
+    if (focusChaseRaf) return;  // already chasing
+    focusChaseRaf = requestAnimationFrame(focusChaseTick);
+  }
+  function focusChaseTick() {
+    focusChaseRaf = null;
+    var thumbsEl = $('thumbs');
+    if (!thumbsEl || focusedIdx === 0 || commandedIdx <= 0) {
+      focusInProgrammaticScroll = false;
+      return;
+    }
+    var portrait = isPortraitFocus();
+    var stride = focusStride();
+    var target = (commandedIdx - 1) * stride;
+    var cur = portrait ? thumbsEl.scrollTop : thumbsEl.scrollLeft;
+    var diff = target - cur;
+    if (Math.abs(diff) < 0.5) {
+      if (portrait) thumbsEl.scrollTop = target; else thumbsEl.scrollLeft = target;
+      focusInProgrammaticScroll = false;
+      return;
+    }
+    // Damped step: 25% of remaining distance per frame. With 60fps this is a
+    // ~150ms half-life; further targets move faster in absolute pixels because
+    // the step scales with distance. Floor at 1px so we always finish.
+    var step = diff * 0.25;
+    if (Math.abs(step) < 1) step = (diff > 0 ? 1 : -1);
+    var nxt = cur + step;
+    if (portrait) thumbsEl.scrollTop = nxt; else thumbsEl.scrollLeft = nxt;
+    focusChaseRaf = requestAnimationFrame(focusChaseTick);
+  }
+
   function scheduleFocusSnap() {
     if (focusSnapTimer) clearTimeout(focusSnapTimer);
     focusSnapTimer = setTimeout(focusSnapNow, 150);
