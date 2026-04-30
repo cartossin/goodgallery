@@ -622,11 +622,9 @@ async function readSpriteMeta(galleryAbs) {
 }
 
 function spriteIsCurrent(meta, images) {
-  if (!meta || !meta.imageMap) return false;
+  if (!meta || meta.version !== 2 || !meta.atlases || !meta.imageMap) return false;
   if (meta.imageCount !== images.length) return false;
-  // every image must be in the map
   for (const f of images) if (!meta.imageMap[f]) return false;
-  // and the map shouldn't have stale entries
   if (Object.keys(meta.imageMap).length !== images.length) return false;
   return true;
 }
@@ -635,119 +633,117 @@ async function buildSpriteForFolder(galleryAbs) {
   const { images } = await listFolder(galleryAbs);
   if (images.length === 0) return null;
   const thumbDir = path.join(galleryAbs, 'thumbcache');
-  // require every thumb to exist; bail (the queue will retry) if any are missing.
+  const SPRITE_CELL_W_MAX = parseInt(process.env.SPRITE_CELL_W_MAX || '600', 10);
+
+  // Atlases at every LoD height we have. Small heights use lossless .v inputs
+  // (instant decode); H=200 uses the AVIF tier.
+  const ATLAS_HEIGHTS = LOD_TIERS
+    .filter(t => [5, 10, 50, 200].includes(t.h))
+    .map(t => ({ h: t.h, format: t.format }));
+
+  // Verify every image has every atlas-input tier on disk; bail otherwise (queue retries).
   for (const f of images) {
-    if (!fs.existsSync(lodPath(thumbDir, f, THUMB_CELL, 'avif'))) return null;
+    for (const at of ATLAS_HEIGHTS) {
+      if (!fs.existsSync(lodPath(thumbDir, f, at.h, at.format))) return null;
+    }
   }
 
-  // Each thumb is fixed-height (THUMB_CELL px) but variable-width — read each one's
-  // actual width so the client can slice the atlas at the correct column boundary.
-  // Cell height is uniform (THUMB_CELL); cell width is the widest thumb in the gallery,
-  // capped to a sane upper bound so a single panorama doesn't bloat the atlas.
-  const SPRITE_CELL_W_MAX = parseInt(process.env.SPRITE_CELL_W_MAX || '600', 10);
-  const widths = images.map(f => {
+  // Read aspect ratio from the cheapest tier (h50.v has a libvips header). All other
+  // tiers preserve the same aspect, so widths at any H = aspect * H.
+  const aspects = images.map(f => {
     const d = readVipsHeader(lodPath(thumbDir, f, 50, 'v'));
-    return d ? Math.round(d.w * (THUMB_CELL / 50)) : THUMB_CELL;
+    return d ? d.w / 50 : 1.6;
   });
-  const cellW = Math.min(SPRITE_CELL_W_MAX, Math.max(THUMB_CELL, ...widths));
-  const cellH = THUMB_CELL;
-  // Dynamic capacity: never let a sprite exceed MAX_SPRITE_PIXELS in area, never let it
-  // exceed SPRITE_ACROSS² in cell count. For wallpaper galleries (366px cells) this is
-  // ~225/sprite; for square thumb galleries (200px) it's the full 400/sprite.
+
+  // Build each atlas height into its own set of sprite-h<H>-<N>.jpg files
+  const atlases = {};
+  for (const at of ATLAS_HEIGHTS) {
+    atlases[String(at.h)] = await buildAtlasAtHeight(thumbDir, images, aspects, at.h, at.format, SPRITE_CELL_W_MAX);
+  }
+
+  // Compact image table — name + canonical width (at H=200). Position in any atlas is
+  // derived from the index here: idx = images.indexOf(name); the row/col/sprite math
+  // uses the chosen atlas's cellsPerSprite + across.
+  const imageMap = {};
+  images.forEach((name, i) => {
+    imageMap[name] = { idx: i, w: Math.round(aspects[i] * 200) };
+  });
+
+  const meta = {
+    version: 2,
+    atlases,
+    imageMap,
+    imageCount: images.length,
+    builtAt: Date.now(),
+  };
+
+  const metaPath = path.join(thumbDir, '_sprite.json');
+  await fsp.writeFile(metaPath + '.tmp', JSON.stringify(meta));
+  await fsp.rename(metaPath + '.tmp', metaPath);
+  spriteMetaCache.set(galleryAbs, meta);
+
+  // GC sprite files no longer referenced (old single-atlas naming + obsolete heights)
+  const referenced = new Set();
+  for (const k in atlases) for (const sp of atlases[k].sprites) referenced.add(sp.file);
+  for (const e of await fsp.readdir(thumbDir)) {
+    if (/^sprite(-h\d+)?-\d+\.jpg$/.test(e) && !referenced.has(e)) {
+      try { await fsp.unlink(path.join(thumbDir, e)); } catch {}
+    }
+  }
+  return meta;
+}
+
+async function buildAtlasAtHeight(thumbDir, images, aspects, height, inputFormat, cellWMax) {
+  const cellH = height;
+  const widths = aspects.map(a => Math.round(a * height));
+  const cellW = Math.min(cellWMax, Math.max(cellH, ...widths));
   const cellArea = cellW * cellH;
   const cellsPerSprite = Math.max(1, Math.min(
     SPRITE_ACROSS * SPRITE_ACROSS,
     Math.floor(MAX_SPRITE_PIXELS / cellArea)
   ));
-
-  const stagingDir = path.join(thumbDir, '_sprite_staging');
-  await fsp.rm(stagingDir, { recursive: true, force: true });
-  await fsp.mkdir(stagingDir, { recursive: true });
-
   const numChunks = Math.ceil(images.length / cellsPerSprite);
   const sprites = [];
-  const imageMap = {};
+
+  const stagingDir = path.join(thumbDir, '_sprite_staging_h' + height);
+  await fsp.rm(stagingDir, { recursive: true, force: true });
+  await fsp.mkdir(stagingDir, { recursive: true });
 
   try {
     for (let c = 0; c < numChunks; c++) {
       const chunk = images.slice(c * cellsPerSprite, (c + 1) * cellsPerSprite);
       const inputPaths = [];
       for (let i = 0; i < chunk.length; i++) {
-        const link = path.join(stagingDir, `${c}_${i}.avif`);
+        const link = path.join(stagingDir, c + '_' + i + '.' + inputFormat);
         try { await fsp.unlink(link); } catch {}
-        await fsp.link(lodPath(thumbDir, chunk[i], THUMB_CELL, 'avif'), link);
+        await fsp.link(lodPath(thumbDir, chunk[i], height, inputFormat), link);
         inputPaths.push(link);
       }
-      const spriteFile = `sprite-${c}.jpg`;
+      const spriteFile = 'sprite-h' + height + '-' + c + '.jpg';
       const spriteAbs = path.join(thumbDir, spriteFile);
       const tmp = spriteAbs + '.__tmp.jpg';
-      // vips arrayjoin: hspacing/vspacing letterbox each input into a uniform cell of that
-      // size, top-left aligned, padded with --background. So a 320x200 thumb in a 600x200
-      // cell becomes 320 wide of image + 280 wide of black padding to its right — and the
-      // CSS slice on the client only reveals the leftmost \`actualW\` pixels.
-      // Two-stage build: arrayjoin → .v intermediate (vips' raw format), then jpegsave →
-      // final .jpg. Splitting the steps is more robust than the bracket-options trick on
-      // the output path (which appears to silently no-op in some spawn contexts).
       const vTmp = tmp + '.v';
-      console.log(`[sprite] building ${spriteFile}: ${chunk.length} thumbs (cell ${cellW}x${cellH})`);
+      console.log('[sprite] building ' + spriteFile + ': ' + chunk.length + ' tiles, cell ' + cellW + 'x' + cellH);
       await runStep('vips', [
         'arrayjoin', inputPaths.join(' '), vTmp,
         '--across', String(SPRITE_ACROSS),
         '--hspacing', String(cellW),
         '--vspacing', String(cellH),
-        // Single-element background broadcasts to any channel count. PNGs become 4-channel
-        // RGBA .v intermediates and reject a 3-element RGB background ("vector must have 1
-        // or 4 elements"). 1-element black works for both 3-channel and 4-channel inputs.
         '--background', '0',
       ], vTmp);
       await runStep('vips', [
         'jpegsave', vTmp, tmp,
-        '--Q', '92',
-        '--strip',
-        '--optimize-coding',
-        '--interlace',
+        '--Q', '92', '--strip', '--optimize-coding', '--interlace',
       ], tmp);
       await fsp.unlink(vTmp).catch(()=>{});
       await fsp.rename(tmp, spriteAbs);
       sprites.push({ file: spriteFile, count: chunk.length });
-      const baseOffset = c * cellsPerSprite;
-      chunk.forEach((name, i) => {
-        imageMap[name] = {
-          sprite: c,
-          row: Math.floor(i / SPRITE_ACROSS),
-          col: i % SPRITE_ACROSS,
-          w: Math.min(widths[baseOffset + i], cellW),
-        };
-      });
     }
   } finally {
-    // Clean up staging on success and failure. The next run rms it anyway, but this
-    // keeps thumbcache/ tidy for casual inspection.
     await fsp.rm(stagingDir, { recursive: true, force: true });
   }
 
-  const meta = {
-    cellW, cellH,
-    across: SPRITE_ACROSS,
-    cellsPerSprite,
-    sprites,
-    imageMap,
-    imageCount: images.length,
-    builtAt: Date.now(),
-  };
-  const metaPath = path.join(thumbDir, '_sprite.json');
-  await fsp.writeFile(metaPath + '.tmp', JSON.stringify(meta));
-  await fsp.rename(metaPath + '.tmp', metaPath);
-  spriteMetaCache.set(galleryAbs, meta);  // hot the cache so the next pageview is zero-I/O
-
-  // GC old sprite files no longer referenced.
-  const referenced = new Set(sprites.map(s => s.file));
-  for (const e of await fsp.readdir(thumbDir)) {
-    if (/^sprite-\d+\.jpg$/.test(e) && !referenced.has(e)) {
-      try { await fsp.unlink(path.join(thumbDir, e)); } catch {}
-    }
-  }
-  return meta;
+  return { cellW, cellH, across: SPRITE_ACROSS, cellsPerSprite, sprites };
 }
 
 // Per-folder dedupe so we don't fire two arrayjoins concurrently for the same folder.

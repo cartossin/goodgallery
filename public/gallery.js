@@ -312,7 +312,11 @@
   // higher densities don't visibly help and just multiply paint cost.
   function devicePixelRatio() { return Math.min(window.devicePixelRatio || 1, 2); }
 
-  var spriteBitmapPromises = null;     // resolved sprite ImageBitmaps (one per sprite-N.jpg)
+  // Per-atlas-height ImageBitmap cache. Each atlas height (5/10/50/200) is loaded once,
+  // lazily, and reused across renders. Switching zoom triggers a new atlas load only if
+  // we don't have it yet.
+  var spriteBitmapsByHeight = {};      // { '50': Promise<[ImageBitmap, ...]>, ... }
+  var currentRowHeight = 200;          // current target row height in CSS px (drives atlas pick)
   var lastTileRects = [];              // [{x, y, w, h, name}] in LAYOUT coords (not screen)
   var lastTotalH = 0;                  // total layout height
   var canvasEl = null;
@@ -321,15 +325,30 @@
   var thumbsScrollAttached = false;
   var pendingScrollDraw = false;
 
-  function loadSpriteBitmaps() {
-    if (spriteBitmapPromises || !window.spriteMeta) return spriteBitmapPromises;
-    spriteBitmapPromises = Promise.all(spriteMeta.sprites.map(function (sp) {
+  function loadSpriteBitmapsForAtlas(atlasH) {
+    var key = String(atlasH);
+    if (spriteBitmapsByHeight[key]) return spriteBitmapsByHeight[key];
+    var atlas = window.spriteMeta && spriteMeta.atlases && spriteMeta.atlases[key];
+    if (!atlas) return Promise.resolve([]);
+    spriteBitmapsByHeight[key] = Promise.all(atlas.sprites.map(function (sp) {
       var url = folderURL + 'thumbcache/' + sp.file;
       return fetch(url, { credentials: 'same-origin' })
         .then(function (r) { return r.blob(); })
         .then(function (b) { return createImageBitmap(b); });
     }));
-    return spriteBitmapPromises;
+    return spriteBitmapsByHeight[key];
+  }
+
+  // Pick the smallest atlas height >= the target row height. If we have atlases at
+  // 5/10/50/200, target H=20 picks 50 (downscale, looks crisp); H=300 picks 200
+  // (largest available — the canvas will upscale slightly).
+  function pickAtlasHeight(targetH) {
+    if (!window.spriteMeta || !spriteMeta.atlases) return null;
+    var heights = Object.keys(spriteMeta.atlases).map(Number).sort(function (a, b) { return a - b; });
+    for (var i = 0; i < heights.length; i++) {
+      if (heights[i] >= targetH) return heights[i];
+    }
+    return heights[heights.length - 1];
   }
 
   function ensureCanvasAndSpacer(thumbsEl) {
@@ -384,18 +403,28 @@
     if (!thumbsEl) return;
     var scrollY = thumbsEl.scrollTop;
     var dpr = devicePixelRatio();
-    // Logical (CSS) size of the canvas
     var viewportH = canvasEl.height / dpr;
     var viewportW = canvasEl.width / dpr;
     if (!viewportH) return;
     var ctx = canvasEl.getContext('2d', { alpha: false });
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);  // all drawImage calls below use CSS coords
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.fillStyle = '#0a0a0a';
     ctx.fillRect(0, 0, viewportW, viewportH);
-    if (!spriteBitmapPromises) return;
-    spriteBitmapPromises.then(function (bitmaps) {
+
+    // Pick the right atlas for the current zoom; load if not yet loaded.
+    var targetH = currentRowHeight;  // the actual row height in CSS px (set in renderGallery)
+    var atlasH = pickAtlasHeight(targetH);
+    if (atlasH == null) return;
+    var atlas = spriteMeta.atlases[String(atlasH)];
+    var prom = loadSpriteBitmapsForAtlas(atlasH);
+
+    prom.then(function (bitmaps) {
       if (!canvasEl) return;
-      var cellW = spriteMeta.cellW, cellH = spriteMeta.cellH;
+      var aCellW = atlas.cellW, aCellH = atlas.cellH;
+      var aPerSprite = atlas.cellsPerSprite, aAcross = atlas.across;
+      // Source-rect width per image at this atlas height — atlas was built from per-image
+      // widths at exactly that height, so srcW = w_at_atlas = canonicalW * (aCellH / 200).
+      var canonicalH = 200;
       var top = scrollY, bot = scrollY + viewportH;
       for (var k = 0; k < lastTileRects.length; k++) {
         var t = lastTileRects[k];
@@ -403,9 +432,15 @@
         if (t.y > bot) break;
         var loc = spriteMeta.imageMap[t.name];
         if (!loc) continue;
-        var bitmap = bitmaps[loc.sprite];
+        var idx = loc.idx;
+        var spriteIdx = Math.floor(idx / aPerSprite);
+        var posInSprite = idx % aPerSprite;
+        var row = Math.floor(posInSprite / aAcross);
+        var col = posInSprite % aAcross;
+        var bitmap = bitmaps[spriteIdx];
         if (!bitmap) continue;
-        ctx.drawImage(bitmap, loc.col * cellW, loc.row * cellH, loc.w, cellH, t.x, t.y - scrollY, t.w, t.h);
+        var srcW = Math.round(loc.w * (aCellH / canonicalH));
+        ctx.drawImage(bitmap, col * aCellW, row * aCellH, srcW, aCellH, t.x, t.y - scrollY, t.w, t.h);
       }
     });
   }
@@ -434,6 +469,7 @@
 
     // Compute layout
     var H = targetRowHeight(getZoom());
+    currentRowHeight = H;  // drawCanvasForScroll uses this to pick the atlas
     var rows = layoutRows(H);
     var W = layoutWidth();
     var totalH = 0;
@@ -477,8 +513,7 @@
     // looking at empty space below the new shorter layout)
     thumbsEl.scrollTop = 0;
 
-    // Trigger initial paint (sprites may already be loaded; if not, paint runs once they resolve)
-    loadSpriteBitmaps();
+    // Trigger initial paint. drawCanvasForScroll picks the right atlas + lazy-loads it.
     drawCanvasForScroll();
   }
 
