@@ -14,6 +14,9 @@
 (function () {
   'use strict';
 
+  // Canonical height for per-image widths in spriteMeta.imageMap (v2 format stores
+  // .w at this height; widths at any other H are .w * (H / CANONICAL_H)).
+  var CANONICAL_H = 200;
   var previewimages = [null];
   var thumbs        = [null];
   var inum = 1;
@@ -194,7 +197,7 @@
     if (!window.spriteMeta || lastimagevalue < 1) return 100;
     var W = layoutWidth();
     var H = layoutHeight();
-    var lo = 2, hi = spriteMeta.cellH;
+    var lo = 2, hi = CANONICAL_H;
     for (var i = 0; i < 18; i++) {
       var mid = (lo + hi) / 2;
       var measured = simulateLayoutHeight(mid, W);
@@ -228,7 +231,7 @@
     for (var i = 1; i <= lastimagevalue; i++) {
       var name = images[i];
       var loc = spriteMeta.imageMap[name];
-      var natW = (loc ? loc.w : spriteMeta.cellH) * H / spriteMeta.cellH;
+      var natW = (loc ? loc.w : CANONICAL_H) * H / CANONICAL_H;
       if (count > 0 && (natRowW + ROW_GAP * count + natW) > W) {
         // close row
         var rowScale = Math.min(1.5, (W - ROW_GAP * (count - 1)) / Math.max(1, natRowW));
@@ -254,7 +257,7 @@
   function targetRowHeight(t) {
     if (!window.spriteMeta) return 100;
     var Hmin = fitAllHeight();
-    var Hmax = spriteMeta.cellH;
+    var Hmax = CANONICAL_H;
     if (Hmax <= Hmin) return Hmax;
     return Hmin * Math.pow(Hmax / Hmin, t / 100);
   }
@@ -268,7 +271,7 @@
     for (var i = 1; i <= lastimagevalue; i++) {
       var name = images[i];
       var loc = spriteMeta.imageMap[name];
-      var natW = (loc ? loc.w : spriteMeta.cellH) * H / spriteMeta.cellH;
+      var natW = (loc ? loc.w : CANONICAL_H) * H / CANONICAL_H;
       // Available content width = W minus inter-thumb gaps for items already in row.
       var avail = W - ROW_GAP * Math.max(0, current.length - 1);
       if (current.length > 0 && (natRowW + natW + ROW_GAP) > W) {
