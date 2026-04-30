@@ -1100,7 +1100,7 @@ function galleryHTML({ urlPath, folders, images, spriteMeta, isAdminFlag, hasPas
 <link rel="stylesheet" href="/_static/goodgallery.css" />
 <link rel="icon" type="image/svg+xml" href="/_static/favicon.svg" />
 </head>
-<body onkeydown="keycheck(event)" onkeyup="unlockkeys(event)">
+<body>
 
 <header id="topbar">
   <nav id="breadcrumb">${breadcrumbs}</nav>
