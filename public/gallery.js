@@ -331,7 +331,7 @@
         // of background-image divs (which seem to cost a separate composite per tile).
         html += '<a class="sprite-thumb" href="#' + encodeURIComponent(name) + '" data-i="' + it.index + '" title="' + name + '" ' +
           'style="width:' + it.w + 'px;height:' + it.h + 'px">' +
-          '<img src="' + spriteURL + '" alt="" loading="lazy" ' +
+          '<img src="' + spriteURL + '" alt="" ' +
           'style="left:' + bgX + 'px;top:' + bgY + 'px;width:' + bgSizeW + 'px"></a>';
       }
       html += '</div>';
