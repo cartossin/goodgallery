@@ -757,6 +757,8 @@
     var target = (focusedIdx - 1) * stride;
     focusInProgrammaticScroll = true;
     setFocusScrollPos(target, false);
+    // Slider pinned at 100 while in focus.
+    var slFocus = $('zoomSlider'); if (slFocus) slFocus.value = '100';
   }
 
   function renderGallery() {
@@ -859,6 +861,8 @@
     }
 
     window.__lastTileRects = lastTileRects;
+    // Slider always mirrors the current zoom in grid mode.
+    var slGrid = $('zoomSlider'); if (slGrid) slGrid.value = String(Math.round(getZoom()));
     // Trigger initial paint. drawCanvasForScroll picks the right atlas + lazy-loads it.
     drawCanvasForScroll();
   }
@@ -975,9 +979,54 @@
     if (!sl) return;
     sl.value = String(getZoom());
     sl.addEventListener('input', function () {
-      setZoom(parseInt(sl.value, 10));
-      scheduleRender();
+      handleZoomChange(parseInt(sl.value, 10));
     });
+  }
+
+  // Single source of truth for zoom changes. Crosses the 100 boundary by switching
+  // mode: hitting 100 in grid enters focus on the centered image; falling below 100
+  // in focus exits back to grid at that zoom level. Inputs come from both the slider
+  // and the pinch handler.
+  function handleZoomChange(v) {
+    if (isNaN(v)) v = 0;
+    if (v < 0) v = 0; if (v > 100) v = 100;
+    if (focusedIdx === 0 && v >= 100) {
+      var name = findCenteredImageName();
+      if (name) {
+        setZoom(100);
+        var sl = $('zoomSlider'); if (sl) sl.value = '100';
+        location.hash = encodeURIComponent(name);
+        return;
+      }
+    }
+    if (focusedIdx > 0 && v < 100) {
+      setZoom(v);
+      var sl2 = $('zoomSlider'); if (sl2) sl2.value = String(v);
+      location.hash = '';
+      return;
+    }
+    setZoom(v);
+    var sl3 = $('zoomSlider'); if (sl3) sl3.value = String(Math.round(v));
+    if (focusedIdx === 0) scheduleRender();
+  }
+
+  // Picks the image whose tile center is closest to viewport center. Used when the
+  // slider is dragged to 100% in grid mode to choose what image to focus on.
+  function findCenteredImageName() {
+    var thumbsEl = $('thumbs');
+    if (!thumbsEl || !lastTileRects.length) return null;
+    var sy = thumbsEl.scrollTop;
+    var cx = thumbsEl.clientWidth / 2;
+    var cy = sy + thumbsEl.clientHeight / 2;
+    var best = null, bestD = Infinity;
+    for (var i = 0; i < lastTileRects.length; i++) {
+      var t = lastTileRects[i];
+      var dx = (t.x + t.w / 2) - cx;
+      var dy = (t.y + t.h / 2) - cy;
+      var d = dx * dx + dy * dy;
+      if (d < bestD) { bestD = d; best = t; }
+    }
+    return best ? best.name : null;
   }
 
   // No custom wheel/touch handlers in focus mode any more — the strip is a real
@@ -1009,8 +1058,9 @@
       return Math.sqrt(dx * dx + dy * dy);
     }
     thumbsEl.addEventListener('touchstart', function (e) {
-      if (e.touches.length === 2 && focusedIdx === 0) {
-        pinch = { d0: dist(e.touches[0], e.touches[1]), v0: getZoom() };
+      if (e.touches.length === 2) {
+        // v0 is the starting slider value. In focus mode that's 100; in grid it's whatever.
+        pinch = { d0: dist(e.touches[0], e.touches[1]), v0: focusedIdx > 0 ? 100 : getZoom() };
         e.preventDefault();
       } else {
         pinch = null;
@@ -1022,10 +1072,11 @@
       var d = dist(e.touches[0], e.touches[1]);
       if (d < 1 || pinch.d0 < 1) return;
       var newVal = Math.max(0, Math.min(100, pinch.v0 + Math.log2(d / pinch.d0) * 25));
-      var sl = $('zoomSlider');
-      if (sl) sl.value = String(Math.round(newVal));
-      setZoom(newVal);
-      scheduleRender();
+      handleZoomChange(newVal);
+      // After a mode flip the pinch baseline is stale (we may have just entered/exited
+      // focus). Reseed so further finger movement keeps tracking.
+      pinch.d0 = d;
+      pinch.v0 = focusedIdx > 0 ? 100 : newVal;
     }, { passive: false });
     thumbsEl.addEventListener('touchend', function (e) {
       if (e.touches.length < 2) pinch = null;

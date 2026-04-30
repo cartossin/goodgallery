@@ -1169,12 +1169,7 @@ function galleryHTML({ urlPath, folders, images, spriteMeta, isAdminFlag, hasPas
 ${folders.length ? `<section id="folders">${folderCards}</section>` : ''}
 
 <div id="prevnext">
-  <div class="image-nav">
-    <button onclick="leftbutton()">‹ Prev</button>
-    <a href="#:" onclick="displaythumbs();return false;"> Thumbnails </a>
-    <button onclick="rightbutton()">Next ›</button>
-  </div>
-  <div class="zoom-nav" title="Thumbnail size">
+  <div class="zoom-nav" title="Zoom — pull to 100% to focus on the centered image">
     <span class="zoom-icon" aria-hidden="true">▫</span>
     <input id="zoomSlider" type="range" min="0" max="100" />
     <span class="zoom-icon" aria-hidden="true">▣</span>

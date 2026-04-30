@@ -184,12 +184,10 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 /* prevent horizontal scroll due to row gap rounding */
 html, body { overflow-x: hidden; }
 
-/* prev/next bar swaps between image-nav (in image view) and zoom-nav (in thumb view) */
+/* Single zoom slider, visible in both grid and focus mode. Pulling the slider to 100%
+   focuses on the centered image; pulling below 100% in focus mode exits back to grid. */
 #prevnext { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 8px 12px; }
-#prevnext .image-nav { display: none; align-items: center; gap: 12px; }
-#prevnext .zoom-nav  { display: none; align-items: center; gap: 8px; width: 100%; max-width: 360px; }
-body.image-view #prevnext .image-nav { display: flex; }
-body.thumb-view #prevnext .zoom-nav  { display: flex; }
+#prevnext .zoom-nav { display: flex; align-items: center; gap: 8px; width: 100%; max-width: 360px; }
 .zoom-icon { color: var(--muted); font-size: 16px; line-height: 1; }
 #zoomSlider {
   -webkit-appearance: none;
