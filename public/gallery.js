@@ -169,12 +169,22 @@
   function keycheck(e) {
     if (keyslocked) return;
     var k = e.which || e.keyCode;
-    // In focus mode both axes shift focus — natural for portrait (vertical strip) and
-    // harmless in landscape. Up/Left = prev, Down/Right = next.
-    if (k === 37 || k === 38) leftbutton();
-    else if (k === 39 || k === 40) rightbutton();
-    else if (k === 27 && focusedIdx > 0) { location.hash = ''; }
-    else return;
+    var isArrow = (k === 37 || k === 38 || k === 39 || k === 40);
+    // In focus mode arrow keys shift focus — Up/Left = prev, Down/Right = next.
+    // We only consume the key (preventDefault) when we actually act on it; otherwise
+    // native page scroll continues to work in grid mode where #thumbs has focus.
+    if (focusedIdx > 0 && isArrow) {
+      e.preventDefault();  // stop the browser's native ~40px arrow-key scroll on the
+                           // focus strip, which would otherwise race with shiftFocus()
+                           // and produce the "slowly sliding" jitter when #thumbs has
+                           // keyboard focus (e.g. after the user clicked into it).
+      if (k === 37 || k === 38) leftbutton(); else rightbutton();
+    } else if (k === 27 && focusedIdx > 0) {
+      e.preventDefault();
+      location.hash = '';
+    } else {
+      return;
+    }
     keyslocked = 1;
   }
 
