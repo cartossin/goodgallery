@@ -1243,7 +1243,7 @@ async function handle(req, res) {
       return notFound(res);
     }
     // sprite atlas files: /<gallery>/.../thumbcache/sprite-N.jpg
-    if (dirOfFile === 'thumbcache' && /^sprite-\d+\.jpg$/.test(fileName)) {
+    if (dirOfFile === 'thumbcache' && /^sprite(?:-h\d+)?-\d+\.jpg$/.test(fileName)) {
       const galleryAbs = resolveGallery(grandparent);
       if (!galleryAbs) return notFound(res);
       return serveStaticFile(req, res, path.join(galleryAbs, 'thumbcache', fileName));
