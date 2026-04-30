@@ -447,7 +447,6 @@
       visible.push(t);
     }
 
-    var myFrame = ++renderFrame;
     var atlasH = pickAtlasHeight(currentRowHeight);
 
     if (atlasH != null) {
@@ -455,7 +454,7 @@
       // covers it. One atlas image, many tiles drawn from offsets within it.
       var atlas = spriteMeta.atlases[String(atlasH)];
       loadSpriteBitmapsForAtlas(atlasH).then(function (bitmaps) {
-        if (renderFrame !== myFrame || !canvasEl) return;
+        if (!canvasEl) return;
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
         var aCellW = atlas.cellW, aCellH = atlas.cellH;
         var aPerSprite = atlas.cellsPerSprite, aAcross = atlas.across;
@@ -482,7 +481,7 @@
       var tierH = pickPerImageTier(currentRowHeight);
       visible.forEach(function (t) {
         loadPerImageBitmap(t.name, tierH).then(function (bitmap) {
-          if (renderFrame !== myFrame || !canvasEl || !bitmap) return;
+          if (!canvasEl || !bitmap) return;
           ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
           ctx.drawImage(bitmap, 0, 0, bitmap.width, bitmap.height, t.x, t.y - scrollY, t.w, t.h);
         });
