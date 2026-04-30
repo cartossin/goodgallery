@@ -307,6 +307,11 @@
   // The canvas is the FIRST child + sticky top, the spacer comes AFTER. Scrolling pushes
   // the spacer up; the canvas stays at the top of the viewport. On scroll we redraw with
   // the appropriate Y window of the layout.
+  // Render at device-pixel density on retina — browser then displays 1:1 from the
+  // backing store rather than upsampling a CSS-px-density canvas. Capped at 2 since
+  // higher densities don't visibly help and just multiply paint cost.
+  function devicePixelRatio() { return Math.min(window.devicePixelRatio || 1, 2); }
+
   var spriteBitmapPromises = null;     // resolved sprite ImageBitmaps (one per sprite-N.jpg)
   var lastTileRects = [];              // [{x, y, w, h, name}] in LAYOUT coords (not screen)
   var lastTotalH = 0;                  // total layout height
@@ -378,23 +383,24 @@
     var thumbsEl = $('thumbs');
     if (!thumbsEl) return;
     var scrollY = thumbsEl.scrollTop;
-    var viewportH = canvasEl.height;
+    var dpr = devicePixelRatio();
+    // Logical (CSS) size of the canvas
+    var viewportH = canvasEl.height / dpr;
+    var viewportW = canvasEl.width / dpr;
     if (!viewportH) return;
     var ctx = canvasEl.getContext('2d', { alpha: false });
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);  // all drawImage calls below use CSS coords
     ctx.fillStyle = '#0a0a0a';
-    ctx.fillRect(0, 0, canvasEl.width, viewportH);
+    ctx.fillRect(0, 0, viewportW, viewportH);
     if (!spriteBitmapPromises) return;
     spriteBitmapPromises.then(function (bitmaps) {
-      // Make sure the user hasn't navigated away in the meantime
       if (!canvasEl) return;
       var cellW = spriteMeta.cellW, cellH = spriteMeta.cellH;
       var top = scrollY, bot = scrollY + viewportH;
-      // Linear scan tile rects; only draw those overlapping [top, bot].
-      // For 60k thumbs this is still fast (single arithmetic per tile, no DOM).
       for (var k = 0; k < lastTileRects.length; k++) {
         var t = lastTileRects[k];
         if (t.y + t.h < top) continue;
-        if (t.y > bot) break;  // rects are y-sorted; can stop early
+        if (t.y > bot) break;
         var loc = spriteMeta.imageMap[t.name];
         if (!loc) continue;
         var bitmap = bitmaps[loc.sprite];
@@ -442,13 +448,17 @@
     thumbsEl.style.overflowY = 'auto';
     thumbsEl.style.height = viewportH + 'px';
 
-    // Canvas + spacer
+    // Canvas + spacer. Backing store at device-pixel density (dpr×); CSS size at
+    // logical (W). drawCanvasForScroll() applies setTransform(dpr) so all drawImage
+    // calls keep using CSS coordinates.
     ensureCanvasAndSpacer(thumbsEl);
-    canvasEl.width = W;
-    canvasEl.height = Math.min(viewportH, Math.ceil(totalH));  // canvas only as tall as it needs
+    var dpr = devicePixelRatio();
+    var canvasH = Math.min(viewportH, Math.ceil(totalH));
+    canvasEl.width = Math.round(W * dpr);
+    canvasEl.height = Math.round(canvasH * dpr);
     canvasEl.style.width = W + 'px';
-    canvasEl.style.height = canvasEl.height + 'px';
-    spacerEl.style.height = Math.max(0, Math.ceil(totalH) - canvasEl.height) + 'px';
+    canvasEl.style.height = canvasH + 'px';
+    spacerEl.style.height = Math.max(0, Math.ceil(totalH) - canvasH) + 'px';
 
     // Compute tile rects in LAYOUT coords (independent of scroll)
     lastTileRects = [];
