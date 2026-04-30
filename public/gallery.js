@@ -708,12 +708,19 @@
     setupThumbClicks();
     setupZoomSlider();
 
-    // populate preview-image array (used by image-viewer prev/next preload)
-    for (var i = 1; i <= lastimagevalue; i++) {
-      previewimages[i] = previewSrc(i);
-    }
     window.addEventListener('resize', scheduleRender);
-    // Sprite ImageBitmaps load lazily on first renderGallery; nothing to kick off here.
+
+    // Async-load the binary imagemap; once it's parsed, populate per-image preview URLs
+    // and re-trigger the initial route to render. Without it (e.g. sprite not built yet)
+    // renderGallery falls through to the "Generating thumbnails…" placeholder.
+    if (window.imagemapURL && window.spriteMeta) {
+      loadImagemap().then(function () {
+        for (var i = 1; i <= lastimagevalue; i++) previewimages[i] = previewSrc(i);
+        refreshfromhash();
+      }).catch(function (e) {
+        console.warn('[imagemap] load failed:', e);
+      });
+    }
 
     // initial route: hash empty or ':N' → thumb view; #filename → image view
     var raw = decodeURIComponent(location.hash.slice(1) || '');
