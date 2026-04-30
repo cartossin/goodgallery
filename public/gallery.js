@@ -817,44 +817,93 @@
     });
   }
 
-  function drawMainImage() {
-    if (!mainEl || !window.spriteMeta) return;
-    if (focusedIdx <= 0 || focusedIdx > lastimagevalue) return;
+  // Geometry helper: where + how big to draw the main image. Shared by drawMainImage
+  // (low-res preview) and upgradeMainImage (high-LoD overlay).
+  function mainImageGeom() {
+    if (focusedIdx <= 0 || focusedIdx > lastimagevalue) return null;
+    var name = images[focusedIdx];
+    if (!spriteMeta || !spriteMeta.imageMap) return null;
+    var loc = spriteMeta.imageMap[name];
+    if (!loc) return null;
     var W = layoutWidth(), H = layoutHeight();
     var mainH = Math.max(120, H - FILM_H);
+    var natW = loc.w, natH = CANONICAL_H;
+    var scale = Math.min(W / natW, mainH / natH);
+    var dw = Math.round(natW * scale), dh = Math.round(natH * scale);
+    return {
+      W: W, mainH: mainH, name: name, natW: natW, natH: natH,
+      dw: dw, dh: dh,
+      dx: Math.round((W - dw) / 2),
+      dy: Math.round((mainH - dh) / 2),
+    };
+  }
+
+  // Low-res paint from the h50 atlas. Always instant (atlas is in memory for
+  // the filmstrip), so the main image follows scrubbing without ever blanking.
+  function drawMainImage() {
+    if (!mainEl || !window.spriteMeta) return;
+    var g = mainImageGeom();
+    if (!g) return;
     var dpr = devicePixelRatio();
     var ctx = mainEl.getContext('2d', { alpha: false });
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.fillStyle = '#000';
-    ctx.fillRect(0, 0, W, mainH);
-
-    var name = images[focusedIdx];
-    var loc = spriteMeta.imageMap[name];
-    if (!loc) return;
-    var natW = loc.w, natH = CANONICAL_H;
-    var scale = Math.min(W / natW, mainH / natH);
-    var dw = Math.round(natW * scale);
-    var dh = Math.round(natH * scale);
-    var dx = Math.round((W - dw) / 2);
-    var dy = Math.round((mainH - dh) / 2);
+    ctx.fillRect(0, 0, g.W, g.mainH);
 
     var atlasH = 50;
     var atlas = spriteMeta.atlases && spriteMeta.atlases[String(atlasH)];
-    if (!atlas) return;
+    if (atlas) {
+      var capturedIdx = focusedIdx;
+      loadSpriteBitmapsForAtlas(atlasH).then(function (bitmaps) {
+        if (!mainEl || focusedIdx !== capturedIdx) return;
+        var idx0 = capturedIdx - 1;
+        var spriteIdx = Math.floor(idx0 / atlas.cellsPerSprite);
+        var posInSprite = idx0 % atlas.cellsPerSprite;
+        var row = Math.floor(posInSprite / atlas.across);
+        var col = posInSprite % atlas.across;
+        var bitmap = bitmaps[spriteIdx];
+        if (!bitmap) return;
+        var srcW = Math.round(g.natW * atlasH / g.natH);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.drawImage(bitmap, col * atlas.cellW, row * atlas.cellH, srcW, atlas.cellH, g.dx, g.dy, g.dw, g.dh);
+      });
+    }
+    // Schedule the high-res upgrade. Resets on every scrub, so it only fires
+    // 150ms after scrolling settles — no point burning network on images the user
+    // is scrolling past.
+    if (mainUpgradeTimer) clearTimeout(mainUpgradeTimer);
+    mainUpgradeTimer = setTimeout(upgradeMainImage, 150);
+  }
+
+  // After the user stops scrubbing, upgrade the main image to whatever LoD tier
+  // best matches the displayed pixel size. Above h800 we serve the original.
+  // Also warms ±FOCUS_PREFETCH neighbors at the same tier so a few prev/next
+  // taps after settling are instant.
+  var mainUpgradeTimer = null;
+  function upgradeMainImage() {
+    mainUpgradeTimer = null;
+    if (!mainEl) return;
+    var g = mainImageGeom();
+    if (!g) return;
+    var tier = pickPerImageTier(g.dh);
     var capturedIdx = focusedIdx;
-    loadSpriteBitmapsForAtlas(atlasH).then(function (bitmaps) {
-      if (!mainEl || focusedIdx !== capturedIdx) return;
-      var idx0 = capturedIdx - 1;
-      var spriteIdx = Math.floor(idx0 / atlas.cellsPerSprite);
-      var posInSprite = idx0 % atlas.cellsPerSprite;
-      var row = Math.floor(posInSprite / atlas.across);
-      var col = posInSprite % atlas.across;
-      var bitmap = bitmaps[spriteIdx];
-      if (!bitmap) return;
-      var srcW = Math.round(natW * atlasH / natH);
+    loadPerImageBitmap(g.name, tier).then(function (bm) {
+      if (!mainEl || !bm || focusedIdx !== capturedIdx) return;
+      var dpr = devicePixelRatio();
+      var ctx = mainEl.getContext('2d', { alpha: false });
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.drawImage(bitmap, col * atlas.cellW, row * atlas.cellH, srcW, atlas.cellH, dx, dy, dw, dh);
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, g.W, g.mainH);
+      ctx.drawImage(bm, 0, 0, bm.width, bm.height, g.dx, g.dy, g.dw, g.dh);
     });
+    // Prefetch neighbors so prev/next is instant after a settle.
+    for (var d = -FOCUS_PREFETCH; d <= FOCUS_PREFETCH; d++) {
+      if (d === 0) continue;
+      var idx = focusedIdx + d;
+      while (idx < 1) idx += lastimagevalue;
+      while (idx > lastimagevalue) idx -= lastimagevalue;
+      if (images[idx]) loadPerImageBitmap(images[idx], tier);
+    }
   }
 
   function renderGallery() {
@@ -1078,11 +1127,13 @@
     });
   }
 
-  // Single source of truth for zoom changes. Crosses the 100 boundary by switching
-  // mode: hitting 100 in grid enters focus on the centered image; falling below 100
-  // in focus exits back to grid at that zoom level. Inputs come from both the slider
-  // and the pinch handler.
-  function handleZoomChange(v) {
+  // Single source of truth for zoom changes. Boundary at 100:
+  //   grid + v>=100 → enter focus on centered image
+  //   focus + v<100 from the SLIDER → exit focus to grid at v
+  //   focus + v<100 from PINCH → no-op (pinch in focus is reserved for image
+  //     zoom; for now we just refuse to exit so the user doesn't get yanked
+  //     out unexpectedly. ESC + slider drag remain as exit paths.)
+  function handleZoomChange(v, fromPinch) {
     if (isNaN(v)) v = 0;
     if (v < 0) v = 0; if (v > 100) v = 100;
     if (focusedIdx === 0 && v >= 100) {
@@ -1095,6 +1146,10 @@
       }
     }
     if (focusedIdx > 0 && v < 100) {
+      if (fromPinch) {
+        var slKeep = $('zoomSlider'); if (slKeep) slKeep.value = '100';
+        return;
+      }
       setZoom(v);
       var sl2 = $('zoomSlider'); if (sl2) sl2.value = String(v);
       location.hash = '';
@@ -1126,7 +1181,7 @@
 
   // No custom wheel/touch handlers in focus mode any more — the strip is a real
   // native-scroll surface, so the browser drives prev/next via inertial scroll and
-  // we just snap-to-image when the user lets go (see onThumbsScroll/scheduleFocusSnap).
+  // the filmstrip is the scroll surface and free-scrolls (no snap).
   // In landscape we redirect vertical wheel to horizontal scroll so trackpad/mousewheel
   // users without a horizontal axis can still navigate. Touch on iOS already gives both
   // axes natively, so no touch handler is needed.
@@ -1180,7 +1235,7 @@
       var d = dist(e.touches[0], e.touches[1]);
       if (d < 1 || pinch.d0 < 1) return;
       var newVal = Math.max(0, Math.min(100, pinch.v0 + Math.log2(d / pinch.d0) * 25));
-      handleZoomChange(newVal);
+      handleZoomChange(newVal, true);
       // After a mode flip the pinch baseline is stale (we may have just entered/exited
       // focus). Reseed so further finger movement keeps tracking.
       pinch.d0 = d;
