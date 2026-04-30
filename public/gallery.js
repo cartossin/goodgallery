@@ -487,6 +487,11 @@
       visible.push(t);
     }
 
+    // Frame counter: every drawCanvasForScroll bumps it. Async .then() callbacks check
+    // it before drawing so stale draws (from a previous mode/zoom) don't paint on top of
+    // the current canvas state. Without this guard, transitioning from atlas to per-image
+    // mode leaves old atlas content showing in the gaps between per-image tiles.
+    var myFrame = ++renderFrame;
     var atlasH = pickAtlasHeight(currentRowHeight);
 
     if (atlasH != null) {
@@ -494,7 +499,7 @@
       // covers it. One atlas image, many tiles drawn from offsets within it.
       var atlas = spriteMeta.atlases[String(atlasH)];
       loadSpriteBitmapsForAtlas(atlasH).then(function (bitmaps) {
-        if (!canvasEl) return;
+        if (!canvasEl || renderFrame !== myFrame) return;
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
         var aCellW = atlas.cellW, aCellH = atlas.cellH;
         var aPerSprite = atlas.cellsPerSprite, aAcross = atlas.across;
@@ -521,7 +526,7 @@
       var tierH = pickPerImageTier(currentRowHeight);
       visible.forEach(function (t) {
         loadPerImageBitmap(t.name, tierH).then(function (bitmap) {
-          if (!canvasEl || !bitmap) return;
+          if (!canvasEl || !bitmap || renderFrame !== myFrame) return;
           ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
           ctx.drawImage(bitmap, 0, 0, bitmap.width, bitmap.height, t.x, t.y - scrollY, t.w, t.h);
         });
