@@ -293,16 +293,28 @@
     };
   }
 
-  // ---- single-canvas rendering (option C) -----------------------------
-  // One <canvas> for the entire thumb grid. drawImage from the loaded sprite ImageBitmap
-  // for each tile. Click handling via hit-test against `lastTileRects`. Tradeoffs: no
-  // native CSS hover, no per-tile links (back/forward still works since we set hash on
-  // click), no right-click-open-in-new-tab. In return: ~1 DOM node, GPU compositing,
-  // smooth on Safari.
+  // ---- virtual-scroll single canvas (option C, scaled) -----------------
+  // The canvas stays the size of the viewport — never grows with the gallery. The
+  // scroll container is sized to the full layout height via a spacer; as the user
+  // scrolls, we redraw the (small) canvas with whichever rows are currently visible.
+  // Memory and paint cost are bounded regardless of N (works for 60k+ images).
+  //
+  // Layout:
+  //   #thumbs (scroll container, overflow-y: auto, height = available viewport)
+  //     <canvas> (position: sticky; top: 0; height = viewport)
+  //     <div class="spacer" style="height = totalLayoutHeight - viewport">
+  //
+  // The canvas is the FIRST child + sticky top, the spacer comes AFTER. Scrolling pushes
+  // the spacer up; the canvas stays at the top of the viewport. On scroll we redraw with
+  // the appropriate Y window of the layout.
   var spriteBitmapPromises = null;     // resolved sprite ImageBitmaps (one per sprite-N.jpg)
-  var lastTileRects = [];              // [{x, y, w, h, name}] for click hit-testing
+  var lastTileRects = [];              // [{x, y, w, h, name}] in LAYOUT coords (not screen)
+  var lastTotalH = 0;                  // total layout height
   var canvasEl = null;
+  var spacerEl = null;
   var canvasClickAttached = false;
+  var thumbsScrollAttached = false;
+  var pendingScrollDraw = false;
 
   function loadSpriteBitmaps() {
     if (spriteBitmapPromises || !window.spriteMeta) return spriteBitmapPromises;
@@ -315,31 +327,81 @@
     return spriteBitmapPromises;
   }
 
-  function ensureCanvas(thumbsEl) {
-    if (canvasEl && canvasEl.parentNode === thumbsEl) return canvasEl;
+  function ensureCanvasAndSpacer(thumbsEl) {
+    if (canvasEl && canvasEl.parentNode === thumbsEl) return;
     thumbsEl.innerHTML = '';
     canvasEl = document.createElement('canvas');
     canvasEl.style.cursor = 'pointer';
     canvasEl.style.display = 'block';
+    canvasEl.style.position = 'sticky';
+    canvasEl.style.top = '0';
+    canvasEl.style.zIndex = '1';
+    spacerEl = document.createElement('div');
+    spacerEl.style.width = '1px';  // collapsed; height is what makes the container scrollable
     thumbsEl.appendChild(canvasEl);
+    thumbsEl.appendChild(spacerEl);
     if (!canvasClickAttached) {
       canvasEl.addEventListener('click', onCanvasClick);
       canvasClickAttached = true;
     }
-    return canvasEl;
+    if (!thumbsScrollAttached) {
+      thumbsEl.addEventListener('scroll', onThumbsScroll, { passive: true });
+      thumbsScrollAttached = true;
+    }
+  }
+
+  function onThumbsScroll() {
+    if (pendingScrollDraw) return;
+    pendingScrollDraw = true;
+    requestAnimationFrame(function () {
+      pendingScrollDraw = false;
+      drawCanvasForScroll();
+    });
   }
 
   function onCanvasClick(e) {
-    var rect = e.currentTarget.getBoundingClientRect();
-    var x = e.clientX - rect.left;
-    var y = e.clientY - rect.top;
+    var rect = canvasEl.getBoundingClientRect();
+    var thumbsEl = $('thumbs');
+    var cx = e.clientX - rect.left;
+    var cy = e.clientY - rect.top + (thumbsEl ? thumbsEl.scrollTop : 0);  // canvas y -> layout y
     for (var i = 0; i < lastTileRects.length; i++) {
       var t = lastTileRects[i];
-      if (x >= t.x && x < t.x + t.w && y >= t.y && y < t.y + t.h) {
+      if (cx >= t.x && cx < t.x + t.w && cy >= t.y && cy < t.y + t.h) {
         location.hash = encodeURIComponent(t.name);
         return;
       }
     }
+  }
+
+  function drawCanvasForScroll() {
+    if (!canvasEl || !window.spriteMeta) return;
+    var thumbsEl = $('thumbs');
+    if (!thumbsEl) return;
+    var scrollY = thumbsEl.scrollTop;
+    var viewportH = canvasEl.height;
+    if (!viewportH) return;
+    var ctx = canvasEl.getContext('2d', { alpha: false });
+    ctx.fillStyle = '#0a0a0a';
+    ctx.fillRect(0, 0, canvasEl.width, viewportH);
+    if (!spriteBitmapPromises) return;
+    spriteBitmapPromises.then(function (bitmaps) {
+      // Make sure the user hasn't navigated away in the meantime
+      if (!canvasEl) return;
+      var cellW = spriteMeta.cellW, cellH = spriteMeta.cellH;
+      var top = scrollY, bot = scrollY + viewportH;
+      // Linear scan tile rects; only draw those overlapping [top, bot].
+      // For 60k thumbs this is still fast (single arithmetic per tile, no DOM).
+      for (var k = 0; k < lastTileRects.length; k++) {
+        var t = lastTileRects[k];
+        if (t.y + t.h < top) continue;
+        if (t.y > bot) break;  // rects are y-sorted; can stop early
+        var loc = spriteMeta.imageMap[t.name];
+        if (!loc) continue;
+        var bitmap = bitmaps[loc.sprite];
+        if (!bitmap) continue;
+        ctx.drawImage(bitmap, loc.col * cellW, loc.row * cellH, loc.w, cellH, t.x, t.y - scrollY, t.w, t.h);
+      }
+    });
   }
 
   function renderGallery() {
@@ -349,6 +411,8 @@
       thumbsEl.innerHTML = '<div style="padding:24px;text-align:center;color:#888">' +
         (window.isadmin ? 'No images yet — upload some via the admin panel.' : 'No images.') +
         '</div>';
+      thumbsEl.style.cssText = '';
+      canvasEl = null; spacerEl = null;
       return;
     }
     if (!window.spriteMeta) {
@@ -357,24 +421,36 @@
         '<div style="font-size:13px">' + lastimagevalue + ' images in this folder</div>' +
         '</div>';
       pollBuildStatus({ reloadOnComplete: true });
+      thumbsEl.style.cssText = '';
+      canvasEl = null; spacerEl = null;
       return;
     }
+
+    // Compute layout
     var H = targetRowHeight(getZoom());
     var rows = layoutRows(H);
     var W = layoutWidth();
-    // Compute total layout height
     var totalH = 0;
     for (var i = 0; i < rows.length; i++) totalH += rows[i].height + ROW_GAP;
+    lastTotalH = totalH;
 
-    var canvas = ensureCanvas(thumbsEl);
-    canvas.width = W; canvas.height = Math.ceil(totalH);
-    canvas.style.width = W + 'px';
-    canvas.style.height = Math.ceil(totalH) + 'px';
-    var ctx = canvas.getContext('2d', { alpha: false });
-    ctx.fillStyle = '#0a0a0a';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    // Available viewport height for the scroll container
+    var viewportH = layoutHeight();
 
-    // Compute tile rects (used for click hit-testing AND to know what to draw)
+    // Configure #thumbs as the scroll container
+    thumbsEl.style.position = 'relative';
+    thumbsEl.style.overflowY = 'auto';
+    thumbsEl.style.height = viewportH + 'px';
+
+    // Canvas + spacer
+    ensureCanvasAndSpacer(thumbsEl);
+    canvasEl.width = W;
+    canvasEl.height = Math.min(viewportH, Math.ceil(totalH));  // canvas only as tall as it needs
+    canvasEl.style.width = W + 'px';
+    canvasEl.style.height = canvasEl.height + 'px';
+    spacerEl.style.height = Math.max(0, Math.ceil(totalH) - canvasEl.height) + 'px';
+
+    // Compute tile rects in LAYOUT coords (independent of scroll)
     lastTileRects = [];
     var y = 0;
     for (var r = 0; r < rows.length; r++) {
@@ -387,20 +463,13 @@
       y += rows[r].height + ROW_GAP;
     }
 
-    // Draw — wait for sprite bitmaps then drawImage each tile
-    loadSpriteBitmaps().then(function (bitmaps) {
-      // Re-check we're still showing the same layout (zoom may have changed mid-fetch)
-      if (canvasEl !== canvas) return;
-      var cellW = spriteMeta.cellW, cellH = spriteMeta.cellH;
-      for (var k = 0; k < lastTileRects.length; k++) {
-        var t = lastTileRects[k];
-        var loc = spriteMeta.imageMap[t.name];
-        if (!loc) continue;
-        var bitmap = bitmaps[loc.sprite];
-        if (!bitmap) continue;
-        ctx.drawImage(bitmap, loc.col * cellW, loc.row * cellH, loc.w, cellH, t.x, t.y, t.w, t.h);
-      }
-    }).catch(function (e) { console.warn('[canvas] sprite load failed:', e); });
+    // Reset scroll position to top on layout change (otherwise zooming can leave you
+    // looking at empty space below the new shorter layout)
+    thumbsEl.scrollTop = 0;
+
+    // Trigger initial paint (sprites may already be loaded; if not, paint runs once they resolve)
+    loadSpriteBitmaps();
+    drawCanvasForScroll();
   }
 
   function buildthumbpages() { /* legacy stub — layout is now incremental via renderGallery */ }
