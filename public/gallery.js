@@ -349,6 +349,10 @@
   // Per-atlas-height ImageBitmap cache. Each atlas height (5/10/50) is loaded once,
   // lazily, and reused across renders.
   var spriteBitmapsByHeight = {};      // { '50': Promise<[ImageBitmap, ...]>, ... }
+  // Sync mirror of the resolved atlas bitmap arrays — populated by the .then() below.
+  // Used by drag-paint where we need to draw prev/next images mid-gesture without an
+  // async hop (a microtask on every drag frame would visibly stutter).
+  var atlasBitmapsSync = {};           // { '50': [ImageBitmap, ...] | undefined }
   // Per-image bitmap cache for high-zoom views. Keyed by `${name}|${tierH}`. At
   // tierH=100/200/400/800 we fetch each visible image as its own AVIF; the canvas
   // composites them. Only viewport-visible images are fetched, so memory is bounded.
@@ -373,7 +377,10 @@
       return fetch(url, { credentials: 'same-origin' })
         .then(function (r) { return r.blob(); })
         .then(function (b) { return createImageBitmap(b); });
-    }));
+    })).then(function (bitmaps) {
+      atlasBitmapsSync[key] = bitmaps;
+      return bitmaps;
+    });
     return spriteBitmapsByHeight[key];
   }
 
@@ -606,6 +613,13 @@
   // Transform state for the focused image (pinch-zoom). Scale anchored at the image
   // center; reset on every focusedIdx change so each photo opens at 1x.
   var mainScale = 1;
+  // Drag state for iCloud-style swipe: while dragging, the focused image translates
+  // by dragDX and prev/next images are painted at offset ±viewportW from center, so
+  // they peek in from the side as the finger moves. On release we either commit
+  // (snap to ±W and shift focus) or revert (snap back to 0).
+  var dragActive = false;
+  var dragDX = 0;
+  var dragRaf = null;     // animation id for commit/revert
   // The source we should draw into the main canvas: bitmap + sub-rect. Updated by
   // drawMainImage (atlas low-res) and upgradeMainImage (high-LoD). Held synchronously
   // so pinch can redraw without the microtask gap that was causing a black flicker
@@ -965,6 +979,127 @@
     }
   }
 
+  // Sync source-rect lookup for an arbitrary image index out of the h50 atlas.
+  // Returns null if the atlas isn't loaded yet (caller should fall back to skipping
+  // that side of the drag rather than blocking).
+  function getAtlasSrcSync(idx1) {
+    if (!spriteMeta || !spriteMeta.atlases) return null;
+    var atlas = spriteMeta.atlases['50'];
+    if (!atlas) return null;
+    var bitmaps = atlasBitmapsSync['50'];
+    if (!bitmaps) return null;
+    var idx0 = idx1 - 1;
+    if (idx0 < 0 || idx0 >= lastimagevalue) return null;
+    var name = images[idx1];
+    if (!name) return null;
+    var loc = spriteMeta.imageMap[name];
+    if (!loc) return null;
+    var spriteIdx = Math.floor(idx0 / atlas.cellsPerSprite);
+    var bitmap = bitmaps[spriteIdx];
+    if (!bitmap) return null;
+    var posInSprite = idx0 % atlas.cellsPerSprite;
+    var row = Math.floor(posInSprite / atlas.across);
+    var col = posInSprite % atlas.across;
+    var srcW = Math.round(loc.w * atlas.cellH / CANONICAL_H);
+    return { bitmap: bitmap, sx: col * atlas.cellW, sy: row * atlas.cellH, sw: srcW, sh: atlas.cellH, natW: loc.w, natH: CANONICAL_H };
+  }
+
+  function destRectForLoc(natW, natH, areaW, areaH) {
+    var scale = Math.min(areaW / natW, areaH / natH);
+    var dw = Math.round(natW * scale), dh = Math.round(natH * scale);
+    return { dw: dw, dh: dh, dx: Math.round((areaW - dw) / 2), dy: Math.round((areaH - dh) / 2) };
+  }
+
+  // Paint the main canvas during a drag: clear, then draw current at offset dragDX,
+  // prev at dragDX-W, next at dragDX+W. Uses mainDrawSrc (high-LoD if available) for
+  // the centered image and atlas-sync sources for the neighbors.
+  function paintMainDragged(dx) {
+    if (!mainEl) return;
+    var W = layoutWidth(), H = layoutHeight();
+    var mainH = Math.max(120, H - FILM_H);
+    var dpr = devicePixelRatio();
+    var ctx = mainEl.getContext('2d', { alpha: false });
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, mainH);
+
+    function paintAt(idx1, offsetX) {
+      if (idx1 < 1 || idx1 > lastimagevalue) return;
+      var name = images[idx1];
+      var loc = name && spriteMeta && spriteMeta.imageMap && spriteMeta.imageMap[name];
+      if (!loc) return;
+      var dest = destRectForLoc(loc.w, CANONICAL_H, W, mainH);
+      var src = (idx1 === focusedIdx && mainDrawSrc && mainDrawSrc.forIdx === idx1)
+        ? mainDrawSrc
+        : getAtlasSrcSync(idx1);
+      if (!src) return;
+      ctx.drawImage(src.bitmap, src.sx, src.sy, src.sw, src.sh, dest.dx + offsetX, dest.dy, dest.dw, dest.dh);
+    }
+    paintAt(focusedIdx, dx);
+    paintAt(focusedIdx - 1, dx - W);
+    paintAt(focusedIdx + 1, dx + W);
+  }
+
+  // Animate dragDX toward targetDX via the same proportional-step chase we use
+  // elsewhere, then run done(). Each step paints the 3-image drag layout.
+  function animateDragTo(targetDX, done) {
+    if (dragRaf) cancelAnimationFrame(dragRaf);
+    function tick() {
+      dragRaf = null;
+      var diff = targetDX - dragDX;
+      if (Math.abs(diff) < 1) {
+        dragDX = targetDX;
+        paintMainDragged(dragDX);
+        if (done) done();
+        return;
+      }
+      var step = diff * 0.3;
+      if (Math.abs(step) < 1) step = (diff > 0 ? 1 : -1);
+      dragDX += step;
+      paintMainDragged(dragDX);
+      dragRaf = requestAnimationFrame(tick);
+    }
+    dragRaf = requestAnimationFrame(tick);
+  }
+
+  // Commit a drag: animate to ±W then shift focus + reset state.
+  // direction: -1 = went to previous (user dragged right), +1 = went to next (dragged left).
+  function commitDrag(direction) {
+    var W = layoutWidth();
+    var targetDx = -direction * W;  // dragDX ended at +W means current image fully right; prev is centered
+    animateDragTo(targetDx, function () {
+      var newIdx = focusedIdx + direction;
+      while (newIdx < 1) newIdx += lastimagevalue;
+      while (newIdx > lastimagevalue) newIdx -= lastimagevalue;
+      // Pre-populate the new mainDrawSrc from the atlas if available, so the next paint
+      // doesn't black-flicker while the atlas .then() resolves on a microtask.
+      var newSrc = getAtlasSrcSync(newIdx);
+      if (newSrc) {
+        mainDrawSrc = { bitmap: newSrc.bitmap, sx: newSrc.sx, sy: newSrc.sy, sw: newSrc.sw, sh: newSrc.sh, forIdx: newIdx };
+      } else {
+        mainDrawSrc = null;
+      }
+      focusedIdx = newIdx;
+      mainScale = 1;
+      dragDX = 0;
+      dragActive = false;
+      // Sync the filmstrip to the new image (no chase animation needed — visual
+      // commit already happened via the drag).
+      if (filmstripEl) filmstripEl.scrollLeft = filmScrollForIdx1(focusedIdx, W);
+      try { history.replaceState(null, '', '#' + encodeURIComponent(images[focusedIdx])); } catch (_) {}
+      paintMain();
+      if (mainUpgradeTimer) clearTimeout(mainUpgradeTimer);
+      mainUpgradeTimer = setTimeout(upgradeMainImage, 150);
+    });
+  }
+  function revertDrag() {
+    animateDragTo(0, function () {
+      dragActive = false;
+      dragDX = 0;
+      paintMain();
+    });
+  }
+
   // Touch gestures on the main image: 1-finger horizontal swipe → prev/next via
   // shiftFocus (which animates through the chase loop). 2-finger pinch → scale the
   // current image around its center; release back to ≈1 snaps to identity.
@@ -1001,6 +1136,21 @@
         if (newScale > 6) newScale = 6;
         mainScale = newScale;
         paintMain();
+        return;
+      }
+      // Single-finger drag: the image follows the finger; prev/next peek from the sides.
+      if (swipeStart && e.touches.length === 1 && mainScale === 1) {
+        var dx = e.touches[0].clientX - swipeStart.x;
+        var dy = e.touches[0].clientY - swipeStart.y;
+        // Direction lock: if the gesture is clearly vertical, leave it alone (lets a
+        // future vertical gesture pass through to anyone who wants it).
+        if (!dragActive && Math.abs(dy) > Math.abs(dx) && Math.abs(dy) > 8) return;
+        if (dragActive || Math.abs(dx) > 6) {
+          dragActive = true;
+          dragDX = dx;
+          e.preventDefault();
+          paintMainDragged(dragDX);
+        }
       }
     }, { passive: false });
     mainEl.addEventListener('touchend', function (e) {
@@ -1012,21 +1162,27 @@
         }
         pinchStart = null;
       }
-      // Swipe end: only treat as swipe if we never went into pinch mode and image
-      // is at 1x (so swipe-while-zoomed isn't accidentally triggering nav).
-      if (swipeStart && e.changedTouches[0] && mainScale === 1) {
-        var dx = e.changedTouches[0].clientX - swipeStart.x;
-        var dy = e.changedTouches[0].clientY - swipeStart.y;
-        var dt = Date.now() - swipeStart.t;
-        if (dt < 600 && Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5) {
-          shiftFocus(dx < 0 ? +1 : -1);
+      // Drag end: commit if dragged > 30% of viewport OR flicked fast. Otherwise revert.
+      if (dragActive) {
+        var W = layoutWidth();
+        var dt = Math.max(1, Date.now() - swipeStart.t);
+        var velocity = dragDX / dt;  // px/ms
+        var commit = (Math.abs(dragDX) > W * 0.30) || (Math.abs(velocity) > 0.5 && Math.abs(dragDX) > 30);
+        if (commit) {
+          // dragDX > 0 means user dragged right → previous image. direction = -1.
+          commitDrag(dragDX > 0 ? -1 : +1);
+        } else {
+          revertDrag();
         }
+        swipeStart = null;
+      } else if (swipeStart) {
         swipeStart = null;
       }
       if (e.touches.length === 0) touchOnMain = false;
     });
     mainEl.addEventListener('touchcancel', function () {
       pinchStart = null; swipeStart = null; touchOnMain = false;
+      if (dragActive) revertDrag();
     });
   }
 
