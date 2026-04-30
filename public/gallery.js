@@ -427,10 +427,10 @@
     spacerEl.style.width = '1px';  // collapsed; height is what makes the container scrollable
     thumbsEl.appendChild(canvasEl);
     thumbsEl.appendChild(spacerEl);
-    if (!canvasClickAttached) {
-      canvasEl.addEventListener('click', onCanvasClick);
-      canvasClickAttached = true;
-    }
+    // Click listener is per-canvas: a fresh canvas (after a focus<->grid round trip)
+    // needs its own listener. The old global canvasClickAttached flag short-circuited
+    // the second attach, leaving the new canvas inert to clicks.
+    canvasEl.addEventListener('click', onCanvasClick);
     if (!thumbsScrollAttached) {
       thumbsEl.addEventListener('scroll', onThumbsScroll, { passive: true });
       thumbsScrollAttached = true;
