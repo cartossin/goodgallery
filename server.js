@@ -621,12 +621,34 @@ async function readSpriteMeta(galleryAbs) {
   return meta;
 }
 
-function spriteIsCurrent(meta, images) {
-  if (!meta || meta.version !== 2 || !meta.atlases || !meta.imageMap) return false;
+function spriteIsCurrent(meta, images, galleryAbs) {
+  if (!meta || meta.version !== 3 || !meta.atlases) return false;
   if (meta.imageCount !== images.length) return false;
-  for (const f of images) if (!meta.imageMap[f]) return false;
-  if (Object.keys(meta.imageMap).length !== images.length) return false;
+  if (!fs.existsSync(path.join(galleryAbs, 'thumbcache', '_imagemap.bin'))) return false;
   return true;
+}
+
+
+async function writeBinaryImagemap(thumbDir, images, aspects) {
+  const enc = new TextEncoder();
+  const nameBytes = images.map(n => enc.encode(n));
+  const widths = images.map((_, i) => Math.min(65535, Math.round(aspects[i] * 200)));
+  const namesTotal = nameBytes.reduce((sum, b) => sum + b.length + 1, 0);
+  const buf = Buffer.alloc(12 + 2 * images.length + namesTotal);
+  buf.write('GGMP', 0, 'ascii');
+  buf.writeUInt16LE(1, 4);
+  buf.writeUInt16LE(0, 6);
+  buf.writeUInt32LE(images.length, 8);
+  for (let i = 0; i < images.length; i++) buf.writeUInt16LE(widths[i], 12 + 2 * i);
+  let pos = 12 + 2 * images.length;
+  for (let i = 0; i < images.length; i++) {
+    buf.set(nameBytes[i], pos);
+    pos += nameBytes[i].length;
+    buf[pos++] = 0;
+  }
+  const dst = path.join(thumbDir, '_imagemap.bin');
+  await fsp.writeFile(dst + '.tmp', buf);
+  await fsp.rename(dst + '.tmp', dst);
 }
 
 async function buildSpriteForFolder(galleryAbs) {
@@ -667,15 +689,11 @@ async function buildSpriteForFolder(galleryAbs) {
   // Compact image table — name + canonical width (at H=200). Position in any atlas is
   // derived from the index here: idx = images.indexOf(name); the row/col/sprite math
   // uses the chosen atlas's cellsPerSprite + across.
-  const imageMap = {};
-  images.forEach((name, i) => {
-    imageMap[name] = { idx: i, w: Math.round(aspects[i] * 200) };
-  });
+  await writeBinaryImagemap(thumbDir, images, aspects);
 
   const meta = {
-    version: 2,
+    version: 3,
     atlases,
-    imageMap,
     imageCount: images.length,
     builtAt: Date.now(),
   };
@@ -689,7 +707,7 @@ async function buildSpriteForFolder(galleryAbs) {
   const referenced = new Set();
   for (const k in atlases) for (const sp of atlases[k].sprites) referenced.add(sp.file);
   for (const e of await fsp.readdir(thumbDir)) {
-    if (/^sprite(-h\d+)?-\d+\.jpg$/.test(e) && !referenced.has(e)) {
+    if (/^sprite(-h\d+)?-\d+\.(jpg|avif)$/.test(e) && !referenced.has(e)) {
       try { await fsp.unlink(path.join(thumbDir, e)); } catch {}
     }
   }
@@ -728,9 +746,9 @@ async function buildAtlasAtHeight(thumbDir, images, aspects, height, inputFormat
         await fsp.link(lodPath(thumbDir, chunk[i], height, inputFormat), link);
         inputPaths.push(link);
       }
-      const spriteFile = 'sprite-h' + height + '-' + c + '.jpg';
+      const spriteFile = 'sprite-h' + height + '-' + c + '.avif';
       const spriteAbs = path.join(thumbDir, spriteFile);
-      const tmp = spriteAbs + '.__tmp.jpg';
+      const tmp = spriteAbs + '.__tmp.avif';
       const vTmp = tmp + '.v';
       console.log('[sprite] building ' + spriteFile + ': ' + chunk.length + ' tiles, cell ' + cellW + 'x' + cellH + ', across ' + across);
       await runStep('vips', [
@@ -741,8 +759,8 @@ async function buildAtlasAtHeight(thumbDir, images, aspects, height, inputFormat
         '--background', '0',
       ], vTmp);
       await runStep('vips', [
-        'jpegsave', vTmp, tmp,
-        '--Q', '92', '--strip', '--optimize-coding', '--interlace',
+        'heifsave', vTmp, tmp,
+        '--Q', '80',
       ], tmp);
       await fsp.unlink(vTmp).catch(()=>{});
       await fsp.rename(tmp, spriteAbs);
@@ -1127,9 +1145,8 @@ function galleryHTML({ urlPath, folders, images, spriteMeta, isAdminFlag, hasPas
     return `<a class="folder" href="${hxEscape(href)}"><span class="folder-icon">📁</span><span class="folder-name">${hxEscape(name)}</span></a>`;
   }).join('');
 
-  // images[] is 1-indexed in the original; we keep the same convention to preserve old JS
-  const imagesJsArray = 'var images = [null,' + images.map(n => jsString(n)).join(',') + '];';
   const lastImageValue = images.length;
+  const imagemapURL = spriteMeta ? jsString(urlPath + 'thumbcache/_imagemap.bin') : 'null';
 
   return `<!doctype html>
 <html lang="en">
@@ -1181,13 +1198,13 @@ ${folders.length ? `<section id="folders">${folderCards}</section>` : ''}
 </footer>
 
 <script>
-${imagesJsArray}
+var images           = [null];
 var lastimagevalue   = ${lastImageValue};
-var xhrpush          = 4;
 var isadmin          = ${isAdminFlag ? 1 : 0};
 var hasPasskey       = ${hasPasskey ? 'true' : 'false'};
 var folderURL        = ${jsString(urlPath)};
 var spriteMeta       = ${spriteMeta ? JSON.stringify(spriteMeta) : 'null'};
+var imagemapURL      = ${imagemapURL};
 </script>
 <script src="/_static/gallery.js"></script>
 
@@ -1246,7 +1263,12 @@ async function handle(req, res) {
       return notFound(res);
     }
     // sprite atlas files: /<gallery>/.../thumbcache/sprite-N.jpg
-    if (dirOfFile === 'thumbcache' && /^sprite(?:-h\d+)?-\d+\.jpg$/.test(fileName)) {
+    if (dirOfFile === 'thumbcache' && fileName === '_imagemap.bin') {
+      const galleryAbs = resolveGallery(grandparent);
+      if (!galleryAbs) return notFound(res);
+      return serveStaticFile(req, res, path.join(galleryAbs, 'thumbcache', fileName));
+    }
+    if (dirOfFile === 'thumbcache' && /^sprite(?:-h\d+)?-\d+\.(jpg|avif)$/.test(fileName)) {
       const galleryAbs = resolveGallery(grandparent);
       if (!galleryAbs) return notFound(res);
       return serveStaticFile(req, res, path.join(galleryAbs, 'thumbcache', fileName));
@@ -1315,7 +1337,7 @@ async function handle(req, res) {
   // Render gallery page
   const { folders, images, sizes } = await listFolder(abs, { withSizes: true });
   let spriteMeta = await readSpriteMeta(abs);
-  if (!spriteIsCurrent(spriteMeta, images)) spriteMeta = null;
+  if (!spriteIsCurrent(spriteMeta, images, abs)) spriteMeta = null;
   const html = galleryHTML({
     urlPath: pathname,
     folders,
@@ -1361,7 +1383,7 @@ async function handleBuildAll(req, res, abs) {
     if (!fs.existsSync(dir)) continue;
     for (const f of fs.readdirSync(dir)) {
       if (isOrphanTmp(f)) { try { fs.unlinkSync(path.join(dir, f)); } catch {} continue; }
-      if (/^sprite-\d+\.(jpg|avif)$/.test(f) || f === '_sprite.json' || f === '_sprite_staging') continue;
+      if (/^sprite(?:-h\d+)?-\d+\.(jpg|avif)$/.test(f) || f === '_sprite.json' || f === '_sprite_staging' || f === '_imagemap.bin' || /^_sprite_staging_h\d+$/.test(f)) continue;
       let original = null;
       const lod = f.match(/^(.+)\.h\d+\.(v|avif)$/);
       if (lod) original = lod[1];
