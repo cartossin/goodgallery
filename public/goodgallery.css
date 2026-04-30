@@ -184,11 +184,22 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   #photospot img { max-height: 78vh; }
 }
 
-/* Variable-width sprite thumbs (CSS-sliced from a single atlas JPEG) */
+/* Variable-width sprite thumbs: <a> is the clipping window, nested <img> is the
+   shared atlas (browser decodes once per src and reuses the bitmap for every reference). */
 #thumbs .sprite-thumb {
+  display: inline-block;
+  position: relative;
+  overflow: hidden;
   background-color: var(--thumb-bg);
-  background-repeat: no-repeat;
   margin: 1px;
+}
+#thumbs .sprite-thumb > img {
+  display: block;
+  position: absolute;
+  height: auto;
+  max-width: none;
+  pointer-events: none;
+  user-select: none;
 }
 #thumbs .sprite-thumb:hover { opacity: 0.85; }
 

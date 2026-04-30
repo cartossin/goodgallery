@@ -325,11 +325,14 @@
         var bgX = -loc.col * spriteMeta.cellW * scale;
         var bgY = -loc.row * spriteMeta.cellH * scale;
         var bgSizeW = spriteMeta.across * spriteMeta.cellW * scale;
+        // Each tile: <a> clipping window + a shared <img> referencing the atlas. Browsers
+        // decode the atlas JPEG once and reuse the same ImageBitmap for every <img> with
+        // that src — Safari/WebKit appears to handle this case faster than the same number
+        // of background-image divs (which seem to cost a separate composite per tile).
         html += '<a class="sprite-thumb" href="#' + encodeURIComponent(name) + '" data-i="' + it.index + '" title="' + name + '" ' +
-          'style="display:inline-block;width:' + it.w + 'px;height:' + it.h + 'px;' +
-          'background-image:url(' + spriteURL + ');' +
-          'background-position:' + bgX + 'px ' + bgY + 'px;' +
-          'background-size:' + bgSizeW + 'px auto;"></a>';
+          'style="width:' + it.w + 'px;height:' + it.h + 'px">' +
+          '<img src="' + spriteURL + '" alt="" loading="lazy" ' +
+          'style="left:' + bgX + 'px;top:' + bgY + 'px;width:' + bgSizeW + 'px"></a>';
       }
       html += '</div>';
     }
