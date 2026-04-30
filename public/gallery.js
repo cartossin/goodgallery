@@ -15,6 +15,7 @@
   'use strict';
 
   var CANONICAL_H = 200;
+  var FOCUS_PREFETCH = 3;  // images on each side of focus to keep warm in the bitmap cache.
 
   // Compact binary imagemap loader. The HTML page no longer ships an inline imageMap;
   // client fetches a binary blob (.bin) and parses it via DataView for ~10x smaller
@@ -160,9 +161,12 @@
   function keycheck(e) {
     if (keyslocked) return;
     var k = e.which || e.keyCode;
-    if (k === 37) leftbutton();
-    else if (k === 39) rightbutton();
-    else if (k === 27 && focusedIdx > 0) { location.hash = ''; }  // ESC = back to grid
+    // In focus mode both axes shift focus — natural for portrait (vertical strip) and
+    // harmless in landscape. Up/Left = prev, Down/Right = next.
+    if (k === 37 || k === 38) leftbutton();
+    else if (k === 39 || k === 40) rightbutton();
+    else if (k === 27 && focusedIdx > 0) { location.hash = ''; }
+    else return;
     keyslocked = 1;
   }
 
@@ -257,10 +261,7 @@
   function targetRowHeight(t) {
     if (!window.spriteMeta) return 100;
     if (focusedIdx > 0) {
-      // Focus mode: row height ~80% of available viewport. Justified-rows layout puts the
-      // focused image's row at this height; adjacent rows (above/below) and adjacent
-      // images in the same row peek in at the edges.
-      return Math.max(50, layoutHeight() * 0.8);
+      return Math.max(50, layoutHeight() * 0.7);
     }
     var Hmin = fitAllHeight();
     var Hmax = CANONICAL_H;
@@ -409,7 +410,12 @@
     }
   }
 
+  // Suppress anchor capture for one scroll event after we set scrollTop programmatically
+  // inside renderGallery — those are the *result* of an anchor, not a user-initiated scroll.
+  var suppressNextAnchorCapture = false;
   function onThumbsScroll() {
+    if (suppressNextAnchorCapture) { suppressNextAnchorCapture = false; }
+    else { captureAnchorFromScroll(); }
     if (pendingScrollDraw) return;
     pendingScrollDraw = true;
     requestAnimationFrame(function () {
@@ -430,6 +436,30 @@
         return;
       }
     }
+  }
+
+  // Anchor state for zoom: captured on user scroll, NOT on re-layout. Each renderGallery
+  // (e.g. during a zoom-slider drag) reuses this anchor unchanged so the row at the top
+  // of the viewport stays at the top of the viewport across zoom changes. Re-capturing
+  // on every render would drift, because the first-column image of the visible top row
+  // changes when the column count changes with zoom.
+  var cachedAnchorName = null;
+  function captureAnchorFromScroll() {
+    var thumbsEl = document.getElementById('thumbs');
+    if (!thumbsEl || !lastTileRects.length) { cachedAnchorName = null; return; }
+    var scrollY = thumbsEl.scrollTop;
+    if (scrollY <= 0) { cachedAnchorName = null; return; }
+    // The tile array is built row-major, so the first tile whose y-range spans scrollY
+    // is the leftmost (x=0) image of the topmost visible row — i.e. the row anchor.
+    for (var i = 0; i < lastTileRects.length; i++) {
+      var t = lastTileRects[i];
+      if (t.y <= scrollY && scrollY < t.y + t.h) { cachedAnchorName = t.name; return; }
+    }
+    // Fell into a gap below all rows; use the last row's leftmost tile.
+    for (var j = lastTileRects.length - 1; j >= 0; j--) {
+      if (lastTileRects[j].x === 0) { cachedAnchorName = lastTileRects[j].name; return; }
+    }
+    cachedAnchorName = null;
   }
 
   function drawCanvasForScroll() {
@@ -517,19 +547,25 @@
     }
   }
 
-  // Focus-mode horizontal strip: focused image centered, neighbors peek in left/right.
-  // Returns lastTileRects-shaped data with x/y in viewport coordinates (no scroll).
+  // Focus-mode layout. Two flavors keyed off viewport orientation:
+  //   landscape (w >= h): horizontal strip — neighbors peek in left/right.
+  //   portrait  (h > w):  vertical strip — neighbors stack above/below; image fills width.
+  // Both return lastTileRects-shaped data with x/y in viewport coords (no scroll).
   function buildFocusLayout(viewportW, viewportH) {
+    if (viewportH > viewportW) return buildFocusLayoutVertical(viewportW, viewportH);
+    return buildFocusLayoutHorizontal(viewportW, viewportH);
+  }
+
+  function buildFocusLayoutHorizontal(viewportW, viewportH) {
     var rects = [];
     if (focusedIdx <= 0 || !window.spriteMeta || !spriteMeta.imageMap) return rects;
-    var GAP = 8;
-    var focusH = Math.max(50, viewportH * 0.85);
+    var GAP = 12;
+    var focusH = Math.max(50, viewportH * 0.78);
     var name = images[focusedIdx];
     var loc = spriteMeta.imageMap[name];
     if (!loc) return rects;
     var focusedW = Math.round(loc.w * focusH / CANONICAL_H);
-    // If the focused image would dominate, shrink to leave room for neighbors
-    var maxFocusedW = viewportW * 0.80;
+    var maxFocusedW = viewportW * 0.60;
     if (focusedW > maxFocusedW) {
       var scaleDown = maxFocusedW / focusedW;
       focusH = focusH * scaleDown;
@@ -539,7 +575,6 @@
     var focusedY = Math.floor((viewportH - focusH) / 2);
     rects.push({ x: focusedX, y: focusedY, w: focusedW, h: Math.round(focusH), idx: focusedIdx, name: name });
 
-    // Walk leftward neighbors until off-screen
     var x = focusedX;
     for (var i = focusedIdx - 1; i >= 1; i--) {
       var nm = images[i];
@@ -550,7 +585,6 @@
       if (x + nw < -50) break;
       rects.push({ x: x, y: focusedY, w: nw, h: Math.round(focusH), idx: i, name: nm });
     }
-    // Walk rightward neighbors
     x = focusedX + focusedW;
     for (var j = focusedIdx + 1; j <= lastimagevalue; j++) {
       var nm2 = images[j];
@@ -561,6 +595,54 @@
       if (x > viewportW + 50) break;
       rects.push({ x: x, y: focusedY, w: nw2, h: Math.round(focusH), idx: j, name: nm2 });
       x += nw2;
+    }
+    return rects;
+  }
+
+  // Vertical (portrait) focus strip. Focused image is fit to viewport — width is
+  // pinned to the edge (or close to it) and height is capped to leave room for the
+  // prev/next previews above and below. Neighbors are sized by the same scale, so
+  // a 16:9 photo and a 9:16 photo end up the same physical width on the device.
+  function buildFocusLayoutVertical(viewportW, viewportH) {
+    var rects = [];
+    if (focusedIdx <= 0 || !window.spriteMeta || !spriteMeta.imageMap) return rects;
+    var GAP = 12;
+    var name = images[focusedIdx];
+    var loc = spriteMeta.imageMap[name];
+    if (!loc) return rects;
+    var maxH = viewportH * 0.85;
+    var maxW = viewportW;
+    var scale = Math.min(maxW / loc.w, maxH / CANONICAL_H);
+    var focusedW = Math.round(loc.w * scale);
+    var focusedH = Math.round(CANONICAL_H * scale);
+    var focusedX = Math.floor((viewportW - focusedW) / 2);
+    var focusedY = Math.floor((viewportH - focusedH) / 2);
+    rects.push({ x: focusedX, y: focusedY, w: focusedW, h: focusedH, idx: focusedIdx, name: name });
+
+    var y = focusedY;
+    for (var i = focusedIdx - 1; i >= 1; i--) {
+      var nm = images[i];
+      var nl = spriteMeta.imageMap[nm];
+      if (!nl) continue;
+      var ns = Math.min(maxW / nl.w, maxH / CANONICAL_H);
+      var nw = Math.round(nl.w * ns);
+      var nh = Math.round(CANONICAL_H * ns);
+      y -= (nh + GAP);
+      if (y + nh < -50) break;
+      rects.push({ x: Math.floor((viewportW - nw) / 2), y: y, w: nw, h: nh, idx: i, name: nm });
+    }
+    y = focusedY + focusedH;
+    for (var j = focusedIdx + 1; j <= lastimagevalue; j++) {
+      var nm2 = images[j];
+      var nl2 = spriteMeta.imageMap[nm2];
+      if (!nl2) continue;
+      var ns2 = Math.min(maxW / nl2.w, maxH / CANONICAL_H);
+      var nw2 = Math.round(nl2.w * ns2);
+      var nh2 = Math.round(CANONICAL_H * ns2);
+      y += GAP;
+      if (y > viewportH + 50) break;
+      rects.push({ x: Math.floor((viewportW - nw2) / 2), y: y, w: nw2, h: nh2, idx: j, name: nm2 });
+      y += nh2;
     }
     return rects;
   }
@@ -604,39 +686,28 @@
       canvasEl.style.height = viewportH + 'px';
       spacerEl.style.height = '0px';
       lastTileRects = buildFocusLayout(W, viewportH);
-      // Use the focused tile's height as currentRowHeight for atlas/per-image picking
+      // Pick LoD tier off the focused image's height (the focused tile is element 0).
       currentRowHeight = lastTileRects.length ? lastTileRects[0].h : 200;
+      window.__lastTileRects = lastTileRects;
+      // Preload +/-FOCUS_PREFETCH images so fast next/prev never blocks on a fetch.
+      // Wraps at boundaries to mirror shiftFocus().
+      var preTier = pickPerImageTier(currentRowHeight);
+      for (var pf = -FOCUS_PREFETCH; pf <= FOCUS_PREFETCH; pf++) {
+        var pidx = focusedIdx + pf;
+        while (pidx < 1) pidx += lastimagevalue;
+        while (pidx > lastimagevalue) pidx -= lastimagevalue;
+        if (images[pidx]) loadPerImageBitmap(images[pidx], preTier);
+      }
       thumbsEl.scrollTop = 0;
       drawCanvasForScroll();
       return;
     }
 
     // ===== GRID MODE: justified rows + virtual scroll =====
-    // Anchor the zoom: find the first-column tile that SPANS viewport top so we can
-    // restore scroll to keep that image at the same viewport offset across re-layouts.
-    var anchorName = null, anchorViewportOffset = 0;
-    if (lastTileRects.length > 0 && thumbsEl.scrollTop > 0) {
-      var scrollY = thumbsEl.scrollTop;
-      // First pick: a first-column tile spanning viewport top.
-      for (var ai = 0; ai < lastTileRects.length; ai++) {
-        var at = lastTileRects[ai];
-        if (at.x !== 0) continue;
-        if (at.y <= scrollY && scrollY < at.y + at.h) {
-          anchorName = at.name;
-          anchorViewportOffset = scrollY - at.y;  // 0..tile.h, how far past tile top
-          break;
-        }
-      }
-      // Fallback: if no first-column tile spans (e.g., scrolled into a gap), use the
-      // first tile fully visible from viewport top.
-      if (!anchorName) {
-        for (var aj = 0; aj < lastTileRects.length; aj++) {
-          var at2 = lastTileRects[aj];
-          if (at2.x !== 0) continue;
-          if (at2.y >= scrollY) { anchorName = at2.name; anchorViewportOffset = 0; break; }
-        }
-      }
-    }
+    // Use the row-stable anchor captured on the last user scroll (see captureAnchorFromScroll).
+    // We do NOT re-capture here, because mid-zoom-drag the column count is changing and the
+    // "image at viewport top" identity flickers — re-capturing would drift the gallery.
+    var anchorName = cachedAnchorName;
 
     // Compute layout
     var H = targetRowHeight(getZoom());
@@ -682,8 +753,11 @@
     if (anchorName) {
       for (var ki = 0; ki < lastTileRects.length; ki++) {
         if (lastTileRects[ki].name === anchorName) {
-          var newScroll = lastTileRects[ki].y + anchorViewportOffset;
-          thumbsEl.scrollTop = Math.max(0, Math.min(maxScroll, newScroll));
+          var newTop = Math.max(0, Math.min(maxScroll, lastTileRects[ki].y));
+          if (Math.abs(thumbsEl.scrollTop - newTop) > 0.5) {
+            suppressNextAnchorCapture = true;
+            thumbsEl.scrollTop = newTop;
+          }
           break;
         }
       }
@@ -691,6 +765,7 @@
       thumbsEl.scrollTop = 0;
     }
 
+    window.__lastTileRects = lastTileRects;
     // Trigger initial paint. drawCanvasForScroll picks the right atlas + lazy-loads it.
     drawCanvasForScroll();
   }
@@ -812,23 +887,48 @@
     });
   }
 
+  // Touch + wheel nav for focus mode. Bound to #thumbs (where the canvas lives).
+  // Swipe direction follows the dominant viewport axis: horizontal in landscape,
+  // vertical in portrait. Wheel events are debounced so a continuous trackpad flick
+  // moves one image, not ten.
   function setupTouch() {
+    var thumbsEl = $('thumbs');
+    if (!thumbsEl) return;
     var startX = 0, startY = 0, startT = 0;
-    var photodiv = $('photodiv');
-    if (!photodiv) return;
-    photodiv.addEventListener('touchstart', function (e) {
+    thumbsEl.addEventListener('touchstart', function (e) {
       var t = e.changedTouches[0];
       startX = t.clientX; startY = t.clientY; startT = Date.now();
     }, { passive: true });
-    photodiv.addEventListener('touchend', function (e) {
+    thumbsEl.addEventListener('touchend', function (e) {
+      if (focusedIdx <= 0) return;
       var t = e.changedTouches[0];
       var dx = t.clientX - startX, dy = t.clientY - startY;
       var dt = Date.now() - startT;
-      if (isfullres) return;
-      if (dt < 600 && Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5) {
-        if (dx < 0) nextimage(); else previousimage();
+      if (dt > 600) return;
+      var portrait = window.innerHeight > window.innerWidth;
+      if (portrait) {
+        if (Math.abs(dy) > 40 && Math.abs(dy) > Math.abs(dx) * 1.2) {
+          if (dy < 0) nextimage(); else previousimage();
+        }
+      } else {
+        if (Math.abs(dx) > 40 && Math.abs(dx) > Math.abs(dy) * 1.2) {
+          if (dx < 0) nextimage(); else previousimage();
+        }
       }
     }, { passive: true });
+
+    var wheelDeadline = 0;
+    thumbsEl.addEventListener('wheel', function (e) {
+      if (focusedIdx <= 0) return;
+      var now = Date.now();
+      if (now < wheelDeadline) return;
+      var portrait = window.innerHeight > window.innerWidth;
+      var d = portrait ? e.deltaY : (e.deltaX || e.deltaY);
+      if (Math.abs(d) < 4) return;
+      e.preventDefault();
+      wheelDeadline = now + 250;
+      if (d > 0) nextimage(); else previousimage();
+    }, { passive: false });
   }
 
   // ---------- thumb click delegation ----------
