@@ -14,9 +14,46 @@
 (function () {
   'use strict';
 
-  // Canonical height for per-image widths in spriteMeta.imageMap (v2 format stores
-  // .w at this height; widths at any other H are .w * (H / CANONICAL_H)).
   var CANONICAL_H = 200;
+
+  // Compact binary imagemap loader. The HTML page no longer ships an inline imageMap;
+  // client fetches a binary blob (.bin) and parses it via DataView for ~10x smaller
+  // bytes-on-the-wire and ~10x faster parse than equivalent JSON.
+  //   Format: 'GGMP' (4B) | version u16 LE | reserved u16 | count u32 LE
+  //           widths: count × u16 LE
+  //           names:  count NUL-terminated UTF-8 strings
+  async function loadImagemap() {
+    if (!window.imagemapURL) return false;
+    var resp = await fetch(window.imagemapURL, { credentials: 'same-origin' });
+    if (!resp.ok) throw new Error('imagemap fetch failed: ' + resp.status);
+    var buf = await resp.arrayBuffer();
+    var dv = new DataView(buf);
+    var bytes = new Uint8Array(buf);
+    var magic = String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]);
+    if (magic !== 'GGMP') throw new Error('imagemap bad magic: ' + magic);
+    var count = dv.getUint32(8, true);
+    var widthsBase = 12;
+    var namesBase  = 12 + 2 * count;
+    var widthsArr = new Uint16Array(buf, widthsBase, count);
+    var dec = new TextDecoder();
+    var newImages = new Array(count + 1);
+    newImages[0] = null;
+    var imageMap = {};
+    var pos = namesBase;
+    for (var i = 0; i < count; i++) {
+      var end = pos;
+      while (end < bytes.length && bytes[end] !== 0) end++;
+      var name = dec.decode(bytes.subarray(pos, end));
+      newImages[i + 1] = name;
+      imageMap[name] = { idx: i, w: widthsArr[i] };
+      pos = end + 1;
+    }
+    window.images = newImages;
+    window.lastimagevalue = count;
+    if (window.spriteMeta) spriteMeta.imageMap = imageMap;
+    return true;
+  }
+
   var previewimages = [null];
   var thumbs        = [null];
   var inum = 1;
