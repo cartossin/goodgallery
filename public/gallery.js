@@ -603,6 +603,13 @@
   var filmstripEl = null; // filmstrip scroll container
   var filmCanvasEl = null;// canvas inside filmstrip
   var filmSpacerEl = null;
+  // Transform state for the focused image (pinch-zoom). Scale anchored at the image
+  // center; reset on every focusedIdx change so each photo opens at 1x.
+  var mainScale = 1;
+  // touchOnMain is set while a touch is active on the main canvas, so the document-
+  // level pinch handler can skip those events (we want pinch on the main image to
+  // zoom the image, not the slider).
+  var touchOnMain = false;
   // Cached layout metrics (recomputed when filmstrip is built / on resize)
   var filmTilePos = null; // Float64Array of cumulative x positions, length = lastimagevalue
   var filmTileW   = null; // Float64Array of widths
@@ -728,6 +735,7 @@
 
     filmstripEl.addEventListener('scroll', onFilmstripScroll, { passive: true });
     filmCanvasEl.addEventListener('click', onFilmstripClick);
+    setupMainImageGestures();
 
     var target = filmScrollForIdx1(focusedIdx, W);
     focusInProgrammaticScroll = true;
@@ -784,6 +792,7 @@
     var newCenterIdx = filmCenteredIdx1(scrollLeft, W);
     if (newCenterIdx !== focusedIdx) {
       focusedIdx = newCenterIdx;
+      mainScale = 1;  // each photo opens at 1x
       try { history.replaceState(null, '', '#' + encodeURIComponent(images[focusedIdx])); } catch (_) {}
     }
 
@@ -859,6 +868,13 @@
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, g.W, g.mainH);
+    // Apply pinch-zoom transform around the image center, then draw normally.
+    if (mainScale !== 1) {
+      var cx = g.W / 2, cy = g.mainH / 2;
+      ctx.translate(cx, cy);
+      ctx.scale(mainScale, mainScale);
+      ctx.translate(-cx, -cy);
+    }
 
     var atlasH = 50;
     var atlas = spriteMeta.atlases && spriteMeta.atlases[String(atlasH)];
@@ -904,6 +920,12 @@
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.fillStyle = '#000';
       ctx.fillRect(0, 0, g.W, g.mainH);
+      if (mainScale !== 1) {
+        var cx = g.W / 2, cy = g.mainH / 2;
+        ctx.translate(cx, cy);
+        ctx.scale(mainScale, mainScale);
+        ctx.translate(-cx, -cy);
+      }
       ctx.drawImage(bm, 0, 0, bm.width, bm.height, g.dx, g.dy, g.dw, g.dh);
     });
     // Prefetch neighbors so prev/next is instant after a settle.
@@ -914,6 +936,71 @@
       while (idx > lastimagevalue) idx -= lastimagevalue;
       if (images[idx]) loadPerImageBitmap(images[idx], tier);
     }
+  }
+
+  // Touch gestures on the main image: 1-finger horizontal swipe → prev/next via
+  // shiftFocus (which animates through the chase loop). 2-finger pinch → scale the
+  // current image around its center; release back to ≈1 snaps to identity.
+  // touchOnMain is set so the document-level pinch handler (which drives the slider)
+  // skips events that started here.
+  function setupMainImageGestures() {
+    if (!mainEl) return;
+    var swipeStart = null;
+    var pinchStart = null;
+    function tdist(t1, t2) {
+      var dx = t1.clientX - t2.clientX, dy = t1.clientY - t2.clientY;
+      return Math.sqrt(dx * dx + dy * dy);
+    }
+    mainEl.addEventListener('touchstart', function (e) {
+      touchOnMain = true;
+      if (e.touches.length === 1) {
+        swipeStart = { x: e.touches[0].clientX, y: e.touches[0].clientY, t: Date.now() };
+        pinchStart = null;
+      } else if (e.touches.length === 2) {
+        pinchStart = { d: tdist(e.touches[0], e.touches[1]), scale: mainScale };
+        swipeStart = null;
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    }, { passive: false });
+    mainEl.addEventListener('touchmove', function (e) {
+      if (pinchStart && e.touches.length === 2) {
+        e.preventDefault();
+        e.stopPropagation();
+        var d = tdist(e.touches[0], e.touches[1]);
+        if (d < 1 || pinchStart.d < 1) return;
+        var newScale = pinchStart.scale * (d / pinchStart.d);
+        if (newScale < 1) newScale = 1;
+        if (newScale > 6) newScale = 6;
+        mainScale = newScale;
+        drawMainImage();
+      }
+    }, { passive: false });
+    mainEl.addEventListener('touchend', function (e) {
+      // Pinch end: snap back to 1x if user released near identity.
+      if (pinchStart && e.touches.length < 2) {
+        if (mainScale < 1.05) {
+          mainScale = 1;
+          drawMainImage();
+        }
+        pinchStart = null;
+      }
+      // Swipe end: only treat as swipe if we never went into pinch mode and image
+      // is at 1x (so swipe-while-zoomed isn't accidentally triggering nav).
+      if (swipeStart && e.changedTouches[0] && mainScale === 1) {
+        var dx = e.changedTouches[0].clientX - swipeStart.x;
+        var dy = e.changedTouches[0].clientY - swipeStart.y;
+        var dt = Date.now() - swipeStart.t;
+        if (dt < 600 && Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+          shiftFocus(dx < 0 ? +1 : -1);
+        }
+        swipeStart = null;
+      }
+      if (e.touches.length === 0) touchOnMain = false;
+    });
+    mainEl.addEventListener('touchcancel', function () {
+      pinchStart = null; swipeStart = null; touchOnMain = false;
+    });
   }
 
   function renderGallery() {
@@ -1229,6 +1316,7 @@
     document.addEventListener('gestureend',    blockGesture, { passive: false });
 
     document.addEventListener('touchstart', function (e) {
+      if (touchOnMain) { pinch = null; return; }
       if (e.touches.length === 2) {
         pinch = { d0: dist(e.touches[0], e.touches[1]), v0: focusedIdx > 0 ? 100 : getZoom() };
         e.preventDefault();
@@ -1240,6 +1328,7 @@
       }
     }, { passive: false });
     document.addEventListener('touchmove', function (e) {
+      if (touchOnMain) return;  // mainEl handler owns this gesture
       if (e.touches.length >= 2) e.preventDefault();  // unconditionally block native pinch zoom
       if (!pinch || e.touches.length !== 2) return;
       var d = dist(e.touches[0], e.touches[1]);
