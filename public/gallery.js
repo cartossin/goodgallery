@@ -166,12 +166,7 @@
     keyslocked = 1;
   }
 
-  // ---------- view ----------  function togglefullres() {
-    if ((decodeURIComponent(location.hash.slice(1)) || '').charAt(0) === ':') return;
-    var pd = $('photodiv');
-    if (!isfullres) { isfullres = 1; pd.classList.add('fullres'); fullres(); }
-    else { startimage(); }
-  }
+  // ---------- view ----------
 
   function chromeHeight() {
     var top = document.getElementById('topbar');
