@@ -698,10 +698,16 @@ async function buildAtlasAtHeight(thumbDir, images, aspects, height, inputFormat
   const widths = aspects.map(a => Math.round(a * height));
   const cellW = Math.min(cellWMax, Math.max(cellH, ...widths));
   const cellArea = cellW * cellH;
+  // Pixel budget is the only cap. Image count per sprite: as many as fit in budget,
+  // also bounded by the gallery size (don't allocate space for more cells than exist).
   const cellsPerSprite = Math.max(1, Math.min(
-    SPRITE_ACROSS * SPRITE_ACROSS,
+    images.length,
     Math.floor(MAX_SPRITE_PIXELS / cellArea)
   ));
+  // Choose `across` so each sprite is roughly square: across*cellW ≈ rows*cellH.
+  // This keeps sprite dimensions sane at any cell size — a 5×9 cell atlas with 50,000
+  // tiles would otherwise be hundreds of pixels wide and tens of thousands tall.
+  const across = Math.max(1, Math.round(Math.sqrt(cellsPerSprite * cellH / cellW)));
   const numChunks = Math.ceil(images.length / cellsPerSprite);
   const sprites = [];
 
@@ -723,10 +729,10 @@ async function buildAtlasAtHeight(thumbDir, images, aspects, height, inputFormat
       const spriteAbs = path.join(thumbDir, spriteFile);
       const tmp = spriteAbs + '.__tmp.jpg';
       const vTmp = tmp + '.v';
-      console.log('[sprite] building ' + spriteFile + ': ' + chunk.length + ' tiles, cell ' + cellW + 'x' + cellH);
+      console.log('[sprite] building ' + spriteFile + ': ' + chunk.length + ' tiles, cell ' + cellW + 'x' + cellH + ', across ' + across);
       await runStep('vips', [
         'arrayjoin', inputPaths.join(' '), vTmp,
-        '--across', String(SPRITE_ACROSS),
+        '--across', String(across),
         '--hspacing', String(cellW),
         '--vspacing', String(cellH),
         '--background', '0',
@@ -743,7 +749,7 @@ async function buildAtlasAtHeight(thumbDir, images, aspects, height, inputFormat
     await fsp.rm(stagingDir, { recursive: true, force: true });
   }
 
-  return { cellW, cellH, across: SPRITE_ACROSS, cellsPerSprite, sprites };
+  return { cellW, cellH, across, cellsPerSprite, sprites };
 }
 
 // Per-folder dedupe so we don't fire two arrayjoins concurrently for the same folder.
