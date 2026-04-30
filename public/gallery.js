@@ -606,6 +606,11 @@
   // Transform state for the focused image (pinch-zoom). Scale anchored at the image
   // center; reset on every focusedIdx change so each photo opens at 1x.
   var mainScale = 1;
+  // The source we should draw into the main canvas: bitmap + sub-rect. Updated by
+  // drawMainImage (atlas low-res) and upgradeMainImage (high-LoD). Held synchronously
+  // so pinch can redraw without the microtask gap that was causing a black flicker
+  // between canvas-clear and the async drawImage on the atlas-load promise.
+  var mainDrawSrc = null;  // { bitmap, sx, sy, sw, sh, forIdx } | null
   // touchOnMain is set while a touch is active on the main canvas, so the document-
   // level pinch handler can skip those events (we want pinch on the main image to
   // zoom the image, not the slider).
@@ -792,7 +797,8 @@
     var newCenterIdx = filmCenteredIdx1(scrollLeft, W);
     if (newCenterIdx !== focusedIdx) {
       focusedIdx = newCenterIdx;
-      mainScale = 1;  // each photo opens at 1x
+      mainScale = 1;
+      mainDrawSrc = null;  // cached bitmap is for the previous image
       try { history.replaceState(null, '', '#' + encodeURIComponent(images[focusedIdx])); } catch (_) {}
     }
 
@@ -859,8 +865,11 @@
 
   // Low-res paint from the h50 atlas. Always instant (atlas is in memory for
   // the filmstrip), so the main image follows scrubbing without ever blanking.
-  function drawMainImage() {
-    if (!mainEl || !window.spriteMeta) return;
+  // Synchronously paint the main canvas: clear + apply transform + drawImage from
+  // mainDrawSrc. Used by pinch redraws (no async, no flicker) and by the load-resolved
+  // callbacks below (after they update mainDrawSrc).
+  function paintMain() {
+    if (!mainEl) return;
     var g = mainImageGeom();
     if (!g) return;
     var dpr = devicePixelRatio();
@@ -868,35 +877,59 @@
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, g.W, g.mainH);
-    // Apply pinch-zoom transform around the image center, then draw normally.
     if (mainScale !== 1) {
       var cx = g.W / 2, cy = g.mainH / 2;
       ctx.translate(cx, cy);
       ctx.scale(mainScale, mainScale);
       ctx.translate(-cx, -cy);
     }
-
-    var atlasH = 50;
-    var atlas = spriteMeta.atlases && spriteMeta.atlases[String(atlasH)];
-    if (atlas) {
-      var capturedIdx = focusedIdx;
-      loadSpriteBitmapsForAtlas(atlasH).then(function (bitmaps) {
-        if (!mainEl || focusedIdx !== capturedIdx) return;
-        var idx0 = capturedIdx - 1;
-        var spriteIdx = Math.floor(idx0 / atlas.cellsPerSprite);
-        var posInSprite = idx0 % atlas.cellsPerSprite;
-        var row = Math.floor(posInSprite / atlas.across);
-        var col = posInSprite % atlas.across;
-        var bitmap = bitmaps[spriteIdx];
-        if (!bitmap) return;
-        var srcW = Math.round(g.natW * atlasH / g.natH);
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        ctx.drawImage(bitmap, col * atlas.cellW, row * atlas.cellH, srcW, atlas.cellH, g.dx, g.dy, g.dw, g.dh);
-      });
+    if (mainDrawSrc && mainDrawSrc.forIdx === focusedIdx) {
+      ctx.drawImage(
+        mainDrawSrc.bitmap,
+        mainDrawSrc.sx, mainDrawSrc.sy, mainDrawSrc.sw, mainDrawSrc.sh,
+        g.dx, g.dy, g.dw, g.dh
+      );
     }
-    // Schedule the high-res upgrade. Resets on every scrub, so it only fires
-    // 150ms after scrolling settles — no point burning network on images the user
-    // is scrolling past.
+  }
+
+  function drawMainImage() {
+    if (!mainEl || !window.spriteMeta) return;
+    var g = mainImageGeom();
+    if (!g) return;
+
+    // Sync repaint with cached bitmap if we still have one for this image (pinch case).
+    var hadCached = !!(mainDrawSrc && mainDrawSrc.forIdx === focusedIdx);
+    paintMain();
+
+    // If we don't have a bitmap yet for this image (newly-focused), load the atlas
+    // tier and update mainDrawSrc + repaint when it resolves. While in flight the
+    // canvas is just black — better than a stale tile.
+    if (!hadCached) {
+      var atlasH = 50;
+      var atlas = spriteMeta.atlases && spriteMeta.atlases[String(atlasH)];
+      if (atlas) {
+        var capturedIdx = focusedIdx;
+        loadSpriteBitmapsForAtlas(atlasH).then(function (bitmaps) {
+          if (!mainEl || focusedIdx !== capturedIdx) return;
+          var idx0 = capturedIdx - 1;
+          var spriteIdx = Math.floor(idx0 / atlas.cellsPerSprite);
+          var posInSprite = idx0 % atlas.cellsPerSprite;
+          var row = Math.floor(posInSprite / atlas.across);
+          var col = posInSprite % atlas.across;
+          var bitmap = bitmaps[spriteIdx];
+          if (!bitmap) return;
+          var srcW = Math.round(g.natW * atlasH / g.natH);
+          mainDrawSrc = {
+            bitmap: bitmap,
+            sx: col * atlas.cellW, sy: row * atlas.cellH,
+            sw: srcW, sh: atlas.cellH,
+            forIdx: capturedIdx,
+          };
+          paintMain();
+        });
+      }
+    }
+    // Debounce the high-res upgrade until scrubbing/pinching settles.
     if (mainUpgradeTimer) clearTimeout(mainUpgradeTimer);
     mainUpgradeTimer = setTimeout(upgradeMainImage, 150);
   }
@@ -915,18 +948,12 @@
     var capturedIdx = focusedIdx;
     loadPerImageBitmap(g.name, tier).then(function (bm) {
       if (!mainEl || !bm || focusedIdx !== capturedIdx) return;
-      var dpr = devicePixelRatio();
-      var ctx = mainEl.getContext('2d', { alpha: false });
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.fillStyle = '#000';
-      ctx.fillRect(0, 0, g.W, g.mainH);
-      if (mainScale !== 1) {
-        var cx = g.W / 2, cy = g.mainH / 2;
-        ctx.translate(cx, cy);
-        ctx.scale(mainScale, mainScale);
-        ctx.translate(-cx, -cy);
-      }
-      ctx.drawImage(bm, 0, 0, bm.width, bm.height, g.dx, g.dy, g.dw, g.dh);
+      mainDrawSrc = {
+        bitmap: bm,
+        sx: 0, sy: 0, sw: bm.width, sh: bm.height,
+        forIdx: capturedIdx,
+      };
+      paintMain();
     });
     // Prefetch neighbors so prev/next is instant after a settle.
     for (var d = -FOCUS_PREFETCH; d <= FOCUS_PREFETCH; d++) {
@@ -973,7 +1000,7 @@
         if (newScale < 1) newScale = 1;
         if (newScale > 6) newScale = 6;
         mainScale = newScale;
-        drawMainImage();
+        paintMain();
       }
     }, { passive: false });
     mainEl.addEventListener('touchend', function (e) {
@@ -981,7 +1008,7 @@
       if (pinchStart && e.touches.length < 2) {
         if (mainScale < 1.05) {
           mainScale = 1;
-          drawMainImage();
+          paintMain();
         }
         pinchStart = null;
       }
