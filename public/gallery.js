@@ -580,6 +580,10 @@
     }
 
     window.addEventListener('hashchange', refreshfromhash);
+    // Key handlers attached programmatically (inline onkey* attributes on body fire
+    // before this IIFE's window.* exports exist — Safari hits the race).
+    window.addEventListener('keydown', keycheck);
+    window.addEventListener('keyup', unlockkeys);
     pollBuildStatus();
   }
 
