@@ -441,19 +441,8 @@
   // inside renderGallery — those are the *result* of an anchor, not a user-initiated scroll.
   var suppressNextAnchorCapture = false;
   function onThumbsScroll() {
-    if (focusedIdx > 0) {
-      if (pendingScrollDraw) return;
-      pendingScrollDraw = true;
-      requestAnimationFrame(function () {
-        pendingScrollDraw = false;
-        drawFocusForScroll();
-      });
-      // Schedule a snap once scroll events go quiet. Resets on every scroll event,
-      // so iOS inertia + user drag gestures don't trigger snap until truly idle.
-      if (!focusInProgrammaticScroll) scheduleFocusSnap();
-      return;
-    }
-    // Grid mode
+    // In filmstrip focus mode #thumbs has overflow:hidden — this won't fire. Grid only.
+    if (focusedIdx > 0) return;
     if (suppressNextAnchorCapture) { suppressNextAnchorCapture = false; }
     else { captureAnchorFromScroll(); }
     if (pendingScrollDraw) return;
@@ -588,235 +577,284 @@
   }
 
   // ============================================================================
-  // FOCUS MODE — native-scroll strip
+  // FOCUS MODE — main image + filmstrip (iCloud Photos style)
   // ============================================================================
-  // The canvas is sticky in the viewport. A 1px-thick spacer establishes scrollWidth
-  // (landscape) or scrollHeight (portrait) so the browser provides a real native
-  // scrollbar with proper inertia on iOS/macOS. As the user scrolls, drawFocusForScroll
-  // redraws the canvas; when scroll events stop coming, we snap to the nearest image
-  // with a smooth scrollTo. Because we're not consuming wheel/touch events, the user
-  // gets the full native scroll feel — momentum, rubber-band, the works.
-  function isPortraitFocus() { return layoutHeight() > layoutWidth(); }
-  function focusStride() {
-    // 70% of the primary axis: focused image gets the middle 60-70%, neighbors peek
-    // ~15% from each side. Each "image" claims one stride of scroll.
-    return isPortraitFocus() ? layoutHeight() * 0.55 : layoutWidth() * 0.7;
-  }
-  function focusImgRect(loc) {
-    // Returned size is "contain"-fit within (maxW × maxH). maxW depends on orientation:
-    // portrait gets full viewport width, landscape leaves a sliver of horizontal padding.
-    var W = layoutWidth(), H = layoutHeight();
-    var maxH = H * 0.85;
-    var maxW = isPortraitFocus() ? W : W * 0.85;
-    var scale = Math.min(maxW / loc.w, maxH / CANONICAL_H);
-    return { w: Math.round(loc.w * scale), h: Math.round(CANONICAL_H * scale) };
-  }
-  function focusScrollPos() {
-    var thumbsEl = $('thumbs');
-    if (!thumbsEl) return 0;
-    return isPortraitFocus() ? thumbsEl.scrollTop : thumbsEl.scrollLeft;
-  }
-  function setFocusScrollPos(v, smooth) {
-    var thumbsEl = $('thumbs');
-    if (!thumbsEl) return;
-    var opts = { behavior: smooth ? 'smooth' : 'auto' };
-    if (isPortraitFocus()) opts.top = v; else opts.left = v;
-    thumbsEl.scrollTo(opts);
-  }
-
-  // Snap-on-stop. Called via debounce after scroll events quiet down for ~150ms
-  // (long enough that iOS inertia has finished). Always smooth-scrolls to the nearest
-  // image's center, even if we're already close — the smooth animation feels nicer
-  // than a hard pixel snap.
-  var focusSnapTimer = null;
+  // Layout in focus mode:
+  //   #thumbs (overflow: hidden, full viewport)
+  //     #focus-main   — main image canvas, fills (viewport - filmstrip)
+  //     #focus-strip  — native horizontal-scroll container at the bottom
+  //       <canvas (sticky left:0)>
+  //       <div spacer (absolute, width = total filmstrip length + edge padding)>
+  //
+  // The filmstrip is the only scroll surface. Each tile is rendered from the h50
+  // atlas at its natural-aspect width (loc.w * 50 / CANONICAL_H). As the
+  // filmstrip scrolls, the centered tile becomes the focused image; the main
+  // canvas is repainted with that image's bitmap. During scrubbing we paint the
+  // main image from the same h50 atlas (instant, low-res); on idle Stage 2 will
+  // upgrade to the highest available LoD.
+  var FILM_H = 70;        // filmstrip CSS-px height (atlas h=50 + 10px top/bottom pad)
+  var FILM_GAP = 4;
+  var mainEl = null;      // main image canvas
+  var filmstripEl = null; // filmstrip scroll container
+  var filmCanvasEl = null;// canvas inside filmstrip
+  var filmSpacerEl = null;
+  // Cached layout metrics (recomputed when filmstrip is built / on resize)
+  var filmTilePos = null; // Float64Array of cumulative x positions, length = lastimagevalue
+  var filmTileW   = null; // Float64Array of widths
+  var filmTotalW  = 0;
+  var filmPadL    = 0;    // leading/trailing padding so the first/last tile can sit at center
+  var filmPadR    = 0;
+  var filmScrollPending = false;
   var focusInProgrammaticScroll = false;
 
-  // Continuous rAF chase toward (commandedIdx - 1) * stride. Each tick reads
-  // commandedIdx live, so additional shiftFocus calls (more arrow presses) just
-  // bump the target ahead — the existing chase keeps running toward the new
-  // target without restarting. step is proportional to remaining distance, so
-  // the strip naturally accelerates as commandedIdx gets further away.
+  function buildFilmstripLayout() {
+    var n = lastimagevalue;
+    filmTilePos = new Float64Array(n);
+    filmTileW = new Float64Array(n);
+    var atlasH = 50;  // matches the h50 atlas tier
+    var x = 0;
+    for (var i = 0; i < n; i++) {
+      var name = images[i + 1];
+      var loc = name && spriteMeta && spriteMeta.imageMap && spriteMeta.imageMap[name];
+      var w = loc ? Math.max(8, Math.round(loc.w * atlasH / CANONICAL_H)) : atlasH;
+      filmTilePos[i] = x;
+      filmTileW[i] = w;
+      x += w + FILM_GAP;
+    }
+    filmTotalW = x - FILM_GAP;
+  }
+
+  function filmCenteredIdx1(scrollLeft, viewportW) {
+    if (!filmTilePos || !filmTilePos.length) return focusedIdx;
+    var center = scrollLeft + viewportW / 2 - filmPadL;
+    var lo = 0, hi = filmTilePos.length - 1;
+    while (lo < hi) {
+      var mid = (lo + hi) >> 1;
+      var midEnd = filmTilePos[mid] + filmTileW[mid];
+      if (midEnd <= center) lo = mid + 1;
+      else hi = mid;
+    }
+    if (lo < 0) lo = 0;
+    if (lo >= filmTilePos.length) lo = filmTilePos.length - 1;
+    return lo + 1;
+  }
+
+  function filmScrollForIdx1(idx1, viewportW) {
+    if (!filmTilePos || idx1 < 1) return 0;
+    var i = idx1 - 1;
+    if (i >= filmTilePos.length) i = filmTilePos.length - 1;
+    var tileCenter = filmPadL + filmTilePos[i] + filmTileW[i] / 2;
+    return Math.max(0, tileCenter - viewportW / 2);
+  }
+
+  // Continuous rAF chase toward filmScrollForIdx1(commandedIdx). Each tick reads
+  // commandedIdx live, so additional shiftFocus calls (more arrow presses) bump
+  // the target ahead and the chase keeps running toward the new target. Step is
+  // proportional to remaining distance, so the strip naturally accelerates.
   var focusChaseRaf = null;
   function startFocusChase() {
     focusInProgrammaticScroll = true;
-    if (focusChaseRaf) return;  // already chasing
+    if (focusChaseRaf) return;
     focusChaseRaf = requestAnimationFrame(focusChaseTick);
   }
   function focusChaseTick() {
     focusChaseRaf = null;
-    var thumbsEl = $('thumbs');
-    if (!thumbsEl || focusedIdx === 0 || commandedIdx <= 0) {
+    if (!filmstripEl || focusedIdx === 0 || commandedIdx <= 0) {
       focusInProgrammaticScroll = false;
       return;
     }
-    var portrait = isPortraitFocus();
-    var stride = focusStride();
-    var target = (commandedIdx - 1) * stride;
-    var cur = portrait ? thumbsEl.scrollTop : thumbsEl.scrollLeft;
+    var W = layoutWidth();
+    var target = filmScrollForIdx1(commandedIdx, W);
+    var cur = filmstripEl.scrollLeft;
     var diff = target - cur;
     if (Math.abs(diff) < 0.5) {
-      if (portrait) thumbsEl.scrollTop = target; else thumbsEl.scrollLeft = target;
+      filmstripEl.scrollLeft = target;
       focusInProgrammaticScroll = false;
       return;
     }
-    // Damped step: 25% of remaining distance per frame. With 60fps this is a
-    // ~150ms half-life; further targets move faster in absolute pixels because
-    // the step scales with distance. Floor at 1px so we always finish.
     var step = diff * 0.25;
     if (Math.abs(step) < 1) step = (diff > 0 ? 1 : -1);
-    var nxt = cur + step;
-    if (portrait) thumbsEl.scrollTop = nxt; else thumbsEl.scrollLeft = nxt;
+    filmstripEl.scrollLeft = cur + step;
     focusChaseRaf = requestAnimationFrame(focusChaseTick);
   }
 
-  function scheduleFocusSnap() {
-    if (focusSnapTimer) clearTimeout(focusSnapTimer);
-    focusSnapTimer = setTimeout(focusSnapNow, 150);
-  }
-  function focusSnapNow() {
-    focusSnapTimer = null;
-    if (focusedIdx <= 0) return;
-    var stride = focusStride();
-    var pos = focusScrollPos();
-    var target = Math.round(pos / stride) * stride;
-    if (Math.abs(pos - target) < 0.5) return;
-    focusInProgrammaticScroll = true;
-    setFocusScrollPos(target, true);
-    // The smooth-scroll animation generates more scroll events; clear the flag once
-    // we're within 1px of target (checked on every scroll tick).
-  }
-
-  // Draw the focus strip for the current scroll position. Iterates ±FOCUS_VISIBLE
-  // images around the centered one; off-screen tiles are skipped cheaply.
-  var FOCUS_VISIBLE = 2;  // images on each side that may contribute pixels to the canvas
-  function drawFocusForScroll() {
-    if (!canvasEl || !window.spriteMeta) return;
-    var thumbsEl = $('thumbs');
-    if (!thumbsEl) return;
-    var portrait = isPortraitFocus();
+  function setupFilmstripFocus(thumbsEl) {
     var W = layoutWidth(), H = layoutHeight();
-    var stride = focusStride();
-    var pos = focusScrollPos();
-    var virtualIdx0 = pos / stride;            // 0-based fractional position in strip
-    var centeredIdx1 = Math.round(virtualIdx0) + 1;  // 1-based
-    if (centeredIdx1 < 1) centeredIdx1 = 1;
-    if (centeredIdx1 > lastimagevalue) centeredIdx1 = lastimagevalue;
+    var mainH = Math.max(120, H - FILM_H);
 
-    // Update focusedIdx + URL hash as the user scrolls past midpoints. Use replaceState
-    // (not assignment to location.hash) so we don't fire hashchange — that would re-enter
-    // the focus path and reset scroll.
-    if (centeredIdx1 !== focusedIdx) {
-      focusedIdx = centeredIdx1;
-      try { history.replaceState(null, '', '#' + encodeURIComponent(images[focusedIdx])); } catch (_) {}
-      // Trigger a fresh ±FOCUS_PREFETCH warmup centered on the new image.
-      var preTier = pickPerImageTier(currentRowHeight);
-      for (var pf = -FOCUS_PREFETCH; pf <= FOCUS_PREFETCH; pf++) {
-        var pidx = focusedIdx + pf;
-        while (pidx < 1) pidx += lastimagevalue;
-        while (pidx > lastimagevalue) pidx -= lastimagevalue;
-        if (images[pidx]) loadPerImageBitmap(images[pidx], preTier);
-      }
-    }
-
-    // Clear stale frame counter check: drawing here is per-rAF, no async race issue.
-    var dpr = devicePixelRatio();
-    var ctx = canvasEl.getContext('2d', { alpha: false });
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.fillStyle = '#0a0a0a';
-    ctx.fillRect(0, 0, W, H);
-
-    // For each visible image, compute its on-screen position and draw it.
-    lastTileRects = [];
-    var tilesForCanvasEl = [];  // for hit-testing on click
-    for (var d = -FOCUS_VISIBLE; d <= FOCUS_VISIBLE; d++) {
-      var idx = focusedIdx + d;
-      if (idx < 1 || idx > lastimagevalue) continue;
-      var name = images[idx];
-      var loc = spriteMeta.imageMap[name];
-      if (!loc) continue;
-      var rect = focusImgRect(loc);
-      var center = (idx - 1 - virtualIdx0) * stride;  // signed offset from viewport center
-      var x, y;
-      if (portrait) {
-        x = Math.round((W - rect.w) / 2);
-        y = Math.round(H / 2 + center - rect.h / 2);
-      } else {
-        x = Math.round(W / 2 + center - rect.w / 2);
-        y = Math.round((H - rect.h) / 2);
-      }
-      // Off-screen cull
-      if (x + rect.w < -50 || x > W + 50) continue;
-      if (y + rect.h < -50 || y > H + 50) continue;
-      lastTileRects.push({ x: x, y: y, w: rect.w, h: rect.h, idx: idx, name: name });
-    }
-    window.__lastTileRects = lastTileRects;
-
-    // Update currentRowHeight off the centered image so tier selection adapts to viewport.
-    var centeredRect = lastTileRects.find(function (r) { return r.idx === focusedIdx; });
-    currentRowHeight = centeredRect ? centeredRect.h : 200;
-
-    var tier = pickPerImageTier(currentRowHeight);
-    var myFrame = ++renderFrame;
-    lastTileRects.forEach(function (t) {
-      loadPerImageBitmap(t.name, tier).then(function (bitmap) {
-        if (!canvasEl || !bitmap || renderFrame !== myFrame) return;
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        ctx.drawImage(bitmap, 0, 0, bitmap.width, bitmap.height, t.x, t.y, t.w, t.h);
-      });
-    });
-
-    // After every draw, check whether the smooth-scroll animation has settled.
-    if (focusInProgrammaticScroll) {
-      var stride2 = stride;
-      var target = Math.round(pos / stride2) * stride2;
-      if (Math.abs(pos - target) < 1) {
-        focusInProgrammaticScroll = false;
-        commandedIdx = focusedIdx;  // resync so the next shiftFocus reads from focusedIdx
-      }
-    }
-  }
-
-  // Configure #thumbs as a focus-mode strip and place the scroll position so the
-  // initial focusedIdx is centered. Idempotent: safe to call on every render.
-  function setupFocusStrip(thumbsEl) {
-    var portrait = isPortraitFocus();
-    var W = layoutWidth(), H = layoutHeight();
-    var stride = focusStride();
-    // Strip length = (N-1)*stride + 1 viewport, so every image can be centered.
-    var stripLen = Math.max(W, H) + Math.max(0, lastimagevalue - 1) * stride;
     thumbsEl.style.position = 'relative';
     thumbsEl.style.height = H + 'px';
-    thumbsEl.style.overflowX = portrait ? 'hidden' : 'auto';
-    thumbsEl.style.overflowY = portrait ? 'auto' : 'hidden';
+    thumbsEl.style.overflow = 'hidden';
+    thumbsEl.innerHTML = '';
+    // Reset grid-mode references so they don't leak across mode switches.
+    canvasEl = null; spacerEl = null;
 
-    ensureCanvasAndSpacer(thumbsEl);
+    mainEl = document.createElement('canvas');
+    mainEl.id = 'focus-main';
     var dpr = devicePixelRatio();
-    canvasEl.width = Math.round(W * dpr);
-    canvasEl.height = Math.round(H * dpr);
-    canvasEl.style.width = W + 'px';
-    canvasEl.style.height = H + 'px';
-    canvasEl.style.position = 'sticky';
-    canvasEl.style.top = '0';
-    canvasEl.style.left = '0';
+    mainEl.width  = Math.round(W * dpr);
+    mainEl.height = Math.round(mainH * dpr);
+    mainEl.style.cssText = 'display:block; width:' + W + 'px; height:' + mainH + 'px; background:#000;';
+    thumbsEl.appendChild(mainEl);
 
-    // Spacer goes absolute so it can extend along whichever axis we're scrolling.
-    spacerEl.style.position = 'absolute';
-    spacerEl.style.top = '0';
-    spacerEl.style.left = '0';
-    if (portrait) {
-      spacerEl.style.width = '1px';
-      spacerEl.style.height = stripLen + 'px';
-    } else {
-      spacerEl.style.width = stripLen + 'px';
-      spacerEl.style.height = '1px';
+    filmstripEl = document.createElement('div');
+    filmstripEl.id = 'focus-strip';
+    filmstripEl.style.cssText =
+      'position:absolute; left:0; bottom:0; width:' + W + 'px; height:' + FILM_H + 'px;' +
+      'overflow-x:auto; overflow-y:hidden; background:#0a0a0a;' +
+      ' -ms-overflow-style:none; scrollbar-width:none;';
+    thumbsEl.appendChild(filmstripEl);
+
+    filmCanvasEl = document.createElement('canvas');
+    filmCanvasEl.width  = Math.round(W * dpr);
+    filmCanvasEl.height = Math.round(FILM_H * dpr);
+    filmCanvasEl.style.cssText =
+      'position:sticky; left:0; top:0; display:block; height:' + FILM_H + 'px; width:' + W + 'px; cursor:pointer;';
+    filmstripEl.appendChild(filmCanvasEl);
+
+    buildFilmstripLayout();
+    filmPadL = filmPadR = Math.round(W / 2);
+
+    filmSpacerEl = document.createElement('div');
+    filmSpacerEl.style.cssText =
+      'position:absolute; top:0; left:0; width:' + (filmPadL + filmTotalW + filmPadR) + 'px; height:1px;';
+    filmstripEl.appendChild(filmSpacerEl);
+
+    filmstripEl.addEventListener('scroll', onFilmstripScroll, { passive: true });
+    filmCanvasEl.addEventListener('click', onFilmstripClick);
+
+    var target = filmScrollForIdx1(focusedIdx, W);
+    focusInProgrammaticScroll = true;
+    filmstripEl.scrollLeft = target;
+    var sl = $('zoomSlider'); if (sl) sl.value = '100';
+
+    drawFilmstrip();
+    drawMainImage();
+  }
+
+  function onFilmstripScroll() {
+    if (filmScrollPending) return;
+    filmScrollPending = true;
+    requestAnimationFrame(function () {
+      filmScrollPending = false;
+      drawFilmstrip();
+      drawMainImage();
+    });
+  }
+
+  function onFilmstripClick(e) {
+    if (!filmstripEl || !filmTilePos) return;
+    var rect = filmCanvasEl.getBoundingClientRect();
+    var clickX = e.clientX - rect.left + filmstripEl.scrollLeft - filmPadL;
+    var lo = 0, hi = filmTilePos.length - 1;
+    while (lo < hi) {
+      var mid = (lo + hi) >> 1;
+      if (filmTilePos[mid] + filmTileW[mid] <= clickX) lo = mid + 1;
+      else hi = mid;
+    }
+    commandedIdx = lo + 1;
+    startFocusChase();
+  }
+
+  function drawFilmstrip() {
+    if (!filmstripEl || !filmCanvasEl || !filmTilePos || !window.spriteMeta) return;
+    var W = layoutWidth();
+    var dpr = devicePixelRatio();
+    var ctx = filmCanvasEl.getContext('2d', { alpha: false });
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = '#0a0a0a';
+    ctx.fillRect(0, 0, W, FILM_H);
+
+    var atlasH = 50;
+    var atlas = spriteMeta.atlases && spriteMeta.atlases[String(atlasH)];
+    if (!atlas) return;
+    var bitmapsPromise = loadSpriteBitmapsForAtlas(atlasH);
+
+    var scrollLeft = filmstripEl.scrollLeft;
+    var leftEdge = scrollLeft - filmPadL;
+    var rightEdge = leftEdge + W;
+    var yPad = (FILM_H - atlasH) / 2;
+
+    var newCenterIdx = filmCenteredIdx1(scrollLeft, W);
+    if (newCenterIdx !== focusedIdx) {
+      focusedIdx = newCenterIdx;
+      try { history.replaceState(null, '', '#' + encodeURIComponent(images[focusedIdx])); } catch (_) {}
     }
 
-    // Position the strip so focusedIdx is centered. Suppress snap during this jump.
-    var target = (focusedIdx - 1) * stride;
-    focusInProgrammaticScroll = true;
-    setFocusScrollPos(target, false);
-    // Slider pinned at 100 while in focus.
-    var slFocus = $('zoomSlider'); if (slFocus) slFocus.value = '100';
+    bitmapsPromise.then(function (bitmaps) {
+      if (!filmCanvasEl) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.fillStyle = '#0a0a0a';
+      ctx.fillRect(0, 0, W, FILM_H);
+      var n = filmTilePos.length;
+      var lo = 0, hi = n - 1;
+      while (lo < hi) {
+        var mid = (lo + hi) >> 1;
+        if (filmTilePos[mid] + filmTileW[mid] <= leftEdge) lo = mid + 1;
+        else hi = mid;
+      }
+      var aCellW = atlas.cellW, aCellH = atlas.cellH;
+      var aPerSprite = atlas.cellsPerSprite, aAcross = atlas.across;
+      for (var i = lo; i < n; i++) {
+        var tx = filmTilePos[i];
+        var tw = filmTileW[i];
+        if (tx > rightEdge) break;
+        var screenX = tx - leftEdge;
+        var spriteIdx = Math.floor(i / aPerSprite);
+        var posInSprite = i % aPerSprite;
+        var row = Math.floor(posInSprite / aAcross);
+        var col = posInSprite % aAcross;
+        var bitmap = bitmaps[spriteIdx];
+        if (!bitmap) continue;
+        var srcW = Math.round(tw);
+        ctx.drawImage(bitmap, col * aCellW, row * aCellH, srcW, aCellH, screenX, yPad, tw, atlasH);
+        if (i + 1 === focusedIdx) {
+          ctx.strokeStyle = '#fff';
+          ctx.lineWidth = 2;
+          ctx.strokeRect(screenX + 1, yPad + 1, tw - 2, atlasH - 2);
+        }
+      }
+    });
+  }
+
+  function drawMainImage() {
+    if (!mainEl || !window.spriteMeta) return;
+    if (focusedIdx <= 0 || focusedIdx > lastimagevalue) return;
+    var W = layoutWidth(), H = layoutHeight();
+    var mainH = Math.max(120, H - FILM_H);
+    var dpr = devicePixelRatio();
+    var ctx = mainEl.getContext('2d', { alpha: false });
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, mainH);
+
+    var name = images[focusedIdx];
+    var loc = spriteMeta.imageMap[name];
+    if (!loc) return;
+    var natW = loc.w, natH = CANONICAL_H;
+    var scale = Math.min(W / natW, mainH / natH);
+    var dw = Math.round(natW * scale);
+    var dh = Math.round(natH * scale);
+    var dx = Math.round((W - dw) / 2);
+    var dy = Math.round((mainH - dh) / 2);
+
+    var atlasH = 50;
+    var atlas = spriteMeta.atlases && spriteMeta.atlases[String(atlasH)];
+    if (!atlas) return;
+    var capturedIdx = focusedIdx;
+    loadSpriteBitmapsForAtlas(atlasH).then(function (bitmaps) {
+      if (!mainEl || focusedIdx !== capturedIdx) return;
+      var idx0 = capturedIdx - 1;
+      var spriteIdx = Math.floor(idx0 / atlas.cellsPerSprite);
+      var posInSprite = idx0 % atlas.cellsPerSprite;
+      var row = Math.floor(posInSprite / atlas.across);
+      var col = posInSprite % atlas.across;
+      var bitmap = bitmaps[spriteIdx];
+      if (!bitmap) return;
+      var srcW = Math.round(natW * atlasH / natH);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.drawImage(bitmap, col * atlas.cellW, row * atlas.cellH, srcW, atlas.cellH, dx, dy, dw, dh);
+    });
   }
 
   function renderGallery() {
@@ -844,10 +882,9 @@
     var W = layoutWidth();
     var viewportH = layoutHeight();
 
-    // ===== FOCUS MODE: native-scroll strip =====
+    // ===== FOCUS MODE: main image + filmstrip =====
     if (focusedIdx > 0) {
-      setupFocusStrip(thumbsEl);
-      drawFocusForScroll();
+      setupFilmstripFocus(thumbsEl);
       return;
     }
 
@@ -1097,12 +1134,12 @@
     var thumbsEl = $('thumbs');
     if (!thumbsEl) return;
     thumbsEl.addEventListener('wheel', function (e) {
-      if (focusedIdx <= 0) return;        // grid mode: native vertical scroll handles it
-      if (isPortraitFocus()) return;      // portrait focus: native vertical scroll, fine
-      // Landscape focus: vertical wheel becomes horizontal scroll on the strip.
+      if (focusedIdx <= 0) return;
+      if (!filmstripEl) return;
+      // In focus mode, vertical wheel scrubs the filmstrip horizontally.
       if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
         e.preventDefault();
-        thumbsEl.scrollLeft += e.deltaY;
+        filmstripEl.scrollLeft += e.deltaY;
       }
     }, { passive: false });
 
