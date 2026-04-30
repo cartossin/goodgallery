@@ -31,8 +31,21 @@ const PUBLIC_DIR       = path.join(__dirname, 'public');
 const PASSKEY_FILE     = path.join(STATE_DIR, 'passkey.json');
 const SITE_TITLE       = process.env.SITE_TITLE || 'Goodgallery';
 const THUMBS_PER_PAGE  = parseInt(process.env.THUMBS_PER_PAGE || '50', 10);
-// Thumbs are now cover-cropped to fixed square cells so they tile cleanly into a sprite
-// atlas. THUMB_CELL is the physical pixel size; CSS displays at half that for 2x retina.
+// LoD ladder: every image is cached at multiple heights. Small tiers are lossless `.v`
+// (raw bytes, fast to read); large tiers are AVIF Q=80 (very compressed). The H=200
+// AVIF is the input to the sprite atlas.
+const LOD_TIERS = [
+  { h: 5,   format: 'v',    quality: null },
+  { h: 10,  format: 'v',    quality: null },
+  { h: 50,  format: 'v',    quality: null },
+  { h: 100, format: 'avif', quality: 80 },
+  { h: 200, format: 'avif', quality: 80 },
+  { h: 400, format: 'avif', quality: 80 },
+  { h: 800, format: 'avif', quality: 80 },
+];
+function lodPath(thumbDir, filename, height, format) {
+  return path.join(thumbDir, filename + '.h' + height + '.' + format);
+}
 const THUMB_CELL       = parseInt(process.env.THUMB_CELL || '200', 10);
 const THUMB_DIM        = THUMB_CELL;  // alias for clarity in build path
 const SPRITE_ACROSS      = parseInt(process.env.SPRITE_ACROSS || '20', 10);   // cells per row (target)
@@ -455,6 +468,20 @@ function vipsThumb(srcAbs, dstAbs, dim, quality) {
 // expensive operation — we want each per-image resize to be its own atomic, idempotent,
 // LOSSLESS unit. Sprite assembly memmaps these with ~zero decode cost. Note: the
 // op-style 'vips thumbnail' is reliable; 'vipsthumbnail --output X.v' silently no-ops.
+function vipsHeightThumbAVIF(srcAbs, dstAbs, height, quality) {
+  return new Promise((resolve, reject) => {
+    const tmp = dstAbs + '.__tmp.avif';
+    const args = [
+      'thumbnail', srcAbs, tmp + '[Q=' + quality + ']', '99999',
+      '--height', String(height),
+      '--size', 'down',
+    ];
+    runStep('vips', args, tmp).then(() =>
+      fs.promises.rename(tmp, dstAbs).then(resolve, reject)
+    ).catch(reject);
+  });
+}
+
 function vipsHeightThumbV(srcAbs, dstAbs, height) {
   return new Promise((resolve, reject) => {
     const tmp = dstAbs + '.__tmp.v';
@@ -512,10 +539,18 @@ async function ensureBuilt(folderAbs, filename) {
   }
   const thumbDir = path.join(folderAbs, 'thumbcache');
   await fsp.mkdir(thumbDir, { recursive: true });
-  // Lossless .v intermediate (gd2 analog) — sprite atlas is the only lossy step.
-  const thumbOut = path.join(thumbDir, filename + '.resized.v');
+  // Build every tier of the LoD ladder that's missing. Each is its own atomic unit.
   let did = 0;
-  if (!fs.existsSync(thumbOut)) { await vipsHeightThumbV(src, thumbOut, THUMB_CELL); did++; }
+  for (const tier of LOD_TIERS) {
+    const out = lodPath(thumbDir, filename, tier.h, tier.format);
+    if (fs.existsSync(out)) continue;
+    if (tier.format === 'v') {
+      await vipsHeightThumbV(src, out, tier.h);
+    } else if (tier.format === 'avif') {
+      await vipsHeightThumbAVIF(src, out, tier.h, tier.quality);
+    }
+    did++;
+  }
   // Preview only for large originals — for small ones the client uses the original directly.
   if (st.size >= PREVIEW_SIZE_THRESHOLD) {
     const previewDir = path.join(folderAbs, 'previewcache');
@@ -602,7 +637,7 @@ async function buildSpriteForFolder(galleryAbs) {
   const thumbDir = path.join(galleryAbs, 'thumbcache');
   // require every thumb to exist; bail (the queue will retry) if any are missing.
   for (const f of images) {
-    if (!fs.existsSync(path.join(thumbDir, f + '.resized.v'))) return null;
+    if (!fs.existsSync(lodPath(thumbDir, f, THUMB_CELL, 'avif'))) return null;
   }
 
   // Each thumb is fixed-height (THUMB_CELL px) but variable-width — read each one's
@@ -611,8 +646,8 @@ async function buildSpriteForFolder(galleryAbs) {
   // capped to a sane upper bound so a single panorama doesn't bloat the atlas.
   const SPRITE_CELL_W_MAX = parseInt(process.env.SPRITE_CELL_W_MAX || '600', 10);
   const widths = images.map(f => {
-    const d = readVipsHeader(path.join(thumbDir, f + '.resized.v'));
-    return d ? d.w : THUMB_CELL;
+    const d = readVipsHeader(lodPath(thumbDir, f, 50, 'v'));
+    return d ? Math.round(d.w * (THUMB_CELL / 50)) : THUMB_CELL;
   });
   const cellW = Math.min(SPRITE_CELL_W_MAX, Math.max(THUMB_CELL, ...widths));
   const cellH = THUMB_CELL;
@@ -638,9 +673,9 @@ async function buildSpriteForFolder(galleryAbs) {
       const chunk = images.slice(c * cellsPerSprite, (c + 1) * cellsPerSprite);
       const inputPaths = [];
       for (let i = 0; i < chunk.length; i++) {
-        const link = path.join(stagingDir, `${c}_${i}.v`);
+        const link = path.join(stagingDir, `${c}_${i}.avif`);
         try { await fsp.unlink(link); } catch {}
-        await fsp.link(path.join(thumbDir, chunk[i] + '.resized.v'), link);
+        await fsp.link(lodPath(thumbDir, chunk[i], THUMB_CELL, 'avif'), link);
         inputPaths.push(link);
       }
       const spriteFile = `sprite-${c}.jpg`;
@@ -1314,10 +1349,12 @@ async function handleBuildAll(req, res, abs) {
     if (!fs.existsSync(dir)) continue;
     for (const f of fs.readdirSync(dir)) {
       if (isOrphanTmp(f)) { try { fs.unlinkSync(path.join(dir, f)); } catch {} continue; }
-      // Recognize both intermediate (.resized.v) and preview (.resized.jpg) suffixes.
+      if (/^sprite-\d+\.(jpg|avif)$/.test(f) || f === '_sprite.json' || f === '_sprite_staging') continue;
       let original = null;
-      if (f.endsWith('.resized.v'))         original = f.slice(0, -'.resized.v'.length);
-      else if (f.endsWith('.resized.jpg'))  original = f.slice(0, -'.resized.jpg'.length);
+      const lod = f.match(/^(.+)\.h\d+\.(v|avif)$/);
+      if (lod) original = lod[1];
+      else if (f.endsWith('.resized.v'))   original = f.slice(0, -'.resized.v'.length);
+      else if (f.endsWith('.resized.jpg')) original = f.slice(0, -'.resized.jpg'.length);
       if (!original) continue;
       if (!presence.has(original)) { try { fs.unlinkSync(path.join(dir, f)); } catch {} }
     }
@@ -1383,12 +1420,16 @@ async function deleteByPath(relPath) {
   const src = safeTrashPath(relPath);
   if (!src || !fs.existsSync(src)) throw new Error('not in trash');
   await fsp.unlink(src);
-  // Reclaim the cached intermediate + preview at the original location.
+  // Reclaim every LoD tier + preview JPEG at the original location.
   const segs = relPath.split('/').filter(Boolean);
   const filename = segs.pop();
   const galleryAbs = path.join(GALLERIES_ROOT, ...segs);
+  const thumbDirAbs = path.join(galleryAbs, 'thumbcache');
+  for (const tier of LOD_TIERS) {
+    try { await fsp.unlink(lodPath(thumbDirAbs, filename, tier.h, tier.format)); } catch {}
+  }
   for (const cf of [
-    path.join(galleryAbs, 'thumbcache',   filename + '.resized.v'),
+    path.join(thumbDirAbs, filename + '.resized.v'),
     path.join(galleryAbs, 'previewcache', filename + '.resized.jpg'),
   ]) { try { await fsp.unlink(cf); } catch {} }
   // GC empty trash subdirs
