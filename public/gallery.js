@@ -312,11 +312,15 @@
   // higher densities don't visibly help and just multiply paint cost.
   function devicePixelRatio() { return Math.min(window.devicePixelRatio || 1, 2); }
 
-  // Per-atlas-height ImageBitmap cache. Each atlas height (5/10/50/200) is loaded once,
-  // lazily, and reused across renders. Switching zoom triggers a new atlas load only if
-  // we don't have it yet.
+  // Per-atlas-height ImageBitmap cache. Each atlas height (5/10/50) is loaded once,
+  // lazily, and reused across renders.
   var spriteBitmapsByHeight = {};      // { '50': Promise<[ImageBitmap, ...]>, ... }
-  var currentRowHeight = 200;          // current target row height in CSS px (drives atlas pick)
+  // Per-image bitmap cache for high-zoom views. Keyed by `${name}|${tierH}`. At
+  // tierH=100/200/400/800 we fetch each visible image as its own AVIF; the canvas
+  // composites them. Only viewport-visible images are fetched, so memory is bounded.
+  var perImageBitmaps = new Map();
+  var currentRowHeight = 200;          // current target row height in CSS px
+  var renderFrame = 0;                 // increments per renderGallery; async draws check this
   var lastTileRects = [];              // [{x, y, w, h, name}] in LAYOUT coords (not screen)
   var lastTotalH = 0;                  // total layout height
   var canvasEl = null;
@@ -339,16 +343,38 @@
     return spriteBitmapsByHeight[key];
   }
 
-  // Pick the smallest atlas height >= the target row height. If we have atlases at
-  // 5/10/50/200, target H=20 picks 50 (downscale, looks crisp); H=300 picks 200
-  // (largest available — the canvas will upscale slightly).
+  // Atlas pick: smallest atlas height >= target. Returns null if target exceeds the
+  // largest atlas (caller should switch to per-image rendering).
   function pickAtlasHeight(targetH) {
     if (!window.spriteMeta || !spriteMeta.atlases) return null;
     var heights = Object.keys(spriteMeta.atlases).map(Number).sort(function (a, b) { return a - b; });
     for (var i = 0; i < heights.length; i++) {
       if (heights[i] >= targetH) return heights[i];
     }
-    return heights[heights.length - 1];
+    return null;  // target is larger than any atlas — caller uses per-image AVIF
+  }
+
+  // Per-image LoD: pick the smallest available tier height >= target. The available
+  // per-image tiers (h100/h200/h400/h800) are an architectural decision matching
+  // the server's LOD_TIERS list.
+  var PER_IMAGE_TIERS = [100, 200, 400, 800];
+  function pickPerImageTier(targetH) {
+    for (var i = 0; i < PER_IMAGE_TIERS.length; i++) {
+      if (PER_IMAGE_TIERS[i] >= targetH) return PER_IMAGE_TIERS[i];
+    }
+    return PER_IMAGE_TIERS[PER_IMAGE_TIERS.length - 1];
+  }
+
+  function loadPerImageBitmap(name, tierH) {
+    var key = name + '|' + tierH;
+    if (perImageBitmaps.has(key)) return perImageBitmaps.get(key);
+    var url = folderURL + 'thumbcache/' + encodeURIComponent(name) + '.h' + tierH + '.avif';
+    var prom = fetch(url, { credentials: 'same-origin' })
+      .then(function (r) { return r.blob(); })
+      .then(function (b) { return createImageBitmap(b); })
+      .catch(function () { return null; });
+    perImageBitmaps.set(key, prom);
+    return prom;
   }
 
   function ensureCanvasAndSpacer(thumbsEl) {
@@ -411,38 +437,57 @@
     ctx.fillStyle = '#0a0a0a';
     ctx.fillRect(0, 0, viewportW, viewportH);
 
-    // Pick the right atlas for the current zoom; load if not yet loaded.
-    var targetH = currentRowHeight;  // the actual row height in CSS px (set in renderGallery)
-    var atlasH = pickAtlasHeight(targetH);
-    if (atlasH == null) return;
-    var atlas = spriteMeta.atlases[String(atlasH)];
-    var prom = loadSpriteBitmapsForAtlas(atlasH);
+    // Find visible tiles
+    var top = scrollY, bot = scrollY + viewportH;
+    var visible = [];
+    for (var k = 0; k < lastTileRects.length; k++) {
+      var t = lastTileRects[k];
+      if (t.y + t.h < top) continue;
+      if (t.y > bot) break;
+      visible.push(t);
+    }
 
-    prom.then(function (bitmaps) {
-      if (!canvasEl) return;
-      var aCellW = atlas.cellW, aCellH = atlas.cellH;
-      var aPerSprite = atlas.cellsPerSprite, aAcross = atlas.across;
-      // Source-rect width per image at this atlas height — atlas was built from per-image
-      // widths at exactly that height, so srcW = w_at_atlas = canonicalW * (aCellH / 200).
-      var canonicalH = 200;
-      var top = scrollY, bot = scrollY + viewportH;
-      for (var k = 0; k < lastTileRects.length; k++) {
-        var t = lastTileRects[k];
-        if (t.y + t.h < top) continue;
-        if (t.y > bot) break;
-        var loc = spriteMeta.imageMap[t.name];
-        if (!loc) continue;
-        var idx = loc.idx;
-        var spriteIdx = Math.floor(idx / aPerSprite);
-        var posInSprite = idx % aPerSprite;
-        var row = Math.floor(posInSprite / aAcross);
-        var col = posInSprite % aAcross;
-        var bitmap = bitmaps[spriteIdx];
-        if (!bitmap) continue;
-        var srcW = Math.round(loc.w * (aCellH / canonicalH));
-        ctx.drawImage(bitmap, col * aCellW, row * aCellH, srcW, aCellH, t.x, t.y - scrollY, t.w, t.h);
-      }
-    });
+    var myFrame = ++renderFrame;
+    var atlasH = pickAtlasHeight(currentRowHeight);
+
+    if (atlasH != null) {
+      // ATLAS PATH: target row height is small enough that a sprite atlas at H<=50
+      // covers it. One atlas image, many tiles drawn from offsets within it.
+      var atlas = spriteMeta.atlases[String(atlasH)];
+      loadSpriteBitmapsForAtlas(atlasH).then(function (bitmaps) {
+        if (renderFrame !== myFrame || !canvasEl) return;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        var aCellW = atlas.cellW, aCellH = atlas.cellH;
+        var aPerSprite = atlas.cellsPerSprite, aAcross = atlas.across;
+        var canonicalH = 200;
+        for (var k = 0; k < visible.length; k++) {
+          var t = visible[k];
+          var loc = spriteMeta.imageMap[t.name];
+          if (!loc) continue;
+          var idx = loc.idx;
+          var spriteIdx = Math.floor(idx / aPerSprite);
+          var posInSprite = idx % aPerSprite;
+          var row = Math.floor(posInSprite / aAcross);
+          var col = posInSprite % aAcross;
+          var bitmap = bitmaps[spriteIdx];
+          if (!bitmap) continue;
+          var srcW = Math.round(loc.w * (aCellH / canonicalH));
+          ctx.drawImage(bitmap, col * aCellW, row * aCellH, srcW, aCellH, t.x, t.y - scrollY, t.w, t.h);
+        }
+      });
+    } else {
+      // PER-IMAGE PATH: target row height too big for the atlas. Each tile fetches its
+      // own AVIF at the appropriate LoD tier. Decodes happen in parallel and the canvas
+      // fills in progressively as bitmaps resolve.
+      var tierH = pickPerImageTier(currentRowHeight);
+      visible.forEach(function (t) {
+        loadPerImageBitmap(t.name, tierH).then(function (bitmap) {
+          if (renderFrame !== myFrame || !canvasEl || !bitmap) return;
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          ctx.drawImage(bitmap, 0, 0, bitmap.width, bitmap.height, t.x, t.y - scrollY, t.w, t.h);
+        });
+      });
+    }
   }
 
   function renderGallery() {

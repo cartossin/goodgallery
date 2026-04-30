@@ -637,8 +637,11 @@ async function buildSpriteForFolder(galleryAbs) {
 
   // Atlases at every LoD height we have. Small heights use lossless .v inputs
   // (instant decode); H=200 uses the AVIF tier.
+  // Sprites only at the small heights — at higher zoom levels the canvas displays
+  // few enough images that loading them individually as AVIF is faster than packing
+  // a giant atlas.
   const ATLAS_HEIGHTS = LOD_TIERS
-    .filter(t => [5, 10, 50, 200].includes(t.h))
+    .filter(t => [5, 10, 50].includes(t.h))
     .map(t => ({ h: t.h, format: t.format }));
 
   // Verify every image has every atlas-input tier on disk; bail otherwise (queue retries).
@@ -1244,6 +1247,13 @@ async function handle(req, res) {
     }
     // sprite atlas files: /<gallery>/.../thumbcache/sprite-N.jpg
     if (dirOfFile === 'thumbcache' && /^sprite(?:-h\d+)?-\d+\.jpg$/.test(fileName)) {
+      const galleryAbs = resolveGallery(grandparent);
+      if (!galleryAbs) return notFound(res);
+      return serveStaticFile(req, res, path.join(galleryAbs, 'thumbcache', fileName));
+    }
+    // Per-image LoD tiers (h100/h200/h400/h800 AVIF) — used by the canvas when zoomed
+    // past atlas range. Pattern: <original>.h<H>.avif
+    if (dirOfFile === 'thumbcache' && /\.h\d+\.avif$/.test(fileName)) {
       const galleryAbs = resolveGallery(grandparent);
       if (!galleryAbs) return notFound(res);
       return serveStaticFile(req, res, path.join(galleryAbs, 'thumbcache', fileName));
