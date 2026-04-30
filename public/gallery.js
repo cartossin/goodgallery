@@ -531,6 +531,20 @@
           ctx.drawImage(bitmap, 0, 0, bitmap.width, bitmap.height, t.x, t.y - scrollY, t.w, t.h);
         });
       });
+
+      // Prefetch one viewport ABOVE and one BELOW the current visible window so that
+      // scrolling into them feels instant. fire-and-forget: loadPerImageBitmap caches by
+      // (name, tier), so subsequent demand-loads find a resolved bitmap immediately.
+      var prefetchTop = top - viewportH;
+      var prefetchBot = bot + viewportH;
+      for (var k = 0; k < lastTileRects.length; k++) {
+        var t = lastTileRects[k];
+        if (t.y > prefetchBot) break;
+        if (t.y + t.h < prefetchTop) continue;
+        // Skip already-visible tiles — they're being fetched in the .forEach above.
+        if (t.y + t.h >= top && t.y <= bot) continue;
+        loadPerImageBitmap(t.name, tierH);
+      }
     }
   }
 
