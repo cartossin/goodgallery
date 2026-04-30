@@ -293,6 +293,70 @@
     };
   }
 
+  // ---- per-tile blob cache (option A) ------------------------------------
+  // Slice each sprite atlas into N independent image blobs (one per thumb), so each
+  // <img> has its own self-contained source. Tradeoff vs. shared sprite img:
+  //   + Each tile is a tiny independent image — browsers (esp. Safari) composite these
+  //     much more efficiently than N elements all referencing the same big JPEG.
+  //   - One-time CPU cost: ~10ms per tile (create + drawImage + toBlob), so ~5–10s for
+  //     800 tiles. Done in the background after first paint, so user sees placeholder
+  //     boxes briefly then the imagery fills in.
+  //   - ~10–30MB extra memory for the blobs.
+  var blobCache = {};       // name -> blob: URL
+  var blobCacheReady = false;
+  var blobCacheBuilding = false;
+
+  function clearBlobCache() {
+    for (var k in blobCache) { try { URL.revokeObjectURL(blobCache[k]); } catch (e) {} }
+    blobCache = {};
+    blobCacheReady = false;
+  }
+
+  async function buildBlobCache() {
+    if (blobCacheBuilding || blobCacheReady) return;
+    if (!window.spriteMeta) return;
+    blobCacheBuilding = true;
+    var t0 = performance.now();
+    try {
+      // Fetch + decode each unique sprite atlas ONCE
+      var spriteBitmaps = await Promise.all(spriteMeta.sprites.map(async function (sp) {
+        var url = folderURL + 'thumbcache/' + sp.file;
+        var resp = await fetch(url, { credentials: 'same-origin' });
+        var blob = await resp.blob();
+        return await createImageBitmap(blob);
+      }));
+      var tFetch = performance.now() - t0;
+
+      // Slice every tile in parallel — browsers throttle internally
+      var entries = Object.keys(spriteMeta.imageMap);
+      var cellW = spriteMeta.cellW, cellH = spriteMeta.cellH;
+      var canvas = document.createElement('canvas');
+      var ctx = canvas.getContext('2d', { alpha: false });
+      // Sequential is faster than parallel for canvas/toBlob — toBlob queues internally
+      // and excessive parallelism just bloats memory without speeding up encoding.
+      for (var i = 0; i < entries.length; i++) {
+        var name = entries[i];
+        var loc = spriteMeta.imageMap[name];
+        var sx = loc.col * cellW, sy = loc.row * cellH;
+        canvas.width = loc.w; canvas.height = cellH;
+        ctx.drawImage(spriteBitmaps[loc.sprite], sx, sy, loc.w, cellH, 0, 0, loc.w, cellH);
+        // Use a Promise-wrapped toBlob; Q=0.85 keeps tiles small without visible loss
+        var blob = await new Promise(function (res) { canvas.toBlob(res, 'image/jpeg', 0.85); });
+        if (blob) blobCache[name] = URL.createObjectURL(blob);
+      }
+      // Free decoded sprite bitmaps
+      for (var s of spriteBitmaps) { try { s.close(); } catch (e) {} }
+      var tTotal = performance.now() - t0;
+      console.log('[blobcache] ' + entries.length + ' tiles in ' + Math.round(tTotal) + 'ms (fetch+decode: ' + Math.round(tFetch) + 'ms, slice+encode: ' + Math.round(tTotal - tFetch) + 'ms)');
+      blobCacheReady = true;
+      scheduleRender();   // re-emit with blob URLs
+    } catch (e) {
+      console.warn('[blobcache] failed:', e);
+    } finally {
+      blobCacheBuilding = false;
+    }
+  }
+
   function renderGallery() {
     var thumbsEl = $('thumbs');
     if (!thumbsEl) return;
@@ -325,14 +389,20 @@
         var bgX = -loc.col * spriteMeta.cellW * scale;
         var bgY = -loc.row * spriteMeta.cellH * scale;
         var bgSizeW = spriteMeta.across * spriteMeta.cellW * scale;
-        // Each tile: <a> clipping window + a shared <img> referencing the atlas. Browsers
-        // decode the atlas JPEG once and reuse the same ImageBitmap for every <img> with
-        // that src — Safari/WebKit appears to handle this case faster than the same number
-        // of background-image divs (which seem to cost a separate composite per tile).
-        html += '<a class="sprite-thumb" href="#' + encodeURIComponent(name) + '" data-i="' + it.index + '" title="' + name + '" ' +
-          'style="width:' + it.w + 'px;height:' + it.h + 'px">' +
-          '<img src="' + spriteURL + '" alt="" ' +
-          'style="left:' + bgX + 'px;top:' + bgY + 'px;width:' + bgSizeW + 'px"></a>';
+        // Self-contained per-tile <img>: each thumb has its own blob URL (sliced from
+        // the atlas in JS). The browser treats it as 800 small independent images rather
+        // than 800 references to one big image — Safari/WebKit composites this much more
+        // efficiently. Wrapper still does layout sizing; img fills it via width:100%.
+        var blobSrc = blobCache[name];
+        if (blobSrc) {
+          html += '<a class="sprite-thumb solo" href="#' + encodeURIComponent(name) + '" data-i="' + it.index + '" title="' + name + '" ' +
+            'style="width:' + it.w + 'px;height:' + it.h + 'px">' +
+            '<img src="' + blobSrc + '" alt=""></a>';
+        } else {
+          // Placeholder: just the wrapper with bg color while blob cache builds
+          html += '<a class="sprite-thumb placeholder" href="#' + encodeURIComponent(name) + '" data-i="' + it.index + '" title="' + name + '" ' +
+            'style="width:' + it.w + 'px;height:' + it.h + 'px"></a>';
+        }
       }
       html += '</div>';
     }
@@ -489,6 +559,13 @@
       previewimages[i] = previewSrc(i);
     }
     window.addEventListener('resize', scheduleRender);
+    window.addEventListener('beforeunload', clearBlobCache);
+
+    // Kick off the per-tile blob slicing in the background. Initial render shows
+    // placeholder boxes; the slicing pass triggers a re-render when complete.
+    if (window.spriteMeta && lastimagevalue > 0) {
+      requestIdleCallback ? requestIdleCallback(buildBlobCache, { timeout: 100 }) : setTimeout(buildBlobCache, 16);
+    }
 
     // initial route: hash empty or ':N' → thumb view; #filename → image view
     var raw = decodeURIComponent(location.hash.slice(1) || '');

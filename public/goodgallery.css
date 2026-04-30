@@ -184,8 +184,9 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   #photospot img { max-height: 78vh; }
 }
 
-/* Variable-width sprite thumbs: <a> is the clipping window, nested <img> is the
-   shared atlas (browser decodes once per src and reuses the bitmap for every reference). */
+/* Each thumb is an independent <img> sliced out of the sprite atlas in JS (option A).
+   Wrapper does layout sizing; img scales to fill it. Placeholders show until blob cache
+   is built (couple seconds after first paint). */
 #thumbs .sprite-thumb {
   display: inline-block;
   position: relative;
@@ -195,9 +196,8 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 }
 #thumbs .sprite-thumb > img {
   display: block;
-  position: absolute;
-  height: auto;
-  max-width: none;
+  width: 100%;
+  height: 100%;
   pointer-events: none;
   user-select: none;
 }
