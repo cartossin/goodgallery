@@ -189,9 +189,8 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   background-color: var(--thumb-bg);
   background-repeat: no-repeat;
   margin: 1px;
-  transition: opacity .12s, transform .12s;
 }
-#thumbs .sprite-thumb:hover { opacity: 0.85; transform: scale(1.04); }
+#thumbs .sprite-thumb:hover { opacity: 0.85; }
 
 
 /* Justified rows layout */

@@ -244,6 +244,9 @@
   // Zoom is in-memory only — every fresh page load starts at fit-all (0). Dragging
   // the slider updates this value but it never persists; reload resets the view.
   var currentZoom = 0;
+  // The zoom level the DOM was last actually laid out at. Live transform-preview during
+  // slider drag scales relative to this baseline; on slider release we re-layout for real.
+  var laidOutZoom = 0;
   function getZoom() { return currentZoom; }
   function setZoom(t) {
     if (isNaN(t) || t < 0) t = 0;
@@ -334,7 +337,26 @@
       html += '</div>';
     }
     thumbsEl.classList.add('layout');
+    thumbsEl.style.transform = '';     // clear any in-flight live-preview transform
+    thumbsEl.style.transformOrigin = '';
     thumbsEl.innerHTML = html;
+    laidOutZoom = currentZoom;
+  }
+
+  // Live transform-preview during slider drag. Cheap on every browser (single GPU
+  // composite, no DOM mutations); on Safari it sidesteps the per-thumb recompute that
+  // would otherwise stall the slider. On release (slider 'change' event) we re-layout
+  // for real, which gives the proper justified rows for the new height.
+  function applyPreviewTransform() {
+    if (!window.spriteMeta) return;
+    var thumbsEl = $('thumbs');
+    if (!thumbsEl) return;
+    var baseH = targetRowHeight(laidOutZoom);
+    var newH  = targetRowHeight(currentZoom);
+    if (baseH <= 0) return;
+    var scale = newH / baseH;
+    thumbsEl.style.transformOrigin = '0 0';
+    thumbsEl.style.transform = 'scale(' + scale + ')';
   }
 
   function buildthumbpages() { /* legacy stub — layout is now incremental via renderGallery */ }
@@ -438,6 +460,10 @@
     sl.value = String(getZoom());
     sl.addEventListener('input', function () {
       setZoom(parseInt(sl.value, 10));
+      applyPreviewTransform();   // GPU scale; no DOM mutations
+    });
+    sl.addEventListener('change', function () {
+      // Pointer up / value committed: do the proper justified re-layout for new height.
       scheduleRender();
     });
   }
