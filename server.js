@@ -4,7 +4,6 @@
 // Preserves the 2014 URL/data layout:
 //   GALLERIES_ROOT/<path...>/<image>            originals
 //   GALLERIES_ROOT/<path...>/thumbcache/<image>.resized.jpg
-//   GALLERIES_ROOT/<path...>/previewcache/<image>.resized.jpg
 //   GALLERIES_ROOT/<path...>/ggTrash/<image>    soft-deleted
 //
 // New: folder hierarchy. Each folder is its own gallery; subfolders appear
@@ -58,12 +57,10 @@ const SPRITE_ACROSS      = parseInt(process.env.SPRITE_ACROSS || '20', 10);   //
 const MAX_SPRITE_BYTES   = parseInt(process.env.MAX_SPRITE_BYTES || String(4 * 1024 * 1024), 10);
 const BYTES_PER_PIXEL_Q92 = parseFloat(process.env.BYTES_PER_PIXEL_Q92 || '0.30');
 const MAX_SPRITE_PIXELS   = Math.max(1, Math.floor(MAX_SPRITE_BYTES / BYTES_PER_PIXEL_Q92));
-const PREVIEW_DIM      = parseInt(process.env.PREVIEW_DIM || '2000', 10); // generous; only used for big originals
+
 const THUMB_QUALITY    = parseInt(process.env.THUMB_QUALITY || '82', 10);
-const PREVIEW_QUALITY  = parseInt(process.env.PREVIEW_QUALITY || '85', 10);
 // Originals smaller than this skip preview generation — the client uses the original directly.
 // Browsers scale well now; the only point of a "preview" is to shrink huge files.
-const PREVIEW_SIZE_THRESHOLD = parseInt(process.env.PREVIEW_SIZE_THRESHOLD || String(500 * 1024), 10);
 const SESSION_DURATION = 24 * 60 * 60 * 1000;
 const RP_NAME          = SITE_TITLE;
 
@@ -555,16 +552,6 @@ function needsBuildForPhase(folderAbs, filename, phase) {
     if (phase === 'avif' && tier.format !== 'avif') continue;
     if (!fs.existsSync(lodPath(thumbDir, filename, tier.h, tier.format))) return true;
   }
-  // AVIF phase also wants the preview JPEG for big-enough originals.
-  if (phase !== 'v') {
-    try {
-      const st = fs.statSync(path.join(folderAbs, filename));
-      if (st.size >= PREVIEW_SIZE_THRESHOLD) {
-        const previewOut = path.join(folderAbs, 'previewcache', filename + '.resized.jpg');
-        if (!fs.existsSync(previewOut)) return true;
-      }
-    } catch {}
-  }
   return false;
 }
 
@@ -593,14 +580,6 @@ async function ensureBuilt(folderAbs, filename, opts) {
       await vipsHeightThumbAVIF(src, out, tier.h, tier.quality);
     }
     did++;
-  }
-  // Preview is part of the AVIF phase (it's a JPEG but only useful at "view" time, not
-  // for the atlas).
-  if (phase !== 'v' && st.size >= PREVIEW_SIZE_THRESHOLD) {
-    const previewDir = path.join(folderAbs, 'previewcache');
-    await fsp.mkdir(previewDir, { recursive: true });
-    const previewOut = path.join(previewDir, filename + '.resized.jpg');
-    if (!fs.existsSync(previewOut)) { await vipsThumb(src, previewOut, PREVIEW_DIM, PREVIEW_QUALITY); did++; }
   }
   return did;
 }
@@ -1276,21 +1255,6 @@ async function handle(req, res) {
     const dirOfFile = segs[segs.length - 2];
     const grandparent = segs.slice(0, -2);
 
-    // 1) cache file: /<gallery>/.../{thumbcache,previewcache}/<file>.resized.jpg
-    if (dirOfFile === 'previewcache' && fileName.endsWith('.resized.jpg')) {
-      const galleryAbs = resolveGallery(grandparent);
-      if (!galleryAbs) return notFound(res);
-      const cacheFile = path.join(galleryAbs, 'previewcache', fileName);
-      const originalName = fileName.slice(0, -'.resized.jpg'.length);
-      if (fs.existsSync(cacheFile)) return serveStaticFile(req, res, cacheFile);
-      // Cache miss → trigger build (idempotent; skips preview gen for files <500KB).
-      try { await ensureBuilt(galleryAbs, originalName); } catch {}
-      if (fs.existsSync(cacheFile)) return serveStaticFile(req, res, cacheFile);
-      // For small originals there's no preview; serve the original. Browsers scale fine.
-      const original = path.join(galleryAbs, originalName);
-      if (fs.existsSync(original)) return serveStaticFile(req, res, original);
-      return notFound(res);
-    }
     // sprite atlas files: /<gallery>/.../thumbcache/sprite-N.jpg
     if (dirOfFile === 'thumbcache' && fileName === '_imagemap.bin') {
       const galleryAbs = resolveGallery(grandparent);
@@ -1407,7 +1371,7 @@ async function handleBuildAll(req, res, abs) {
   if (fs.existsSync(tslice)) {
     for (const f of fs.readdirSync(tslice)) presence.add(f);
   }
-  for (const sub of ['thumbcache', 'previewcache']) {
+  for (const sub of ['thumbcache']) {
     const dir = path.join(abs, sub);
     if (!fs.existsSync(dir)) continue;
     for (const f of fs.readdirSync(dir)) {
@@ -1432,7 +1396,7 @@ async function adminAction(req, res, fn) {
   catch (e) { sendText(res, 500, 'error: ' + e.message); }
 }
 async function clearcache(abs) {
-  for (const sub of ['thumbcache', 'previewcache']) {
+  for (const sub of ['thumbcache']) {
     const dir = path.join(abs, sub);
     if (!fs.existsSync(dir)) continue;
     for (const f of fs.readdirSync(dir)) { try { fs.unlinkSync(path.join(dir, f)); } catch {} }
@@ -1493,7 +1457,6 @@ async function deleteByPath(relPath) {
   }
   for (const cf of [
     path.join(thumbDirAbs, filename + '.resized.v'),
-    path.join(galleryAbs, 'previewcache', filename + '.resized.jpg'),
   ]) { try { await fsp.unlink(cf); } catch {} }
   // GC empty trash subdirs
   let parent = path.dirname(src);

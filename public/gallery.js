@@ -68,7 +68,6 @@
   // For files smaller than previewThreshold we just use the original — modern browsers
   // scale beautifully, so making a smaller "preview" is wasted disk for small files.
   function thumbURL(name)         { return folderURL + 'thumbcache/'   + encodeURIComponent(name) + '.resized.jpg'; }
-  function previewCacheURL(name)  { return folderURL + 'previewcache/' + encodeURIComponent(name) + '.resized.avif'; }
   function originalURL(name)      { return folderURL + encodeURIComponent(name); }
   // Server transparently serves the original when no preview file exists, so the client
   // never has to know which to ask for. Avoids embedding per-image sizes in the page —
@@ -357,6 +356,9 @@
   // tierH=100/200/400/800 we fetch each visible image as its own AVIF; the canvas
   // composites them. Only viewport-visible images are fetched, so memory is bounded.
   var perImageBitmaps = new Map();
+  // Sync mirror — populated by loadPerImageBitmap.then. Lets paintMain pick the
+  // best already-resolved tier without going through a Promise microtask.
+  var perImageBitmapsSync = new Map();   // key -> ImageBitmap
   var currentRowHeight = 200;          // current target row height in CSS px
   var renderFrame = 0;                 // increments per renderGallery; async draws check this
   var lastTileRects = [];              // [{x, y, w, h, name}] in LAYOUT coords (not screen)
@@ -417,8 +419,12 @@
       .then(function (r) { return r.blob(); })
       .then(function (b) { return createImageBitmap(b); })
       .catch(function () { return null; });
+    prom.then(function (bm) { if (bm) perImageBitmapsSync.set(key, bm); });
     perImageBitmaps.set(key, prom);
     return prom;
+  }
+  function getPerImageBitmapSync(name, tierH) {
+    return perImageBitmapsSync.get(name + '|' + tierH) || null;
   }
 
   function ensureCanvasAndSpacer(thumbsEl) {
@@ -759,6 +765,22 @@
 
     filmstripEl.addEventListener('scroll', onFilmstripScroll, { passive: true });
     filmCanvasEl.addEventListener('click', onFilmstripClick);
+    // User gesture on the filmstrip cancels any in-flight chase animation. Without
+    // this, click-then-scroll fights the chase: the user scrolls, the chase keeps
+    // pulling back toward the click target, and the strip rubber-bands. Touchstart
+    // catches both desktop+mobile mouse-drags (browsers fire touch events on touch
+    // surfaces); wheel covers desktop trackpad/mousewheel.
+    function cancelChaseFromUser() {
+      if (focusChaseRaf) {
+        cancelAnimationFrame(focusChaseRaf);
+        focusChaseRaf = null;
+        focusInProgrammaticScroll = false;
+        commandedIdx = focusedIdx;  // resync so next shiftFocus reads from focusedIdx
+      }
+    }
+    filmstripEl.addEventListener('wheel', cancelChaseFromUser, { passive: true });
+    filmstripEl.addEventListener('touchstart', cancelChaseFromUser, { passive: true });
+    filmstripEl.addEventListener('mousedown', cancelChaseFromUser);
     setupMainImageGestures();
 
     var target = filmScrollForIdx1(focusedIdx, W);
@@ -894,6 +916,7 @@
     if (!g) return;
     var dpr = devicePixelRatio();
     var ctx = mainEl.getContext('2d', { alpha: false });
+    ctx.imageSmoothingQuality = 'high';
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, g.W, g.mainH);
@@ -927,77 +950,110 @@
     var g = mainImageGeom();
     if (!g) return;
 
-    // Sync repaint with cached bitmap if we still have one for this image (pinch case).
-    var hadCached = !!(mainDrawSrc && mainDrawSrc.forIdx === focusedIdx);
-    paintMain();
+    var targetH = g.dh;  // displayed pixel height of the focused image
+    var tier = pickPerImageTier(targetH);
 
-    // If we don't have a bitmap yet for this image (newly-focused), load the atlas
-    // tier and update mainDrawSrc + repaint when it resolves. While in flight the
-    // canvas is just black — better than a stale tile.
-    if (!hadCached) {
+    // Pick the best already-resolved source NOW (target tier > any cached lower
+    // tier > atlas). Set it into mainDrawSrc and paint synchronously.
+    var src = getBestSrcForFocus(focusedIdx, targetH);
+    if (src) {
+      mainDrawSrc = { bitmap: src.bitmap, sx: src.sx, sy: src.sy, sw: src.sw, sh: src.sh, forIdx: focusedIdx };
+      paintMain();
+    } else {
+      // Atlas not loaded yet on first ever entry; clear and wait for atlas .then.
+      mainDrawSrc = null;
+      paintMain();
+    }
+
+    // Kick off the target-tier load if not already in flight; when it resolves we
+    // upgrade mainDrawSrc and repaint. No debounce — we want the highest-res tier
+    // as soon as it's available, including DURING scrubbing.
+    var capturedIdx = focusedIdx;
+    var name = images[capturedIdx];
+    if (name) {
+      loadPerImageBitmap(name, tier).then(function (bm) {
+        if (!mainEl || !bm || focusedIdx !== capturedIdx) return;
+        mainDrawSrc = { bitmap: bm, sx: 0, sy: 0, sw: bm.width, sh: bm.height, forIdx: capturedIdx };
+        paintMain();
+      });
+    }
+
+    // If we didn't have any bitmap at all, also kick off the atlas so the first
+    // frame after entry isn't black for long.
+    if (!src) {
       var atlasH = 50;
       var atlas = spriteMeta.atlases && spriteMeta.atlases[String(atlasH)];
       if (atlas) {
-        var capturedIdx = focusedIdx;
-        loadSpriteBitmapsForAtlas(atlasH).then(function (bitmaps) {
+        loadSpriteBitmapsForAtlas(atlasH).then(function () {
           if (!mainEl || focusedIdx !== capturedIdx) return;
-          var idx0 = capturedIdx - 1;
-          var spriteIdx = Math.floor(idx0 / atlas.cellsPerSprite);
-          var posInSprite = idx0 % atlas.cellsPerSprite;
-          var row = Math.floor(posInSprite / atlas.across);
-          var col = posInSprite % atlas.across;
-          var bitmap = bitmaps[spriteIdx];
-          if (!bitmap) return;
-          var srcW = Math.round(g.natW * atlasH / g.natH);
-          mainDrawSrc = {
-            bitmap: bitmap,
-            sx: col * atlas.cellW, sy: row * atlas.cellH,
-            sw: srcW, sh: atlas.cellH,
-            forIdx: capturedIdx,
-          };
-          paintMain();
+          var atlasSrc = getAtlasSrcSync(capturedIdx);
+          if (!atlasSrc) return;
+          // Only set if we still don't have a better bitmap.
+          if (!mainDrawSrc || mainDrawSrc.forIdx !== capturedIdx) {
+            mainDrawSrc = { bitmap: atlasSrc.bitmap, sx: atlasSrc.sx, sy: atlasSrc.sy, sw: atlasSrc.sw, sh: atlasSrc.sh, forIdx: capturedIdx };
+            paintMain();
+          }
         });
       }
     }
-    // Debounce the high-res upgrade until scrubbing/pinching settles.
-    if (mainUpgradeTimer) clearTimeout(mainUpgradeTimer);
-    mainUpgradeTimer = setTimeout(upgradeMainImage, 150);
+
+    // Prefetch all images currently visible in the filmstrip at the same target tier.
+    prefetchFilmstripVisible(tier);
   }
 
-  // After the user stops scrubbing, upgrade the main image to whatever LoD tier
-  // best matches the displayed pixel size. Above h800 we serve the original.
-  // Also warms ±FOCUS_PREFETCH neighbors at the same tier so a few prev/next
-  // taps after settling are instant.
-  var mainUpgradeTimer = null;
-  function upgradeMainImage() {
-    mainUpgradeTimer = null;
-    if (!mainEl) return;
-    var g = mainImageGeom();
-    if (!g) return;
-    var tier = pickPerImageTier(g.dh);
-    var capturedIdx = focusedIdx;
-    loadPerImageBitmap(g.name, tier).then(function (bm) {
-      if (!mainEl || !bm || focusedIdx !== capturedIdx) return;
-      mainDrawSrc = {
-        bitmap: bm,
-        sx: 0, sy: 0, sw: bm.width, sh: bm.height,
-        forIdx: capturedIdx,
-      };
-      paintMain();
-    });
-    // Prefetch neighbors so prev/next is instant after a settle.
-    for (var d = -FOCUS_PREFETCH; d <= FOCUS_PREFETCH; d++) {
-      if (d === 0) continue;
-      var idx = focusedIdx + d;
-      while (idx < 1) idx += lastimagevalue;
-      while (idx > lastimagevalue) idx -= lastimagevalue;
-      if (images[idx]) loadPerImageBitmap(images[idx], tier);
+  // Walks the filmstrip's currently-visible range (plus a small look-ahead) and fires
+  // loadPerImageBitmap at the requested tier. Caches dedupe so this is cheap on a
+  // continuous scrub — just a Map.has() per tile.
+  function prefetchFilmstripVisible(tier) {
+    if (!filmstripEl || !filmTilePos) return;
+    var W = layoutWidth();
+    var leftEdge = filmstripEl.scrollLeft - filmPadL;
+    var rightEdge = leftEdge + W;
+    // Look ~half a viewport ahead in either direction so a fast scrub stays warm.
+    var lookahead = W * 0.5;
+    var lo = leftEdge - lookahead;
+    var hi = rightEdge + lookahead;
+    var n = filmTilePos.length;
+    // Binary-search start
+    var i = 0, j = n - 1;
+    while (i < j) {
+      var mid = (i + j) >> 1;
+      if (filmTilePos[mid] + filmTileW[mid] <= lo) i = mid + 1;
+      else j = mid;
+    }
+    for (; i < n; i++) {
+      if (filmTilePos[i] > hi) break;
+      var name = images[i + 1];
+      if (name) loadPerImageBitmap(name, tier);
     }
   }
+
+  // Legacy timer slot — drawMainImage now upgrades synchronously and prefetches
+  // the filmstrip-visible window, so this is a no-op kept only to satisfy the
+  // mainUpgradeTimer references that were left in for safety.
+  var mainUpgradeTimer = null;
+  function upgradeMainImage() { mainUpgradeTimer = null; }
 
   // Sync source-rect lookup for an arbitrary image index out of the h50 atlas.
   // Returns null if the atlas isn't loaded yet (caller should fall back to skipping
   // that side of the drag rather than blocking).
+  // Try tiers in descending order until one is cached. If none, fall back to the
+  // atlas (always-fastest). Returns { bitmap, sx, sy, sw, sh } or null.
+  function getBestSrcForFocus(idx1, targetH) {
+    if (idx1 < 1 || idx1 > lastimagevalue) return null;
+    var name = images[idx1];
+    if (!name) return null;
+    var tier = pickPerImageTier(targetH);
+    // Try the picked tier and any smaller pre-built tier we already have cached.
+    var ladder = [tier].concat(PER_IMAGE_TIERS.filter(function (h) { return h < tier || tier === 0; }).reverse());
+    for (var i = 0; i < ladder.length; i++) {
+      var t = ladder[i];
+      var bm = getPerImageBitmapSync(name, t);
+      if (bm) return { bitmap: bm, sx: 0, sy: 0, sw: bm.width, sh: bm.height };
+    }
+    return getAtlasSrcSync(idx1);
+  }
+
   function getAtlasSrcSync(idx1) {
     if (!spriteMeta || !spriteMeta.atlases) return null;
     var atlas = spriteMeta.atlases['50'];
@@ -1035,6 +1091,7 @@
     var mainH = Math.max(120, H - FILM_H);
     var dpr = devicePixelRatio();
     var ctx = mainEl.getContext('2d', { alpha: false });
+    ctx.imageSmoothingQuality = 'high';
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, W, mainH);
@@ -1047,9 +1104,15 @@
       var loc = name && spriteMeta && spriteMeta.imageMap && spriteMeta.imageMap[name];
       if (!loc) return;
       var dest = destRectForLoc(loc.w, CANONICAL_H, W, mainH);
-      var src = (idx1 === focusedIdx && mainDrawSrc && mainDrawSrc.forIdx === idx1)
-        ? mainDrawSrc
-        : getAtlasSrcSync(idx1);
+      // For the centered image the live mainDrawSrc is already the best choice.
+      // For the neighbors that peek in during a swipe, ask getBestSrcForFocus so
+      // we use any cached high-res tier we have for them too, falling back to atlas.
+      var src;
+      if (idx1 === focusedIdx && mainDrawSrc && mainDrawSrc.forIdx === idx1) {
+        src = mainDrawSrc;
+      } else {
+        src = getBestSrcForFocus(idx1, dest.dh);
+      }
       if (!src) return;
       ctx.drawImage(src.bitmap, src.sx, src.sy, src.sw, src.sh, dest.dx + offsetX, dest.dy, dest.dw, dest.dh);
     }
