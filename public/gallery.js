@@ -613,6 +613,7 @@
   // Transform state for the focused image (pinch-zoom). Scale anchored at the image
   // center; reset on every focusedIdx change so each photo opens at 1x.
   var mainScale = 1;
+  var imgTx = 0, imgTy = 0;  // pan offset applied AFTER scale, so a finger drag of N px moves the image N px in screen space (independent of zoom level).
   // Drag state for iCloud-style swipe: while dragging, the focused image translates
   // by dragDX and prev/next images are painted at offset ±viewportW from center, so
   // they peek in from the side as the finger moves. On release we either commit
@@ -620,6 +621,9 @@
   var dragActive = false;
   var dragDX = 0;
   var dragRaf = null;     // animation id for commit/revert
+  // Pan state (single-finger drag while mainScale > 1).
+  var panActive = false;
+  var panStart = null;    // { sx, sy, tx0, ty0 }
   // The source we should draw into the main canvas: bitmap + sub-rect. Updated by
   // drawMainImage (atlas low-res) and upgradeMainImage (high-LoD). Held synchronously
   // so pinch can redraw without the microtask gap that was causing a black flicker
@@ -726,7 +730,7 @@
     var dpr = devicePixelRatio();
     mainEl.width  = Math.round(W * dpr);
     mainEl.height = Math.round(mainH * dpr);
-    mainEl.style.cssText = 'display:block; width:' + W + 'px; height:' + mainH + 'px; background:#000;';
+    mainEl.style.cssText = 'display:block; width:' + W + 'px; height:' + mainH + 'px; background:#000; touch-action:none;';
     thumbsEl.appendChild(mainEl);
 
     filmstripEl = document.createElement('div');
@@ -734,7 +738,8 @@
     filmstripEl.style.cssText =
       'position:absolute; left:0; bottom:0; width:' + W + 'px; height:' + FILM_H + 'px;' +
       'overflow-x:auto; overflow-y:hidden; background:#0a0a0a;' +
-      ' -ms-overflow-style:none; scrollbar-width:none;';
+      ' -ms-overflow-style:none; scrollbar-width:none;' +
+      ' touch-action:pan-x;';
     thumbsEl.appendChild(filmstripEl);
 
     filmCanvasEl = document.createElement('canvas');
@@ -812,6 +817,7 @@
     if (newCenterIdx !== focusedIdx) {
       focusedIdx = newCenterIdx;
       mainScale = 1;
+      imgTx = 0; imgTy = 0;
       mainDrawSrc = null;  // cached bitmap is for the previous image
       try { history.replaceState(null, '', '#' + encodeURIComponent(images[focusedIdx])); } catch (_) {}
     }
@@ -891,6 +897,16 @@
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, g.W, g.mainH);
+    // Order matters here. We want: scale around image center, THEN translate by
+    // (imgTx, imgTy) so a 100px finger drag moves the image 100px on screen
+    // regardless of zoom level. In canvas, the LAST transform applied is the
+    // INNERMOST (closest to drawImage), and operations apply right-to-left, so:
+    //   ctx.translate(tx, ty)        ← applied last in source = first in math
+    // ...wait, actually the convention is: source-order transforms are applied to
+    // coordinates left-to-right (each one wraps the previous), so ctx.translate
+    // before drawImage applies to the draw coords. To translate AFTER scale, the
+    // translate must come BEFORE the scale block in source.
+    if (imgTx !== 0 || imgTy !== 0) ctx.translate(imgTx, imgTy);
     if (mainScale !== 1) {
       var cx = g.W / 2, cy = g.mainH / 2;
       ctx.translate(cx, cy);
@@ -1022,6 +1038,8 @@
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, W, mainH);
+    // No transform when dragging (we only enter the drag path at mainScale === 1).
+    // imgTx/Ty are reset to 0 on focus change, so they don't need to be applied here.
 
     function paintAt(idx1, offsetX) {
       if (idx1 < 1 || idx1 > lastimagevalue) return;
@@ -1138,17 +1156,32 @@
         paintMain();
         return;
       }
-      // Single-finger drag: the image follows the finger; prev/next peek from the sides.
-      if (swipeStart && e.touches.length === 1 && mainScale === 1) {
+      // Single-finger drag.
+      if (swipeStart && e.touches.length === 1) {
+        e.preventDefault();  // unconditionally — touch-action:none on the main canvas
+                             // already kills native scroll, but defensive in case the
+                             // browser ignores touch-action for synthesized events.
+        if (mainScale > 1) {
+          // Pan the zoomed image. Initialize panStart on first move past the deadzone.
+          if (!panActive) {
+            var dxp = e.touches[0].clientX - swipeStart.x;
+            var dyp = e.touches[0].clientY - swipeStart.y;
+            if (Math.abs(dxp) < 6 && Math.abs(dyp) < 6) return;
+            panActive = true;
+            panStart = { sx: e.touches[0].clientX, sy: e.touches[0].clientY, tx0: imgTx, ty0: imgTy };
+          }
+          imgTx = panStart.tx0 + (e.touches[0].clientX - panStart.sx);
+          imgTy = panStart.ty0 + (e.touches[0].clientY - panStart.sy);
+          paintMain();
+          return;
+        }
+        // Not zoomed: iCloud-style horizontal commit/revert swipe.
         var dx = e.touches[0].clientX - swipeStart.x;
         var dy = e.touches[0].clientY - swipeStart.y;
-        // Direction lock: if the gesture is clearly vertical, leave it alone (lets a
-        // future vertical gesture pass through to anyone who wants it).
         if (!dragActive && Math.abs(dy) > Math.abs(dx) && Math.abs(dy) > 8) return;
         if (dragActive || Math.abs(dx) > 6) {
           dragActive = true;
           dragDX = dx;
-          e.preventDefault();
           paintMainDragged(dragDX);
         }
       }
@@ -1158,9 +1191,16 @@
       if (pinchStart && e.touches.length < 2) {
         if (mainScale < 1.05) {
           mainScale = 1;
+          imgTx = 0; imgTy = 0;
           paintMain();
         }
         pinchStart = null;
+      }
+      // Pan end: just settle. (No snap behavior — leave the image where the user left it.)
+      if (panActive) {
+        panActive = false;
+        panStart = null;
+        swipeStart = null;
       }
       // Drag end: commit if dragged > 30% of viewport OR flicked fast. Otherwise revert.
       if (dragActive) {
@@ -1182,6 +1222,7 @@
     });
     mainEl.addEventListener('touchcancel', function () {
       pinchStart = null; swipeStart = null; touchOnMain = false;
+      panActive = false; panStart = null;
       if (dragActive) revertDrag();
     });
   }

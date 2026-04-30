@@ -225,9 +225,13 @@ class BuildQueue {
     return true;
   }
   async enqueueFolder(galleryAbs, opts) {
+    const phase = (opts && opts.phase) || 'all';
     const { images } = await listFolder(galleryAbs);
     let n = 0;
-    for (const f of images) if (this.enqueue(galleryAbs, f, opts)) n++;
+    for (const f of images) {
+      if (!needsBuildForPhase(galleryAbs, f, phase)) continue;
+      if (this.enqueue(galleryAbs, f, opts)) n++;
+    }
     return n;
   }
   // Resolves once the queue is fully drained (no pending, no in-flight workers).
@@ -538,6 +542,30 @@ function runVips(cmd, args, tmp, finalPath) {
       fs.promises.rename(tmp, finalPath).then(resolve, reject);
     });
   });
+}
+
+// True iff at least one tier for the given phase is missing on disk for this image.
+// Used by enqueueFolder to filter out images that have nothing to do for the phase,
+// so the user-facing pending count doesn't include 'fake' work that would just be a
+// no-op fs.existsSync chain.
+function needsBuildForPhase(folderAbs, filename, phase) {
+  const thumbDir = path.join(folderAbs, 'thumbcache');
+  for (const tier of LOD_TIERS) {
+    if (phase === 'v' && tier.format !== 'v') continue;
+    if (phase === 'avif' && tier.format !== 'avif') continue;
+    if (!fs.existsSync(lodPath(thumbDir, filename, tier.h, tier.format))) return true;
+  }
+  // AVIF phase also wants the preview JPEG for big-enough originals.
+  if (phase !== 'v') {
+    try {
+      const st = fs.statSync(path.join(folderAbs, filename));
+      if (st.size >= PREVIEW_SIZE_THRESHOLD) {
+        const previewOut = path.join(folderAbs, 'previewcache', filename + '.resized.jpg');
+        if (!fs.existsSync(previewOut)) return true;
+      }
+    } catch {}
+  }
+  return false;
 }
 
 async function ensureBuilt(folderAbs, filename, opts) {
