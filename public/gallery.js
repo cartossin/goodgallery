@@ -1188,7 +1188,7 @@
       } else if (lastimagevalue > 0) {
         var found = 0;
         for (var j = 1; j <= lastimagevalue; j++) if (raw === images[j]) { inum = j; found = 1; break; }
-        if (found) startimage(); else displaythumbs();
+        if (found) refreshfromhash(); else displaythumbs();
       } else {
         displaythumbs();
       }
