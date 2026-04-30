@@ -208,26 +208,38 @@ class BuildQueue {
     this.workers = 0;
     this.progress = new Map();
   }
-  _key(g, f) { return g + '\0' + f; }
+  _key(g, f, phase) { return g + '\0' + f + '\0' + (phase || 'all'); }
   _bumpProgress(g, fn) {
     const p = this.progress.get(g) || { pending: 0, inProgress: 0, done: 0, total: 0, recent: [] };
     fn(p);
     this.progress.set(g, p);
   }
-  enqueue(galleryAbs, filename) {
-    const k = this._key(galleryAbs, filename);
+  enqueue(galleryAbs, filename, opts) {
+    const phase = (opts && opts.phase) || 'all';
+    const k = this._key(galleryAbs, filename, phase);
     if (this.inFlight.has(k)) return false;
     this.inFlight.add(k);
-    this.queue.push({ galleryAbs, filename });
+    this.queue.push({ galleryAbs, filename, phase });
     this._bumpProgress(galleryAbs, p => { p.pending++; p.total++; });
     this._kick();
     return true;
   }
-  async enqueueFolder(galleryAbs) {
+  async enqueueFolder(galleryAbs, opts) {
     const { images } = await listFolder(galleryAbs);
     let n = 0;
-    for (const f of images) if (this.enqueue(galleryAbs, f)) n++;
+    for (const f of images) if (this.enqueue(galleryAbs, f, opts)) n++;
     return n;
+  }
+  // Resolves once the queue is fully drained (no pending, no in-flight workers).
+  // Useful between phases of the startup scan.
+  drainPromise() {
+    return new Promise((resolve) => {
+      const tick = () => {
+        if (this.queue.length === 0 && this.workers === 0) resolve();
+        else setTimeout(tick, 500);
+      };
+      setTimeout(tick, 500);
+    });
   }
   _kick() {
     while (this.workers < this.concurrency && this.queue.length) {
@@ -238,11 +250,11 @@ class BuildQueue {
   async _runOne() {
     try {
       while (this.queue.length) {
-        const { galleryAbs, filename } = this.queue.shift();
-        const k = this._key(galleryAbs, filename);
+        const { galleryAbs, filename, phase } = this.queue.shift();
+        const k = this._key(galleryAbs, filename, phase);
         this._bumpProgress(galleryAbs, p => { p.pending--; p.inProgress++; });
         try {
-          await ensureBuilt(galleryAbs, filename);
+          await ensureBuilt(galleryAbs, filename, { phase });
           this._bumpProgress(galleryAbs, p => {
             p.done++;
             p.recent.unshift(filename);
@@ -269,7 +281,7 @@ class BuildQueue {
     if (!p) return { pending: 0, inProgress: 0, done: 0, total: 0, recent: [] };
     return { pending: p.pending, inProgress: p.inProgress, done: p.done, total: p.total, recent: p.recent.slice(), lastError: p.lastError };
   }
-  async scanAll(root) {
+  async scanAll(root, opts) {
     let totalQueued = 0;
     const walk = async (dir) => {
       let entries;
@@ -278,7 +290,7 @@ class BuildQueue {
         if (e.name.startsWith('.') || RESERVED.has(e.name)) continue;
         if (e.isDirectory()) await walk(path.join(dir, e.name));
       }
-      totalQueued += await this.enqueueFolder(dir);
+      totalQueued += await this.enqueueFolder(dir, opts);
     };
     await walk(root);
     return totalQueued;
@@ -528,20 +540,23 @@ function runVips(cmd, args, tmp, finalPath) {
   });
 }
 
-async function ensureBuilt(folderAbs, filename) {
+async function ensureBuilt(folderAbs, filename, opts) {
   if (!isImage(filename)) throw new Error('unsupported');
+  // phase: 'v' (atlas inputs only — fast), 'avif' (per-image AVIF tiers + preview),
+  //        'all' (default — both, used by on-demand requests).
+  const phase = (opts && opts.phase) || 'all';
   const src = path.join(folderAbs, filename);
   let st;
   try { st = await fsp.stat(src); } catch { throw new Error('missing original'); }
-  // (debug: log when we touch a file so the user can see preview-vs-original decisions)
   if (process.env.GG_DEBUG_BUILDS) {
-    console.log('[build]', filename, 'size=' + st.size, 'preview=' + (st.size >= PREVIEW_SIZE_THRESHOLD));
+    console.log('[build]', filename, 'phase=' + phase, 'size=' + st.size, 'preview=' + (st.size >= PREVIEW_SIZE_THRESHOLD));
   }
   const thumbDir = path.join(folderAbs, 'thumbcache');
   await fsp.mkdir(thumbDir, { recursive: true });
-  // Build every tier of the LoD ladder that's missing. Each is its own atomic unit.
   let did = 0;
   for (const tier of LOD_TIERS) {
+    if (phase === 'v' && tier.format !== 'v') continue;
+    if (phase === 'avif' && tier.format !== 'avif') continue;
     const out = lodPath(thumbDir, filename, tier.h, tier.format);
     if (fs.existsSync(out)) continue;
     if (tier.format === 'v') {
@@ -551,8 +566,9 @@ async function ensureBuilt(folderAbs, filename) {
     }
     did++;
   }
-  // Preview only for large originals — for small ones the client uses the original directly.
-  if (st.size >= PREVIEW_SIZE_THRESHOLD) {
+  // Preview is part of the AVIF phase (it's a JPEG but only useful at "view" time, not
+  // for the atlas).
+  if (phase !== 'v' && st.size >= PREVIEW_SIZE_THRESHOLD) {
     const previewDir = path.join(folderAbs, 'previewcache');
     await fsp.mkdir(previewDir, { recursive: true });
     const previewOut = path.join(previewDir, filename + '.resized.jpg');
@@ -1732,9 +1748,32 @@ const server = http.createServer((req, res) => {
   if (swept) console.log(`Swept ${swept} orphan tmp file(s) at startup.`);
   await migrateLegacyTrash();
   startWatcher();
-  buildQueue.scanAll(GALLERIES_ROOT).then(n => {
-    if (n) console.log(`Startup scan queued ${n} build job(s) (concurrency=${BUILD_CONCURRENCY}).`);
-  }).catch(e => console.warn('Startup scan error:', e.message));
+  // Two-phase build:
+  //   Phase 1 (.v) — atlas inputs across every gallery. Fast (no AVIF encoding),
+  //                  unblocks the gallery as soon as atlases can build.
+  //   Atlases — fired explicitly per gallery once Phase 1 drains; without this the
+  //             debounced scheduleSpriteBuild would never fire because Phase 2 jumps
+  //             in and keeps the queue busy.
+  //   Phase 2 (avif + preview) — runs in the background; on-demand handler still
+  //                              covers any tier the user actually looks at.
+  (async () => {
+    try {
+      const n1 = await buildQueue.scanAll(GALLERIES_ROOT, { phase: 'v' });
+      if (n1) console.log(`Phase 1 (atlas inputs) queued ${n1} job(s) (concurrency=${BUILD_CONCURRENCY}).`);
+      await buildQueue.drainPromise();
+      // Atlas build for each gallery folder we know about.
+      const galleryDirs = new Set();
+      for (const k of buildQueue.progress.keys()) galleryDirs.add(k);
+      for (const g of galleryDirs) {
+        try { await maybeBuildSprite(g); } catch (e) { console.warn('[sprite]', g, e.message); }
+      }
+      console.log(`Atlases built for ${galleryDirs.size} gallery folder(s); gallery is usable.`);
+      const n2 = await buildQueue.scanAll(GALLERIES_ROOT, { phase: 'avif' });
+      if (n2) console.log(`Phase 2 (per-image AVIFs) queued ${n2} job(s) — running in background.`);
+    } catch (e) {
+      console.warn('Startup scan error:', e.message);
+    }
+  })();
   server.listen(PORT, HOST, () => {
     console.log(`Goodgallery listening on http://${HOST}:${PORT}`);
     console.log(`  galleries root: ${GALLERIES_ROOT}`);
