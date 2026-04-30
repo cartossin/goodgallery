@@ -29,7 +29,7 @@
   // For files smaller than previewThreshold we just use the original — modern browsers
   // scale beautifully, so making a smaller "preview" is wasted disk for small files.
   function thumbURL(name)         { return folderURL + 'thumbcache/'   + encodeURIComponent(name) + '.resized.jpg'; }
-  function previewCacheURL(name)  { return folderURL + 'previewcache/' + encodeURIComponent(name) + '.resized.jpg'; }
+  function previewCacheURL(name)  { return folderURL + 'previewcache/' + encodeURIComponent(name) + '.resized.avif'; }
   function originalURL(name)      { return folderURL + encodeURIComponent(name); }
   // Server transparently serves the original when no preview file exists, so the client
   // never has to know which to ask for. Avoids embedding per-image sizes in the page —
