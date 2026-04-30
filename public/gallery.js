@@ -364,21 +364,24 @@
     return null;  // target is larger than any atlas — caller uses per-image AVIF
   }
 
-  // Per-image LoD: pick the smallest available tier height >= target. The available
-  // per-image tiers (h100/h200/h400/h800) are an architectural decision matching
+  // Per-image LoD: pick the smallest available tier height >= target. Tier 0 is a
+  // sentinel meaning "the original file" — used when the canvas needs more pixels than
+  // h800 provides (high-DPI focus on a 1080p+ display). Available pre-built tiers match
   // the server's LOD_TIERS list.
   var PER_IMAGE_TIERS = [100, 200, 400, 800];
   function pickPerImageTier(targetH) {
     for (var i = 0; i < PER_IMAGE_TIERS.length; i++) {
       if (PER_IMAGE_TIERS[i] >= targetH) return PER_IMAGE_TIERS[i];
     }
-    return PER_IMAGE_TIERS[PER_IMAGE_TIERS.length - 1];
+    return 0;  // request the original
   }
 
   function loadPerImageBitmap(name, tierH) {
     var key = name + '|' + tierH;
     if (perImageBitmaps.has(key)) return perImageBitmaps.get(key);
-    var url = folderURL + 'thumbcache/' + encodeURIComponent(name) + '.h' + tierH + '.avif';
+    var url = tierH === 0
+      ? folderURL + encodeURIComponent(name)
+      : folderURL + 'thumbcache/' + encodeURIComponent(name) + '.h' + tierH + '.avif';
     var prom = fetch(url, { credentials: 'same-origin' })
       .then(function (r) { return r.blob(); })
       .then(function (b) { return createImageBitmap(b); })
