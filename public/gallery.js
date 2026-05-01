@@ -882,7 +882,10 @@
       focusedIdx = newCenterIdx;
       mainScale = 1;
       imgTx = 0; imgTy = 0;
-      mainDrawSrc = null;  // cached bitmap is for the previous image
+      // Don't null mainDrawSrc — keep it as a placeholder so the next paintMain
+      // shows SOMETHING (last good frame) instead of black. drawMainImage will be
+      // called next from onFilmstripScroll and will install a fresh source
+      // immediately (atlas h50 falls out of getBestSrcForFocus).
       try { history.replaceState(null, '', '#' + encodeURIComponent(images[focusedIdx])); } catch (_) {}
     }
 
@@ -978,7 +981,12 @@
       ctx.scale(mainScale, mainScale);
       ctx.translate(-cx, -cy);
     }
-    if (mainDrawSrc && mainDrawSrc.forIdx === focusedIdx) {
+    // Always draw whatever's in mainDrawSrc — even if it's the *previous* image.
+    // This is what stops the canvas from going black during scrubs / focus shifts:
+    // worst case the user sees the last good frame for a few ms while the new
+    // tier (or atlas) loads, then we swap in place. The .then() callbacks below
+    // gate WRITES to mainDrawSrc by capturedIdx, so we never install stale data.
+    if (mainDrawSrc && mainDrawSrc.bitmap) {
       ctx.drawImage(
         mainDrawSrc.bitmap,
         mainDrawSrc.sx, mainDrawSrc.sy, mainDrawSrc.sw, mainDrawSrc.sh,
@@ -1000,12 +1008,10 @@
     var src = getBestSrcForFocus(focusedIdx, targetH);
     if (src) {
       mainDrawSrc = { bitmap: src.bitmap, sx: src.sx, sy: src.sy, sw: src.sw, sh: src.sh, forIdx: focusedIdx };
-      paintMain();
-    } else {
-      // Atlas not loaded yet on first ever entry; clear and wait for atlas .then.
-      mainDrawSrc = null;
-      paintMain();
     }
+    // If src is null (atlas not loaded yet), keep the previous mainDrawSrc so
+    // paintMain still shows the last good frame instead of a black flash.
+    paintMain();
 
     // Kick off the target-tier load if not already in flight; when it resolves we
     // upgrade mainDrawSrc and repaint. No debounce — we want the highest-res tier
@@ -1196,11 +1202,12 @@
       while (newIdx > lastimagevalue) newIdx -= lastimagevalue;
       // Pre-populate the new mainDrawSrc from the atlas if available, so the next paint
       // doesn't black-flicker while the atlas .then() resolves on a microtask.
-      var newSrc = getAtlasSrcSync(newIdx);
+      // Pre-populate with best cached source for the new image. If nothing's
+      // cached, keep the previous mainDrawSrc as a placeholder so paintMain doesn't
+      // black-flash; drawMainImage's load callback will overwrite when ready.
+      var newSrc = getBestSrcForFocus(newIdx, mainImageGeom() && mainImageGeom().dh);
       if (newSrc) {
         mainDrawSrc = { bitmap: newSrc.bitmap, sx: newSrc.sx, sy: newSrc.sy, sw: newSrc.sw, sh: newSrc.sh, forIdx: newIdx };
-      } else {
-        mainDrawSrc = null;
       }
       focusedIdx = newIdx;
       mainScale = 1;
