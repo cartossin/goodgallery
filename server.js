@@ -463,6 +463,137 @@ async function listFolder(absDir) {
   return { folders, images };
 }
 
+// ---------- per-gallery manifest cache ----------
+// Pageviews must NEVER do `readdir` on the gallery dir. Instead they read a tiny
+// JSON file whose contents we keep mirrored in RAM. The manifest is mutated
+// incrementally by every code path that already knows what changed (uploader,
+// trash, restore, mkdir). Full rescan is the only thing that ever readdir's a
+// gallery during normal operation; it's behind an admin button.
+const MANIFEST_VERSION = 1;
+const manifestCache = new Map(); // galleryAbs -> { version, builtAt, folders, images }
+const _natCmp = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' }).compare;
+
+function manifestPathFor(galleryAbs) {
+  return path.join(galleryAbs, GG_DIR, '_manifest.json');
+}
+
+// Always-allowed: this readdir runs cold (full rescan / first-time index / startup
+// warm) — never on a hot pageview path. Cost is paid at most once per gallery per
+// process lifetime.
+async function buildManifestFromDisk(galleryAbs) {
+  const { folders, images } = await listFolder(galleryAbs);
+  return { version: MANIFEST_VERSION, builtAt: Date.now(), folders, images };
+}
+
+async function writeManifest(galleryAbs, m) {
+  const p = manifestPathFor(galleryAbs);
+  await fsp.mkdir(path.dirname(p), { recursive: true });
+  await fsp.writeFile(p + '.tmp', JSON.stringify(m));
+  await fsp.rename(p + '.tmp', p);
+  manifestCache.set(galleryAbs, m);
+}
+
+async function loadManifest(galleryAbs) {
+  const cached = manifestCache.get(galleryAbs);
+  if (cached) return cached;
+  // Try disk — one tiny readFile is allowed on cold-cache pageview.
+  try {
+    const raw = await fsp.readFile(manifestPathFor(galleryAbs), 'utf8');
+    const m = JSON.parse(raw);
+    if (m && m.version === MANIFEST_VERSION && Array.isArray(m.folders) && Array.isArray(m.images)) {
+      manifestCache.set(galleryAbs, m);
+      return m;
+    }
+  } catch {}
+  // Last resort: this gallery was never indexed. Build, persist, cache. The readdir
+  // cost is paid exactly once for this gallery's lifetime in this process.
+  const m = await buildManifestFromDisk(galleryAbs);
+  await writeManifest(galleryAbs, m);
+  return m;
+}
+
+// Insort into a natural-numeric-sorted array. Returns true if inserted, false if dup.
+function insortUnique(arr, name) {
+  let lo = 0, hi = arr.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    const c = _natCmp(arr[mid], name);
+    if (c < 0) lo = mid + 1;
+    else if (c > 0) hi = mid;
+    else return false;
+  }
+  arr.splice(lo, 0, name);
+  return true;
+}
+function spliceName(arr, name) {
+  const i = arr.indexOf(name);
+  if (i < 0) return false;
+  arr.splice(i, 1);
+  return true;
+}
+
+// Mutation helpers. Best-effort: log + swallow errors so a manifest write failure
+// never breaks the user-visible operation. Drift gets fixed by the admin Full
+// rescan button.
+async function manifestAddImage(galleryAbs, name) {
+  try {
+    const m = await loadManifest(galleryAbs);
+    if (insortUnique(m.images, name)) { m.builtAt = Date.now(); await writeManifest(galleryAbs, m); }
+  } catch (e) { console.warn('[manifest:addImage]', galleryAbs, name, e.message); }
+}
+async function manifestRemoveImage(galleryAbs, name) {
+  try {
+    const m = await loadManifest(galleryAbs);
+    if (spliceName(m.images, name)) { m.builtAt = Date.now(); await writeManifest(galleryAbs, m); }
+  } catch (e) { console.warn('[manifest:removeImage]', galleryAbs, name, e.message); }
+}
+async function manifestAddFolder(galleryAbs, name) {
+  try {
+    const m = await loadManifest(galleryAbs);
+    if (insortUnique(m.folders, name)) { m.builtAt = Date.now(); await writeManifest(galleryAbs, m); }
+  } catch (e) { console.warn('[manifest:addFolder]', galleryAbs, name, e.message); }
+}
+
+// Rebuild from disk (drift correction). Used by Full Rescan.
+async function rebuildManifest(galleryAbs) {
+  const m = await buildManifestFromDisk(galleryAbs);
+  await writeManifest(galleryAbs, m);
+  return m;
+}
+
+// Warm pass at startup: walk the tree once and ensure every gallery folder has a
+// manifest on disk. Skips folders that already have one (trust it; rescan fixes drift).
+// Reuses listFolder for the walk — paid once at startup.
+async function warmManifests(rootAbs) {
+  let built = 0;
+  async function walk(dir) {
+    let entries;
+    try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { return; }
+    const subdirs = [];
+    let hasContent = false;
+    for (const e of entries) {
+      if (e.name.startsWith('.')) continue;
+      if (e.isDirectory()) {
+        if (!RESERVED.has(e.name)) { subdirs.push(e.name); hasContent = true; }
+      } else if (e.isFile() && isImage(e.name)) {
+        hasContent = true;
+      }
+    }
+    if (hasContent && !fs.existsSync(manifestPathFor(dir))) {
+      try { await rebuildManifest(dir); built++; }
+      catch (e) { console.warn('[warmManifests]', dir, e.message); }
+    }
+    for (const sub of subdirs) await walk(path.join(dir, sub));
+  }
+  // Root itself counts as a gallery.
+  if (!fs.existsSync(manifestPathFor(rootAbs))) {
+    try { await rebuildManifest(rootAbs); built++; }
+    catch (e) { console.warn('[warmManifests:root]', e.message); }
+  }
+  await walk(rootAbs);
+  if (built) console.log(`Built ${built} initial manifest(s).`);
+}
+
 // ---------- image build via vipsthumbnail ----------
 // vipsthumbnail handles sizing + orientation + JPEG output. Atomic via .tmp rename.
 // Preserve-aspect thumb (used for previews of large originals).
@@ -1026,7 +1157,9 @@ async function handleUploadAPI(req, res, pathname, method) {
     try { await fsp.rm(path.join(UPLOAD_DIR, id), { recursive: true, force: true }); } catch {}
     uploads.delete(id);
 
-    // Trigger build (fs.watch may also fire — buildQueue dedupe handles it)
+    // Update manifest + trigger build. Awaited so the next pageview reflects the new
+    // image even if the client races to refresh immediately.
+    await manifestAddImage(targetAbs, info.filename);
     buildQueue.enqueue(targetAbs, info.filename);
 
     return sendJson(res, 200, { ok: true, path: info.targetFolderRel + info.filename });
@@ -1325,7 +1458,10 @@ async function handle(req, res) {
     const name = q.get('mkdir').trim();
     if (!name || /[\/\\\x00]/.test(name) || name.startsWith('.') || RESERVED.has(name))
       return badRequest(res, 'invalid name');
-    await fsp.mkdir(path.join(abs, name), { recursive: false }).catch(() => {});
+    let made = true;
+    try { await fsp.mkdir(path.join(abs, name), { recursive: false }); }
+    catch { made = false; }
+    if (made) await manifestAddFolder(abs, name);
     return sendJson(res, 200, { ok: true });
   }
   if (q.has('upload') && method === 'POST') {
@@ -1333,8 +1469,9 @@ async function handle(req, res) {
     return handleUpload(req, res, abs, q);
   }
 
-  // Render gallery page
-  const { folders, images } = await listFolder(abs);
+  // Render gallery page (manifest-cached: never readdir on the hot path).
+  const m = await loadManifest(abs);
+  const folders = m.folders, images = m.images;
   let spriteMeta = await readSpriteMeta(abs);
   if (!spriteIsCurrent(spriteMeta, images, abs)) spriteMeta = null;
   const html = galleryHTML({
@@ -1426,9 +1563,11 @@ async function movetotrash(abs, filename) {
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     const dst2 = path.join(path.dirname(dst), `${base}.trashed-${stamp}${ext}`);
     await fsp.rename(src, dst2);
+    await manifestRemoveImage(abs, filename);
     return `${filename} moved to trash (renamed to avoid collision)`;
   }
   await fsp.rename(src, dst);
+  await manifestRemoveImage(abs, filename);
   return `${filename} moved to trash`;
 }
 
@@ -1439,6 +1578,11 @@ async function restoreByPath(relPath) {
   if (fs.existsSync(dst)) throw new Error(`a file at ${relPath} already exists`);
   await fsp.mkdir(path.dirname(dst), { recursive: true });
   await fsp.rename(src, dst);
+  // Update manifest of the destination gallery.
+  const segs = relPath.split('/').filter(Boolean);
+  const filename = segs.pop();
+  const galleryAbs = path.join(GALLERIES_ROOT, ...segs);
+  await manifestAddImage(galleryAbs, filename);
   // Clean up empty trash subdirs left behind
   let parent = path.dirname(src);
   while (parent.startsWith(TRASH_DIR + path.sep)) {
@@ -1601,9 +1745,28 @@ async function handleAdminAPI(req, res, pathname, method) {
     // block; client can poll ?build-status on individual galleries.
     (async () => {
       try {
+        // Rebuild every manifest from disk (drift correction for files dropped via rsync
+        // / mv outside the uploader). Walks the tree once.
+        let rebuilt = 0;
+        async function walkRebuild(dir) {
+          let entries;
+          try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { return; }
+          let hasContent = false;
+          const subs = [];
+          for (const e of entries) {
+            if (e.name.startsWith('.')) continue;
+            if (e.isDirectory()) {
+              if (!RESERVED.has(e.name)) { subs.push(e.name); hasContent = true; }
+            } else if (e.isFile() && isImage(e.name)) hasContent = true;
+          }
+          if (hasContent) { try { await rebuildManifest(dir); rebuilt++; } catch (e) { console.warn('[fullrescan:manifest]', dir, e.message); } }
+          for (const sub of subs) await walkRebuild(path.join(dir, sub));
+        }
+        try { await rebuildManifest(GALLERIES_ROOT); rebuilt++; } catch {}
+        await walkRebuild(GALLERIES_ROOT);
         const a = await buildQueue.scanAll(GALLERIES_ROOT, { phase: 'v' });
         const b = await buildQueue.scanAll(GALLERIES_ROOT, { phase: 'avif' });
-        console.log('[fullrescan] enqueued v=' + a + ' avif=' + b);
+        console.log('[fullrescan] manifests=' + rebuilt + ' v=' + a + ' avif=' + b);
       } catch (e) { console.warn('[fullrescan]', e.message); }
     })();
     return sendJson(res, 200, { ok: true, started: true });
@@ -1758,6 +1921,7 @@ const server = http.createServer((req, res) => {
   if (swept) console.log(`Swept ${swept} orphan tmp file(s) at startup.`);
   await migrateLegacyTrash();
   await migrateLegacyThumbcache();
+  await warmManifests(GALLERIES_ROOT);
   // Two-phase build:
   //   Phase 1 (.v) — atlas inputs across every gallery. Fast (no AVIF encoding),
   //                  unblocks the gallery as soon as atlases can build.
