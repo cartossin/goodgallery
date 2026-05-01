@@ -228,7 +228,9 @@
 
   // Compute total layout height for a given row-height target without rendering. Mirrors
   // layoutRows()/finalizeRow() exactly so fit-all is accurate.
-  var ROW_GAP = 2;  // matches CSS .row gap
+  // Proportional grid gap: 2.5% of the target row height. Floors to 0 at very small
+  // tile sizes so e.g. h5 atlas tiles butt up against each other (no visible gap).
+  function rowGap(H) { return Math.max(0, Math.floor(H * 0.025)); }
   function simulateLayoutHeight(H, W) {
     if (!window.spriteMeta) return 0;
     var rows = 0, totalH = 0;
@@ -237,15 +239,15 @@
       var name = images[i];
       var loc = spriteMeta.imageMap[name];
       var natW = (loc ? loc.w : CANONICAL_H) * H / CANONICAL_H;
-      if (count > 0 && (natRowW + ROW_GAP * count + natW) > W) {
+      if (count > 0 && (natRowW + rowGap(H) * count + natW) > W) {
         // close row
-        var rowScale = Math.min(1.5, (W - ROW_GAP * (count - 1)) / Math.max(1, natRowW));
-        totalH += H * rowScale + ROW_GAP;
+        var rowScale = Math.min(1.5, (W - rowGap(H) * (count - 1)) / Math.max(1, natRowW));
+        totalH += H * rowScale + rowGap(H);
         rows++; natRowW = 0; count = 0;
       }
       natRowW += natW; count++;
     }
-    if (count > 0) totalH += H + ROW_GAP;  // last row at natural height
+    if (count > 0) totalH += H + rowGap(H);  // last row at natural height
     return totalH;
   }
 
@@ -281,8 +283,8 @@
       var loc = spriteMeta.imageMap[name];
       var natW = (loc ? loc.w : CANONICAL_H) * H / CANONICAL_H;
       // Available content width = W minus inter-thumb gaps for items already in row.
-      var avail = W - ROW_GAP * Math.max(0, current.length - 1);
-      if (current.length > 0 && (natRowW + natW + ROW_GAP) > W) {
+      var avail = W - rowGap(H) * Math.max(0, current.length - 1);
+      if (current.length > 0 && (natRowW + natW + rowGap(H)) > W) {
         rows.push(finalizeRow(current, natRowW, H, W, false));
         current = []; natRowW = 0;
       }
@@ -294,7 +296,7 @@
   }
 
   function finalizeRow(items, natRowW, H, W, isLast) {
-    var contentW = W - ROW_GAP * Math.max(0, items.length - 1);
+    var contentW = W - rowGap(H) * Math.max(0, items.length - 1);
     var rowScale = isLast ? 1 : Math.min(1.5, contentW / Math.max(1, natRowW));
     return {
       items: items.map(function (it) {
@@ -403,6 +405,58 @@
   }
   function getPerImageBitmapSync(name, tierH) {
     return perImageBitmapsSync.get(name + '|' + tierH) || null;
+  }
+
+  // Returns the best per-image bitmap that's already in the sync cache, preferring
+  // the requested tier, then any smaller cached tier. Returns null if nothing is
+  // cached — caller should fall back to the atlas. This is what stops the canvas
+  // from going black during a zoom slide: we paint whatever resolution we already
+  // have, then upgrade in-place when the target tier finishes loading.
+  function bestCachedPerImage(name, targetTier) {
+    if (targetTier === 0) {
+      // 'original' requested; any cached tier is acceptable as a placeholder.
+      for (var i = PER_IMAGE_TIERS.length - 1; i >= 0; i--) {
+        var bm = getPerImageBitmapSync(name, PER_IMAGE_TIERS[i]);
+        if (bm) return bm;
+      }
+      return null;
+    }
+    var bm = getPerImageBitmapSync(name, targetTier);
+    if (bm) return bm;
+    for (var i = PER_IMAGE_TIERS.length - 1; i >= 0; i--) {
+      if (PER_IMAGE_TIERS[i] >= targetTier) continue;
+      var bm2 = getPerImageBitmapSync(name, PER_IMAGE_TIERS[i]);
+      if (bm2) return bm2;
+    }
+    return null;
+  }
+
+  // Atlas-source lookup by image name. Returns the best-loaded atlas tier (h50 if
+  // available, else h10, else h5). Used as the deepest fallback for the no-black
+  // ladder.
+  function bestCachedAtlasSrc(name) {
+    if (!window.spriteMeta || !spriteMeta.atlases) return null;
+    var loc = spriteMeta.imageMap && spriteMeta.imageMap[name];
+    if (!loc) return null;
+    var heights = ['50', '10', '5'];
+    for (var hi = 0; hi < heights.length; hi++) {
+      var key = heights[hi];
+      var atlas = spriteMeta.atlases[key];
+      if (!atlas) continue;
+      var bitmaps = atlasBitmapsSync[key];
+      if (!bitmaps) continue;
+      var idx = loc.idx;
+      var spriteIdx = Math.floor(idx / atlas.cellsPerSprite);
+      var bitmap = bitmaps[spriteIdx];
+      if (!bitmap) continue;
+      var posInSprite = idx % atlas.cellsPerSprite;
+      var row = Math.floor(posInSprite / atlas.across);
+      var col = posInSprite % atlas.across;
+      var canonicalH = 200;
+      var srcW = Math.round(loc.w * (atlas.cellH / canonicalH));
+      return { bitmap: bitmap, sx: col * atlas.cellW, sy: row * atlas.cellH, sw: srcW, sh: atlas.cellH };
+    }
+    return null;
   }
 
   function ensureCanvasAndSpacer(thumbsEl) {
@@ -544,6 +598,16 @@
       // fills in progressively as bitmaps resolve.
       var tierH = pickPerImageTier(currentRowHeight);
       visible.forEach(function (t) {
+        // Paint whatever's already in cache so the tile never goes black during a
+        // zoom slide. Prefer the picked tier; fall back to any smaller cached tier;
+        // ultimately fall back to the atlas. Then upgrade asynchronously.
+        var cached = bestCachedPerImage(t.name, tierH);
+        if (cached) {
+          ctx.drawImage(cached, 0, 0, cached.width, cached.height, t.x, t.y - scrollY, t.w, t.h);
+        } else {
+          var as = bestCachedAtlasSrc(t.name);
+          if (as) ctx.drawImage(as.bitmap, as.sx, as.sy, as.sw, as.sh, t.x, t.y - scrollY, t.w, t.h);
+        }
         loadPerImageBitmap(t.name, tierH).then(function (bitmap) {
           if (!canvasEl || !bitmap || renderFrame !== myFrame) return;
           ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -1310,7 +1374,8 @@
     currentRowHeight = H;  // drawCanvasForScroll uses this to pick the atlas
     var rows = layoutRows(H);
     var totalH = 0;
-    for (var i = 0; i < rows.length; i++) totalH += rows[i].height + ROW_GAP;
+    var GAP = rowGap(H);
+    for (var i = 0; i < rows.length; i++) totalH += rows[i].height + GAP;
     lastTotalH = totalH;
 
     // Configure #thumbs as the scroll container
@@ -1343,9 +1408,9 @@
       for (var j = 0; j < rows[r].items.length; j++) {
         var it = rows[r].items[j];
         lastTileRects.push({ x: x, y: y, w: it.w, h: it.h, idx: it.index, name: images[it.index] });
-        x += it.w + ROW_GAP;
+        x += it.w + GAP;
       }
-      y += rows[r].height + ROW_GAP;
+      y += rows[r].height + GAP;
     }
 
     // Restore scroll position: anchor on the previously-top-left image so zoom doesn't

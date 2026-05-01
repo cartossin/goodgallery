@@ -47,6 +47,11 @@ const LOD_TIERS = [
 function lodPath(thumbDir, filename, height, format) {
   return path.join(thumbDir, filename + '.h' + height + '.' + format);
 }
+
+// Heights at which we build sprite atlases. Drives the staged build order: each
+// stage drains all images for one h, then bakes that single atlas, so the gallery
+// becomes usable after just the smallest tier — not after every tier.
+const ATLAS_TIERS = [5, 10, 50];
 const THUMB_CELL       = parseInt(process.env.THUMB_CELL || '200', 10);
 const THUMB_DIM        = THUMB_CELL;  // alias for clarity in build path
 const SPRITE_ACROSS      = parseInt(process.env.SPRITE_ACROSS || '20', 10);   // cells per row (target)
@@ -689,11 +694,21 @@ function runVips(cmd, args, tmp, finalPath) {
 // Used by enqueueFolder to filter out images that have nothing to do for the phase,
 // so the user-facing pending count doesn't include 'fake' work that would just be a
 // no-op fs.existsSync chain.
+function phaseAccepts(phase, tier) {
+  if (!phase || phase === 'all') return true;
+  if (phase === 'v') return tier.format === 'v';
+  if (phase === 'avif') return tier.format === 'avif';
+  // 'h5' / 'h10' / 'h50' / etc. — the specific atlas-input tier.
+  if (phase.charCodeAt(0) === 104 /* 'h' */) {
+    return tier.h === parseInt(phase.slice(1), 10);
+  }
+  return false;
+}
+
 function needsBuildForPhase(folderAbs, filename, phase) {
   const thumbDir = path.join(folderAbs, GG_DIR);
   for (const tier of LOD_TIERS) {
-    if (phase === 'v' && tier.format !== 'v') continue;
-    if (phase === 'avif' && tier.format !== 'avif') continue;
+    if (!phaseAccepts(phase, tier)) continue;
     if (!fs.existsSync(lodPath(thumbDir, filename, tier.h, tier.format))) return true;
   }
   return false;
@@ -701,8 +716,8 @@ function needsBuildForPhase(folderAbs, filename, phase) {
 
 async function ensureBuilt(folderAbs, filename, opts) {
   if (!isImage(filename)) throw new Error('unsupported');
-  // phase: 'v' (atlas inputs only — fast), 'avif' (per-image AVIF tiers + preview),
-  //        'all' (default — both, used by on-demand requests).
+  // phase: 'h5' / 'h10' / 'h50' (one specific atlas-input tier), 'v' (all
+  //        atlas-input .v tiers), 'avif' (per-image AVIF tiers), 'all' (everything).
   const phase = (opts && opts.phase) || 'all';
   const src = path.join(folderAbs, filename);
   let st;
@@ -714,8 +729,7 @@ async function ensureBuilt(folderAbs, filename, opts) {
   await fsp.mkdir(thumbDir, { recursive: true });
   let did = 0;
   for (const tier of LOD_TIERS) {
-    if (phase === 'v' && tier.format !== 'v') continue;
-    if (phase === 'avif' && tier.format !== 'avif') continue;
+    if (!phaseAccepts(phase, tier)) continue;
     const out = lodPath(thumbDir, filename, tier.h, tier.format);
     if (fs.existsSync(out)) continue;
     if (tier.format === 'v') {
@@ -949,6 +963,80 @@ async function maybeBuildSprite(galleryAbs) {
   try { await buildSpriteForFolder(galleryAbs); }
   catch (e) { console.warn('[sprite]', galleryAbs, e.message); }
   finally { spriteInFlight.delete(galleryAbs); }
+}
+
+// Build the atlas for ONE tier and merge into the existing _sprite.json. Used by
+// the staged startup build so the gallery becomes browsable as soon as the h5
+// tier is ready, instead of waiting for every tier's .v files + every atlas.
+// Idempotent: returns existing meta if this tier's atlas already covers the
+// current image count.
+async function maybeBuildSpriteAtTier(galleryAbs, tierH) {
+  if (spriteInFlight.has(galleryAbs)) return;
+  spriteInFlight.add(galleryAbs);
+  try {
+    const m = await loadManifest(galleryAbs);
+    const images = m.images;
+    if (images.length === 0) return null;
+    const thumbDir = path.join(galleryAbs, GG_DIR);
+    const tierDef = LOD_TIERS.find(t => t.h === tierH);
+    if (!tierDef) throw new Error('unknown atlas tier h' + tierH);
+
+    // Skip if this tier is already current.
+    let meta = await readSpriteMeta(galleryAbs);
+    if (meta && meta.version === 3 && meta.atlases && meta.atlases[String(tierH)] &&
+        meta.imageCount === images.length) {
+      return meta;
+    }
+
+    // Verify every image has this specific tier on disk.
+    for (const f of images) {
+      if (!fs.existsSync(lodPath(thumbDir, f, tierH, tierDef.format))) return null;
+    }
+
+    // Aspect ratios. Read from this tier (any tier gives the same w/h ratio).
+    const aspects = images.map(f => {
+      const d = readVipsHeader(lodPath(thumbDir, f, tierH, tierDef.format));
+      return d && d.h ? d.w / d.h : 1.6;
+    });
+
+    const SPRITE_CELL_W_MAX = parseInt(process.env.SPRITE_CELL_W_MAX || '600', 10);
+    const atlas = await buildAtlasAtHeight(thumbDir, images, aspects, tierH, tierDef.format, SPRITE_CELL_W_MAX);
+
+    // Merge into existing meta (or seed one).
+    if (!meta || meta.version !== 3 || !meta.atlases) {
+      meta = { version: 3, atlases: {}, imageCount: images.length, builtAt: Date.now() };
+    } else {
+      meta.imageCount = images.length;
+      meta.builtAt = Date.now();
+    }
+    meta.atlases[String(tierH)] = atlas;
+
+    // Imagemap is tier-independent; write once if missing.
+    const imagemapPath = path.join(thumbDir, '_imagemap.bin');
+    if (!fs.existsSync(imagemapPath)) {
+      await writeBinaryImagemap(thumbDir, images, aspects);
+    }
+
+    const metaPath = path.join(thumbDir, '_sprite.json');
+    await fsp.writeFile(metaPath + '.tmp', JSON.stringify(meta));
+    await fsp.rename(metaPath + '.tmp', metaPath);
+    spriteMetaCache.set(galleryAbs, meta);
+
+    // GC stale sprite files for THIS tier only (don't touch other tiers' sprites).
+    const referenced = new Set();
+    for (const sp of atlas.sprites) referenced.add(sp.file);
+    for (const e of await fsp.readdir(thumbDir)) {
+      const m2 = e.match(/^sprite-h(\d+)-\d+\.(jpg|avif)$/);
+      if (m2 && parseInt(m2[1], 10) === tierH && !referenced.has(e)) {
+        try { await fsp.unlink(path.join(thumbDir, e)); } catch {}
+      }
+    }
+    return meta;
+  } catch (e) {
+    console.warn('[sprite h' + tierH + ']', galleryAbs, e.message);
+  } finally {
+    spriteInFlight.delete(galleryAbs);
+  }
 }
 
 // Debounce sprite rebuilds. Without this, dropping 1000 files into a folder triggers
@@ -1725,9 +1813,12 @@ async function handleAdminAPI(req, res, pathname, method) {
         }
         try { await rebuildManifest(GALLERIES_ROOT); rebuilt++; } catch {}
         await walkRebuild(GALLERIES_ROOT);
-        const a = await buildQueue.scanAll(GALLERIES_ROOT, { phase: 'v' });
+        let queuedV = 0;
+        for (const tierH of ATLAS_TIERS) {
+          queuedV += await buildQueue.scanAll(GALLERIES_ROOT, { phase: 'h' + tierH });
+        }
         const b = await buildQueue.scanAll(GALLERIES_ROOT, { phase: 'avif' });
-        console.log('[fullrescan] manifests=' + rebuilt + ' v=' + a + ' avif=' + b);
+        console.log('[fullrescan] manifests=' + rebuilt + ' v=' + queuedV + ' avif=' + b);
       } catch (e) { console.warn('[fullrescan]', e.message); }
     })();
     return sendJson(res, 200, { ok: true, started: true });
@@ -1893,14 +1984,8 @@ const server = http.createServer((req, res) => {
   //                              covers any tier the user actually looks at.
   (async () => {
     try {
-      const n1 = await buildQueue.scanAll(GALLERIES_ROOT, { phase: 'v' });
-      if (n1) console.log(`Phase 1 (atlas inputs) queued ${n1} job(s) (concurrency=${BUILD_CONCURRENCY}).`);
-      await buildQueue.drainPromise();
-      // Atlas build for each gallery folder we know about.
-      // Walk every gallery dir (not just ones that had Phase 1 work) and call
-      // maybeBuildSprite on each. The function itself is now idempotent — it returns
-      // the existing meta when the sprite is current, so this is cheap on restart and
-      // expensive only when something genuinely needs building.
+      // Walk the tree once up-front to know which gallery folders contain images;
+      // we'll bake atlases for each one after each tier completes.
       const galleryDirs = new Set();
       async function walkForSprites(dir) {
         let entries;
@@ -1917,19 +2002,25 @@ const server = http.createServer((req, res) => {
         for (const sub of subs) await walkForSprites(path.join(dir, sub));
       }
       await walkForSprites(GALLERIES_ROOT);
-      let built = 0, skipped = 0;
-      for (const g of galleryDirs) {
-        try {
-          const before = fs.existsSync(path.join(g, GG_DIR, '_sprite.json'));
-          await maybeBuildSprite(g);
-          // Heuristic: if the sprite file existed before and exists after, count as skipped
-          const after = fs.existsSync(path.join(g, GG_DIR, '_sprite.json'));
-          if (before && after) skipped++; else built++;
-        } catch (e) { console.warn('[sprite]', g, e.message); }
+
+      // Staged build: smallest atlas tier first, so the gallery becomes browsable
+      // after just h5 (~33% of the total .v work) instead of waiting for h10 + h50
+      // too. After each tier's .v files drain, bake that one atlas across every
+      // gallery and merge into _sprite.json — the client's pickAtlasHeight picks
+      // whatever atlas heights are currently available.
+      for (const tierH of ATLAS_TIERS) {
+        const n = await buildQueue.scanAll(GALLERIES_ROOT, { phase: 'h' + tierH });
+        if (n) console.log(`Phase h${tierH}: queued ${n} job(s) (concurrency=${BUILD_CONCURRENCY}).`);
+        await buildQueue.drainPromise();
+        for (const g of galleryDirs) {
+          try { await maybeBuildSpriteAtTier(g, tierH); }
+          catch (e) { console.warn('[sprite h' + tierH + ']', g, e.message); }
+        }
+        console.log(`Atlas h${tierH} ready across ${galleryDirs.size} gallery folder(s).`);
       }
-      console.log(`Atlases: built ${built}, current ${skipped} (across ${galleryDirs.size} gallery folder(s)); gallery is usable.`);
+
       const n2 = await buildQueue.scanAll(GALLERIES_ROOT, { phase: 'avif' });
-      if (n2) console.log(`Phase 2 (per-image AVIFs) queued ${n2} job(s) — running in background.`);
+      if (n2) console.log(`Per-image AVIFs queued ${n2} job(s) — running in background.`);
     } catch (e) {
       console.warn('Startup scan error:', e.message);
     }
