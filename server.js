@@ -68,9 +68,11 @@ const MAX_SPRITE_PIXELS   = Math.max(1, Math.floor(MAX_SPRITE_BYTES / BYTES_PER_
 // space-separated arg of input paths, so each ~90-char path costs that much. Cap
 // hard at 2000 tiles per sprite so we never trip E2BIG. With 21 sprites per h-tier
 // at the 41k OI scale this is fine — client loads sprites lazily anyway.
-const MAX_TILES_PER_SPRITE = parseInt(process.env.MAX_TILES_PER_SPRITE || '1200', 10);
-// Linux MAX_ARG_STRLEN is 128 KB per single argv arg; with ~85-char LoD paths that
-// gives us a hard ceiling around ~1500 tiles per sprite. 1200 leaves margin.
+// Per-arrayjoin-call cap (Linux MAX_ARG_STRLEN is 128 KB per argv arg, ~85-char
+// paths → ~1500 paths max). Sprites larger than this are built via chunked
+// arrayjoin: row-strip sub-atlases, then vertical arrayjoin. Sprite SIZE is
+// still capped purely by pixel budget (MAX_SPRITE_PIXELS), not tile count.
+const ARRAYJOIN_TILES_PER_CALL = parseInt(process.env.ARRAYJOIN_TILES_PER_CALL || '1000', 10);
 
 const THUMB_QUALITY    = parseInt(process.env.THUMB_QUALITY || '82', 10);
 // Originals smaller than this skip preview generation — the client uses the original directly.
@@ -910,8 +912,7 @@ async function buildAtlasAtHeight(thumbDir, images, aspects, height, inputFormat
   // also bounded by the gallery size (don't allocate space for more cells than exist).
   const cellsPerSprite = Math.max(1, Math.min(
     images.length,
-    Math.floor(MAX_SPRITE_PIXELS / cellArea),
-    MAX_TILES_PER_SPRITE
+    Math.floor(MAX_SPRITE_PIXELS / cellArea)
   ));
   // Choose `across` so each sprite is roughly square: across*cellW ≈ rows*cellH.
   // This keeps sprite dimensions sane at any cell size — a 5×9 cell atlas with 50,000
@@ -923,25 +924,69 @@ async function buildAtlasAtHeight(thumbDir, images, aspects, height, inputFormat
   try {
     for (let c = 0; c < numChunks; c++) {
       const chunk = images.slice(c * cellsPerSprite, (c + 1) * cellsPerSprite);
-      // arrayjoin uses argument order, so pass LoD paths directly. No staging
-      // hardlinks needed — they only added path length and a syscall per tile.
       const inputPaths = chunk.map(name => lodPath(thumbDir, name, height, inputFormat));
       const spriteFile = 'sprite-h' + height + '-' + c + '.avif';
       const spriteAbs = path.join(thumbDir, spriteFile);
       const tmp = spriteAbs + '.__tmp.avif';
       const vTmp = tmp + '.v';
-      console.log('[sprite] building ' + spriteFile + ': ' + chunk.length + ' tiles, cell ' + cellW + 'x' + cellH + ', across ' + across);
-      await runStep('vips', [
-        'arrayjoin', inputPaths.join(' '), vTmp,
-        '--across', String(across),
-        '--hspacing', String(cellW),
-        '--vspacing', String(cellH),
-        '--background', '0',
-      ], vTmp);
-      await runStep('vips', [
-        'heifsave', vTmp, tmp,
-        '--Q', '80',
-      ], tmp);
+
+      if (inputPaths.length <= ARRAYJOIN_TILES_PER_CALL) {
+        // Single arrayjoin — fits in one argv pass.
+        console.log('[sprite] building ' + spriteFile + ': ' + chunk.length + ' tiles, cell ' + cellW + 'x' + cellH + ', across ' + across);
+        await runStep('vips', [
+          'arrayjoin', inputPaths.join(' '), vTmp,
+          '--across', String(across),
+          '--hspacing', String(cellW),
+          '--vspacing', String(cellH),
+          '--background', '0',
+        ], vTmp);
+      } else {
+        // Chunked arrayjoin: build row-strip sub-atlases (K complete rows each),
+        // then vertical-arrayjoin the strips. K is chosen so K * across ≤
+        // ARRAYJOIN_TILES_PER_CALL, keeping each sub's argv well under the limit.
+        // Math works because each strip is exactly K * across tiles in row-major
+        // order; stacking strips vertically preserves the row index a tile would
+        // have in a single non-chunked atlas. See spec discussion 2026-05-01.
+        const rowsPerSub = Math.max(1, Math.floor(ARRAYJOIN_TILES_PER_CALL / across));
+        const tilesPerSub = rowsPerSub * across;
+        const numSubs = Math.ceil(inputPaths.length / tilesPerSub);
+        console.log('[sprite] building ' + spriteFile + ': ' + chunk.length + ' tiles via ' + numSubs + ' sub-atlas(es) of ' + rowsPerSub + ' rows each, cell ' + cellW + 'x' + cellH + ', across ' + across);
+        const stagingDir = path.join(thumbDir, '_sprite_staging_h' + height);
+        await fsp.mkdir(stagingDir, { recursive: true });
+        const subPaths = [];
+        try {
+          for (let si = 0; si < numSubs; si++) {
+            const subStart = si * tilesPerSub;
+            const subEnd = Math.min(inputPaths.length, subStart + tilesPerSub);
+            const subTiles = inputPaths.slice(subStart, subEnd);
+            const subTmp = path.join(stagingDir, 'c' + c + '_sub' + si + '.v');
+            await runStep('vips', [
+              'arrayjoin', subTiles.join(' '), subTmp,
+              '--across', String(across),
+              '--hspacing', String(cellW),
+              '--vspacing', String(cellH),
+              '--background', '0',
+            ], subTmp);
+            subPaths.push(subTmp);
+          }
+          // Vertical-stack the row-strips. vspacing = rowsPerSub * cellH so all
+          // strips line up; the last strip may be shorter (partial rows) but is
+          // placed in the same vspacing slot — leaves background pixels below it
+          // which the client never indexes into.
+          await runStep('vips', [
+            'arrayjoin', subPaths.join(' '), vTmp,
+            '--across', '1',
+            '--hspacing', String(across * cellW),
+            '--vspacing', String(rowsPerSub * cellH),
+            '--background', '0',
+          ], vTmp);
+        } finally {
+          // Always clean up sub-atlases + staging dir.
+          await fsp.rm(stagingDir, { recursive: true, force: true }).catch(()=>{});
+        }
+      }
+
+      await runStep('vips', ['heifsave', vTmp, tmp, '--Q', '80'], tmp);
       await fsp.unlink(vTmp).catch(()=>{});
       await fsp.rename(tmp, spriteAbs);
       sprites.push({ file: spriteFile, count: chunk.length });
