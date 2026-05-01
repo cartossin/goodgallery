@@ -3,8 +3,10 @@
 //
 // Preserves the 2014 URL/data layout:
 //   GALLERIES_ROOT/<path...>/<image>            originals
-//   GALLERIES_ROOT/<path...>/thumbcache/<image>.resized.jpg
-//   GALLERIES_ROOT/<path...>/ggTrash/<image>    soft-deleted
+//   GALLERIES_ROOT/<path...>/gg/<image>.h<H>.<format>   per-image LoDs (avif/v)
+//   GALLERIES_ROOT/<path...>/gg/sprite-h<H>-<N>.avif    sprite atlases
+//   GALLERIES_ROOT/<path...>/gg/_manifest.json          per-gallery manifest
+//   STATE_DIR/trash/<rel-path>/<image>                  soft-deleted (global)
 //
 // New: folder hierarchy. Each folder is its own gallery; subfolders appear
 // as cards in the parent. Folder URL = the path itself, ending with `/`.
@@ -65,7 +67,11 @@ const SESSION_DURATION = 24 * 60 * 60 * 1000;
 const RP_NAME          = SITE_TITLE;
 
 // reserved on-disk names that are NOT user content
-const RESERVED = new Set(['thumbcache', 'previewcache', 'ggTrash']);
+// Each gallery folder owns a single child dir named GG_DIR for all of its derived
+// state (manifest, per-image LoDs, atlases, etc). Legacy names stay in RESERVED so any
+// pre-migration dirs remain hidden from listings forever — harmless, never recursed into.
+const GG_DIR = 'gg';
+const RESERVED = new Set([GG_DIR, 'thumbcache', 'previewcache', 'ggTrash']);
 const SUPPORTED_EXT = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.avif']);
 
 // ---------- bootstrap ----------
@@ -146,6 +152,32 @@ async function migrateLegacyTrash() {
   }
   await walk(GALLERIES_ROOT);
   if (migrated) console.log(`Migrated ${migrated} legacy ggTrash file(s) to global trash.`);
+}
+
+// Idempotent: rename every gallery's legacy `thumbcache/` to `gg/`. Run at startup so
+// deployment is "just restart"; safe to re-run because it only renames when `thumbcache/`
+// exists AND `gg/` does not. Walks every nested gallery folder. Skips reserved names so
+// it doesn't descend into existing gg/, the legacy thumbcache itself, etc.
+async function migrateLegacyThumbcache() {
+  let migrated = 0;
+  async function checkAndRecurse(galleryAbs) {
+    const legacy = path.join(galleryAbs, 'thumbcache');
+    const target = path.join(galleryAbs, GG_DIR);
+    if (fs.existsSync(legacy) && !fs.existsSync(target)) {
+      try { await fsp.rename(legacy, target); migrated++; }
+      catch (e) { console.warn('[migrate-gg]', legacy, e.message); }
+    }
+    let entries;
+    try { entries = await fsp.readdir(galleryAbs, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      if (e.name.startsWith('.')) continue;
+      if (RESERVED.has(e.name)) continue;
+      await checkAndRecurse(path.join(galleryAbs, e.name));
+    }
+  }
+  await checkAndRecurse(GALLERIES_ROOT);
+  if (migrated) console.log(`Migrated ${migrated} thumbcache->${GG_DIR} dir(s).`);
 }
 
 
@@ -520,7 +552,7 @@ function runVips(cmd, args, tmp, finalPath) {
 // so the user-facing pending count doesn't include 'fake' work that would just be a
 // no-op fs.existsSync chain.
 function needsBuildForPhase(folderAbs, filename, phase) {
-  const thumbDir = path.join(folderAbs, 'thumbcache');
+  const thumbDir = path.join(folderAbs, GG_DIR);
   for (const tier of LOD_TIERS) {
     if (phase === 'v' && tier.format !== 'v') continue;
     if (phase === 'avif' && tier.format !== 'avif') continue;
@@ -540,7 +572,7 @@ async function ensureBuilt(folderAbs, filename, opts) {
   if (process.env.GG_DEBUG_BUILDS) {
     console.log('[build]', filename, 'phase=' + phase, 'size=' + st.size, 'preview=' + (st.size >= PREVIEW_SIZE_THRESHOLD));
   }
-  const thumbDir = path.join(folderAbs, 'thumbcache');
+  const thumbDir = path.join(folderAbs, GG_DIR);
   await fsp.mkdir(thumbDir, { recursive: true });
   let did = 0;
   for (const tier of LOD_TIERS) {
@@ -611,7 +643,7 @@ async function readSpriteMeta(galleryAbs) {
   if (spriteMetaCache.has(galleryAbs)) return spriteMetaCache.get(galleryAbs);
   let meta = null;
   try {
-    const raw = await fsp.readFile(path.join(galleryAbs, 'thumbcache', '_sprite.json'), 'utf8');
+    const raw = await fsp.readFile(path.join(galleryAbs, GG_DIR, '_sprite.json'), 'utf8');
     meta = JSON.parse(raw);
   } catch {}
   spriteMetaCache.set(galleryAbs, meta);
@@ -621,7 +653,7 @@ async function readSpriteMeta(galleryAbs) {
 function spriteIsCurrent(meta, images, galleryAbs) {
   if (!meta || meta.version !== 3 || !meta.atlases) return false;
   if (meta.imageCount !== images.length) return false;
-  if (!fs.existsSync(path.join(galleryAbs, 'thumbcache', '_imagemap.bin'))) return false;
+  if (!fs.existsSync(path.join(galleryAbs, GG_DIR, '_imagemap.bin'))) return false;
   return true;
 }
 
@@ -651,7 +683,7 @@ async function writeBinaryImagemap(thumbDir, images, aspects) {
 async function buildSpriteForFolder(galleryAbs) {
   const { images } = await listFolder(galleryAbs);
   if (images.length === 0) return null;
-  const thumbDir = path.join(galleryAbs, 'thumbcache');
+  const thumbDir = path.join(galleryAbs, GG_DIR);
   const SPRITE_CELL_W_MAX = parseInt(process.env.SPRITE_CELL_W_MAX || '600', 10);
 
   // Atlases at every LoD height we have. Small heights use lossless .v inputs
@@ -1143,7 +1175,7 @@ function galleryHTML({ urlPath, folders, images, spriteMeta, isAdminFlag, hasPas
   }).join('');
 
   const lastImageValue = images.length;
-  const imagemapURL = spriteMeta ? jsString(urlPath + 'thumbcache/_imagemap.bin') : 'null';
+  const imagemapURL = spriteMeta ? jsString(urlPath + GG_DIR + '/_imagemap.bin') : 'null';
 
   return `<!doctype html>
 <html lang="en">
@@ -1229,23 +1261,23 @@ async function handle(req, res) {
     const dirOfFile = segs[segs.length - 2];
     const grandparent = segs.slice(0, -2);
 
-    // sprite atlas files: /<gallery>/.../thumbcache/sprite-N.jpg
-    if (dirOfFile === 'thumbcache' && fileName === '_imagemap.bin') {
+    // sprite atlas files: /<gallery>/.../gg/sprite-N.jpg
+    if (dirOfFile === GG_DIR && fileName === '_imagemap.bin') {
       const galleryAbs = resolveGallery(grandparent);
       if (!galleryAbs) return notFound(res);
-      return serveStaticFile(req, res, path.join(galleryAbs, 'thumbcache', fileName));
+      return serveStaticFile(req, res, path.join(galleryAbs, GG_DIR, fileName));
     }
-    if (dirOfFile === 'thumbcache' && /^sprite(?:-h\d+)?-\d+\.(jpg|avif)$/.test(fileName)) {
+    if (dirOfFile === GG_DIR && /^sprite(?:-h\d+)?-\d+\.(jpg|avif)$/.test(fileName)) {
       const galleryAbs = resolveGallery(grandparent);
       if (!galleryAbs) return notFound(res);
-      return serveStaticFile(req, res, path.join(galleryAbs, 'thumbcache', fileName));
+      return serveStaticFile(req, res, path.join(galleryAbs, GG_DIR, fileName));
     }
     // Per-image LoD tiers (h100/h200/h400/h800 AVIF) — used by the canvas when zoomed
     // past atlas range. Pattern: <original>.h<H>.avif
-    if (dirOfFile === 'thumbcache' && /\.h\d+\.avif$/.test(fileName)) {
+    if (dirOfFile === GG_DIR && /\.h\d+\.avif$/.test(fileName)) {
       const galleryAbs = resolveGallery(grandparent);
       if (!galleryAbs) return notFound(res);
-      return serveStaticFile(req, res, path.join(galleryAbs, 'thumbcache', fileName));
+      return serveStaticFile(req, res, path.join(galleryAbs, GG_DIR, fileName));
     }
 
     // (The legacy /<gallery>/.../ggTrash/<file> route is gone — trash lives in
@@ -1344,7 +1376,7 @@ async function handleBuildAll(req, res, abs) {
   if (fs.existsSync(tslice)) {
     for (const f of fs.readdirSync(tslice)) presence.add(f);
   }
-  for (const sub of ['thumbcache']) {
+  for (const sub of [GG_DIR]) {
     const dir = path.join(abs, sub);
     if (!fs.existsSync(dir)) continue;
     for (const f of fs.readdirSync(dir)) {
@@ -1369,7 +1401,7 @@ async function adminAction(req, res, fn) {
   catch (e) { sendText(res, 500, 'error: ' + e.message); }
 }
 async function clearcache(abs) {
-  for (const sub of ['thumbcache']) {
+  for (const sub of [GG_DIR]) {
     const dir = path.join(abs, sub);
     if (!fs.existsSync(dir)) continue;
     for (const f of fs.readdirSync(dir)) { try { fs.unlinkSync(path.join(dir, f)); } catch {} }
@@ -1424,7 +1456,7 @@ async function deleteByPath(relPath) {
   const segs = relPath.split('/').filter(Boolean);
   const filename = segs.pop();
   const galleryAbs = path.join(GALLERIES_ROOT, ...segs);
-  const thumbDirAbs = path.join(galleryAbs, 'thumbcache');
+  const thumbDirAbs = path.join(galleryAbs, GG_DIR);
   for (const tier of LOD_TIERS) {
     try { await fsp.unlink(lodPath(thumbDirAbs, filename, tier.h, tier.format)); } catch {}
   }
@@ -1725,6 +1757,7 @@ const server = http.createServer((req, res) => {
   const swept = await sweepOrphanTmps(GALLERIES_ROOT);
   if (swept) console.log(`Swept ${swept} orphan tmp file(s) at startup.`);
   await migrateLegacyTrash();
+  await migrateLegacyThumbcache();
   // Two-phase build:
   //   Phase 1 (.v) — atlas inputs across every gallery. Fast (no AVIF encoding),
   //                  unblocks the gallery as soon as atlases can build.

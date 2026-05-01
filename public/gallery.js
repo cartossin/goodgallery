@@ -57,6 +57,8 @@
 
   var previewimages = [null];
   var thumbs        = [null];
+  // Per-gallery reserved subdir for all derived state (matches server.js GG_DIR).
+  var GG_DIR = 'gg';
   var inum = 1;             // legacy alias for focusedIdx — keep for any old refs
   var focusedIdx = 0;       // 0 = no focus (grid view); 1..N = focused image index (1-based)
   var isfullres = 0;        // unused after viewer removal; kept to satisfy any leftover refs
@@ -67,7 +69,7 @@
   // Build cache URLs that live under the current folder URL.
   // For files smaller than previewThreshold we just use the original — modern browsers
   // scale beautifully, so making a smaller "preview" is wasted disk for small files.
-  function thumbURL(name)         { return folderURL + 'thumbcache/'   + encodeURIComponent(name) + '.resized.jpg'; }
+  function thumbURL(name)         { return folderURL + GG_DIR + '/'    + encodeURIComponent(name) + '.resized.jpg'; }
   function originalURL(name)      { return folderURL + encodeURIComponent(name); }
   // Server transparently serves the original when no preview file exists, so the client
   // never has to know which to ask for. Avoids embedding per-image sizes in the page —
@@ -375,7 +377,7 @@
     var atlas = window.spriteMeta && spriteMeta.atlases && spriteMeta.atlases[key];
     if (!atlas) return Promise.resolve([]);
     spriteBitmapsByHeight[key] = Promise.all(atlas.sprites.map(function (sp) {
-      var url = folderURL + 'thumbcache/' + sp.file;
+      var url = folderURL + GG_DIR + '/' + sp.file;
       return fetch(url, { credentials: 'same-origin' })
         .then(function (r) { return r.blob(); })
         .then(function (b) { return createImageBitmap(b); });
@@ -414,7 +416,7 @@
     if (perImageBitmaps.has(key)) return perImageBitmaps.get(key);
     var url = tierH === 0
       ? folderURL + encodeURIComponent(name)
-      : folderURL + 'thumbcache/' + encodeURIComponent(name) + '.h' + tierH + '.avif';
+      : folderURL + GG_DIR + '/' + encodeURIComponent(name) + '.h' + tierH + '.avif';
     var prom = fetch(url, { credentials: 'same-origin' })
       .then(function (r) { return r.blob(); })
       .then(function (b) { return createImageBitmap(b); })
