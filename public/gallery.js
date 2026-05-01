@@ -1082,7 +1082,6 @@
         if (!existing) queueSpriteLoad(50, fs);
       }
     })();
-    var bitmapsPromise = Promise.resolve();
 
     var scrollLeft = filmstripEl.scrollLeft;
     var leftEdge = scrollLeft - filmPadL;
@@ -1101,11 +1100,16 @@
       try { history.replaceState(null, '', '#' + encodeURIComponent(images[focusedIdx])); } catch (_) {}
     }
 
-    bitmapsPromise.then(function (bitmaps) {
+    // Synchronous paint from atlasBitmapsSync — sprites are loaded on-demand
+    // by the per-sprite block above; tiles whose sprite isn't yet loaded just
+    // skip and re-paint when the load resolves (repaintOnArrival in
+    // flushPendingLoads triggers drawFilmstrip again).
+    (function () {
       if (!filmCanvasEl) return;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.fillStyle = '#0a0a0a';
       ctx.fillRect(0, 0, W, FILM_H);
+      var bitmaps = atlasBitmapsSync['50'] || [];
       var n = filmTilePos.length;
       var lo = 0, hi = n - 1;
       while (lo < hi) {
@@ -1115,9 +1119,6 @@
       }
       var aCellW = atlas.cellW, aCellH = atlas.cellH;
       var aPerSprite = atlas.cellsPerSprite, aAcross = atlas.across;
-      // Source from the atlas at its full h50 cell size; drawImage downscales to
-      // FILM_TILE_H (=30) for the displayed thumb. srcW = atlas-cell width for
-      // this image (loc.w * 50/CANONICAL_H == filmTileW * 50/FILM_TILE_H).
       var srcScale = aCellH / FILM_TILE_H;
       for (var i = lo; i < n; i++) {
         var tx = filmTilePos[i];
@@ -1138,7 +1139,7 @@
           ctx.strokeRect(screenX + 0.5, yPad + 0.5, tw - 1, FILM_TILE_H - 1);
         }
       }
-    });
+    })();
   }
 
   // Geometry helper: where + how big to draw the main image. Shared by drawMainImage
