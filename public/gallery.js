@@ -368,21 +368,35 @@
     var perImages = pendingPerImageLoads;
     pendingSpriteLoads = {};
     pendingPerImageLoads = [];
+    // Trigger one repaint when any queued load resolves. Cheap: the next render
+    // re-checks atlasBitmapsSync / perImageBitmapsSync and picks up new bitmaps.
+    function repaintOnArrival() {
+      if (focusedIdx > 0) {
+        // Focus mode: re-run drawFilmstrip + drawMainImage on next frame.
+        if (typeof onFilmstripScroll === 'function') {
+          requestAnimationFrame(function () {
+            try { drawFilmstrip(); } catch (_) {}
+            try { drawMainImage(); } catch (_) {}
+          });
+        }
+      } else {
+        scheduleRender();
+      }
+    }
     var hkeys = Object.keys(sprites);
     for (var hi = 0; hi < hkeys.length; hi++) {
       var hk = hkeys[hi];
       var idxs = Array.from(sprites[hk]);
       for (var ii = 0; ii < idxs.length; ii++) {
-        // Skip if no longer wanted (user moved on before debounce fired).
         var wantedNow = wantedSpriteIndices[hk];
         if (!wantedNow || !wantedNow.has(idxs[ii])) continue;
-        loadSpriteAt(parseInt(hk, 10), idxs[ii]);
+        loadSpriteAt(parseInt(hk, 10), idxs[ii]).then(repaintOnArrival);
       }
     }
     for (var pi = 0; pi < perImages.length; pi++) {
       var key = perImages[pi][0] + '|' + perImages[pi][1];
       if (!wantedPerImageKeys || !wantedPerImageKeys.has(key)) continue;
-      loadPerImageBitmap(perImages[pi][0], perImages[pi][1]);
+      loadPerImageBitmap(perImages[pi][0], perImages[pi][1]).then(repaintOnArrival);
     }
   }
   // Sync mirror of the resolved atlas bitmap arrays — populated by the .then() below.
