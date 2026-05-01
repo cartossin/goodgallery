@@ -59,6 +59,13 @@ const SPRITE_ACROSS      = parseInt(process.env.SPRITE_ACROSS || '20', 10);   //
 const MAX_SPRITE_BYTES   = parseInt(process.env.MAX_SPRITE_BYTES || String(4 * 1024 * 1024), 10);
 const BYTES_PER_PIXEL_Q92 = parseFloat(process.env.BYTES_PER_PIXEL_Q92 || '0.30');
 const MAX_SPRITE_PIXELS   = Math.max(1, Math.floor(MAX_SPRITE_BYTES / BYTES_PER_PIXEL_Q92));
+// Linux ARG_MAX is ~2 MB total argv; `vips arrayjoin` is invoked with one giant
+// space-separated arg of input paths, so each ~90-char path costs that much. Cap
+// hard at 2000 tiles per sprite so we never trip E2BIG. With 21 sprites per h-tier
+// at the 41k OI scale this is fine — client loads sprites lazily anyway.
+const MAX_TILES_PER_SPRITE = parseInt(process.env.MAX_TILES_PER_SPRITE || '1200', 10);
+// Linux MAX_ARG_STRLEN is 128 KB per single argv arg; with ~85-char LoD paths that
+// gives us a hard ceiling around ~1500 tiles per sprite. 1200 leaves margin.
 
 const THUMB_QUALITY    = parseInt(process.env.THUMB_QUALITY || '82', 10);
 // Originals smaller than this skip preview generation — the client uses the original directly.
@@ -812,9 +819,15 @@ async function writeBinaryImagemap(thumbDir, images, aspects) {
 }
 
 async function buildSpriteForFolder(galleryAbs) {
-  const { images } = await listFolder(galleryAbs);
+  const m = await loadManifest(galleryAbs);
+  const images = m.images;
   if (images.length === 0) return null;
   const thumbDir = path.join(galleryAbs, GG_DIR);
+  // Idempotent: if a current sprite already exists, skip the rebuild. Lets us call
+  // this on every gallery at startup without paying for the (expensive) atlas
+  // operations when nothing changed.
+  const existing = await readSpriteMeta(galleryAbs);
+  if (spriteIsCurrent(existing, images, galleryAbs)) return existing;
   const SPRITE_CELL_W_MAX = parseInt(process.env.SPRITE_CELL_W_MAX || '600', 10);
 
   // Atlases at every LoD height we have. Small heights use lossless .v inputs
@@ -883,7 +896,8 @@ async function buildAtlasAtHeight(thumbDir, images, aspects, height, inputFormat
   // also bounded by the gallery size (don't allocate space for more cells than exist).
   const cellsPerSprite = Math.max(1, Math.min(
     images.length,
-    Math.floor(MAX_SPRITE_PIXELS / cellArea)
+    Math.floor(MAX_SPRITE_PIXELS / cellArea),
+    MAX_TILES_PER_SPRITE
   ));
   // Choose `across` so each sprite is roughly square: across*cellW ≈ rows*cellH.
   // This keeps sprite dimensions sane at any cell size — a 5×9 cell atlas with 50,000
@@ -892,20 +906,12 @@ async function buildAtlasAtHeight(thumbDir, images, aspects, height, inputFormat
   const numChunks = Math.ceil(images.length / cellsPerSprite);
   const sprites = [];
 
-  const stagingDir = path.join(thumbDir, '_sprite_staging_h' + height);
-  await fsp.rm(stagingDir, { recursive: true, force: true });
-  await fsp.mkdir(stagingDir, { recursive: true });
-
   try {
     for (let c = 0; c < numChunks; c++) {
       const chunk = images.slice(c * cellsPerSprite, (c + 1) * cellsPerSprite);
-      const inputPaths = [];
-      for (let i = 0; i < chunk.length; i++) {
-        const link = path.join(stagingDir, c + '_' + i + '.' + inputFormat);
-        try { await fsp.unlink(link); } catch {}
-        await fsp.link(lodPath(thumbDir, chunk[i], height, inputFormat), link);
-        inputPaths.push(link);
-      }
+      // arrayjoin uses argument order, so pass LoD paths directly. No staging
+      // hardlinks needed — they only added path length and a syscall per tile.
+      const inputPaths = chunk.map(name => lodPath(thumbDir, name, height, inputFormat));
       const spriteFile = 'sprite-h' + height + '-' + c + '.avif';
       const spriteAbs = path.join(thumbDir, spriteFile);
       const tmp = spriteAbs + '.__tmp.avif';
@@ -927,7 +933,9 @@ async function buildAtlasAtHeight(thumbDir, images, aspects, height, inputFormat
       sprites.push({ file: spriteFile, count: chunk.length });
     }
   } finally {
-    await fsp.rm(stagingDir, { recursive: true, force: true });
+    // Sweep any legacy _sprite_staging_h<H>/ dirs left over from prior versions.
+    const legacyStaging = path.join(thumbDir, '_sprite_staging_h' + height);
+    await fsp.rm(legacyStaging, { recursive: true, force: true }).catch(()=>{});
   }
 
   return { cellW, cellH, across, cellsPerSprite, sprites };
@@ -1936,12 +1944,37 @@ const server = http.createServer((req, res) => {
       if (n1) console.log(`Phase 1 (atlas inputs) queued ${n1} job(s) (concurrency=${BUILD_CONCURRENCY}).`);
       await buildQueue.drainPromise();
       // Atlas build for each gallery folder we know about.
+      // Walk every gallery dir (not just ones that had Phase 1 work) and call
+      // maybeBuildSprite on each. The function itself is now idempotent — it returns
+      // the existing meta when the sprite is current, so this is cheap on restart and
+      // expensive only when something genuinely needs building.
       const galleryDirs = new Set();
-      for (const k of buildQueue.progress.keys()) galleryDirs.add(k);
-      for (const g of galleryDirs) {
-        try { await maybeBuildSprite(g); } catch (e) { console.warn('[sprite]', g, e.message); }
+      async function walkForSprites(dir) {
+        let entries;
+        try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { return; }
+        let hasImages = false;
+        const subs = [];
+        for (const e of entries) {
+          if (e.name.startsWith('.')) continue;
+          if (e.isDirectory()) {
+            if (!RESERVED.has(e.name)) subs.push(e.name);
+          } else if (e.isFile() && isImage(e.name)) hasImages = true;
+        }
+        if (hasImages) galleryDirs.add(dir);
+        for (const sub of subs) await walkForSprites(path.join(dir, sub));
       }
-      console.log(`Atlases built for ${galleryDirs.size} gallery folder(s); gallery is usable.`);
+      await walkForSprites(GALLERIES_ROOT);
+      let built = 0, skipped = 0;
+      for (const g of galleryDirs) {
+        try {
+          const before = fs.existsSync(path.join(g, GG_DIR, '_sprite.json'));
+          await maybeBuildSprite(g);
+          // Heuristic: if the sprite file existed before and exists after, count as skipped
+          const after = fs.existsSync(path.join(g, GG_DIR, '_sprite.json'));
+          if (before && after) skipped++; else built++;
+        } catch (e) { console.warn('[sprite]', g, e.message); }
+      }
+      console.log(`Atlases: built ${built}, current ${skipped} (across ${galleryDirs.size} gallery folder(s)); gallery is usable.`);
       const n2 = await buildQueue.scanAll(GALLERIES_ROOT, { phase: 'avif' });
       if (n2) console.log(`Phase 2 (per-image AVIFs) queued ${n2} job(s) — running in background.`);
     } catch (e) {

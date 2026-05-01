@@ -1,5 +1,5 @@
 // Goodgallery 2.0 client. Vanilla JS, no third-party libraries.
-// Preserves the 2014 logic: images[], previewimages[], thumbs[], hash navigation,
+// Preserves the 2014 logic: images[], thumbs[], hash navigation,
 // 1-indexed nav (inum), per-page thumb rendering, on-demand build via onerror.
 
 // State injected by the server-rendered page:
@@ -55,7 +55,6 @@
     return true;
   }
 
-  var previewimages = [null];
   var thumbs        = [null];
   // Per-gallery reserved subdir for all derived state (matches server.js GG_DIR).
   var GG_DIR = 'gg';
@@ -66,15 +65,10 @@
   var hashmirror = '';
   var monitortimerid = null;
 
-  // Build cache URLs that live under the current folder URL.
-  // For files smaller than previewThreshold we just use the original — modern browsers
-  // scale beautifully, so making a smaller "preview" is wasted disk for small files.
-  function thumbURL(name)         { return folderURL + GG_DIR + '/'    + encodeURIComponent(name) + '.resized.jpg'; }
+  // Original-image URL for a name. Per-image LoDs and atlases are built separately
+  // (see getBestSrcForFocus / loadPerImageBitmap / sprite atlas). Originals are only
+  // fetched when a focused image needs more pixels than h800 provides.
   function originalURL(name)      { return folderURL + encodeURIComponent(name); }
-  // Server transparently serves the original when no preview file exists, so the client
-  // never has to know which to ask for. Avoids embedding per-image sizes in the page —
-  // important at 60k scale where that'd mean 60k stats per render.
-  function previewSrc(i) { return previewCacheURL(images[i]); }
 
   function $(id) { return document.getElementById(id); }
   function setText(id, t) { var e = $(id); if (e) e.textContent = t; }
@@ -1678,7 +1672,6 @@
       var thumbsEl = $('thumbs');
       if (thumbsEl) thumbsEl.innerHTML = '<div style="padding:32px;text-align:center;color:#888">Loading…</div>';
       loadImagemap().then(function () {
-        for (var i = 1; i <= lastimagevalue; i++) previewimages[i] = previewSrc(i);
         runInitialRoute();
       }).catch(function (e) {
         console.warn('[imagemap] load failed:', e);
