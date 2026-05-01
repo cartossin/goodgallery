@@ -230,7 +230,7 @@
   // layoutRows()/finalizeRow() exactly so fit-all is accurate.
   // Proportional grid gap: 2.5% of the target row height. Floors to 0 at very small
   // tile sizes so e.g. h5 atlas tiles butt up against each other (no visible gap).
-  function rowGap(H) { return Math.max(0, Math.floor(H * 0.025)); }
+  function rowGap(H) { return Math.max(0, Math.floor(H * 0.04)); }
   function simulateLayoutHeight(H, W) {
     if (!window.spriteMeta) return 0;
     var rows = 0, totalH = 0;
