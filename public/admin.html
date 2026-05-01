@@ -85,7 +85,6 @@
     <span id="imgCount" style="color:#888;font-size:12px;margin-left:8px"></span>
     <ul id="images" class="files"><li><small>Loading…</small></li></ul>
     <div class="row" style="margin-top:8px">
-      <button id="validateBtn">Validate / build all</button>
       <button id="clearCacheBtn">Clear cache</button>
       <button id="fullRescanBtn" title="Re-scan every gallery for files added outside the uploader (e.g. rsync, mv).">Full rescan</button>
       <button id="exploreTrashBtn">Explore trash</button>
@@ -298,11 +297,6 @@ document.getElementById('mkDirBtn').addEventListener('click', async () => {
   else { document.getElementById('newDirName').value = ''; document.getElementById('dirError').textContent = ''; loadFolder(); }
 });
 
-document.getElementById('validateBtn').addEventListener('click', async () => {
-  log('validating...');
-  var r = await fetch(cwdPath + '?buildall=1', { headers: authHeaders() });
-  log(await r.text());
-});
 document.getElementById('clearCacheBtn').addEventListener('click', async () => {
   if (!confirm('Clear all cached thumbs/previews in ' + cwdPath + '?')) return;
   var r = await fetch(cwdPath + '?clearcache=1', { method: 'POST', headers: authHeaders() });

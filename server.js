@@ -1446,10 +1446,9 @@ async function handle(req, res) {
   try { st = fs.statSync(abs); } catch { return notFound(res, 'no such gallery'); }
   if (!st.isDirectory()) return notFound(res, 'not a folder');
 
-  // gallery action queries (?build=, ?buildall=1, etc.) — POST or GET.
+  // gallery action queries (admin-only mutations + read-only status). Per-folder
+  // build/scan was retired — admin "Full rescan" covers all real cases globally.
   const q = u.searchParams;
-  // ?build= retired (sprite-only architecture; no per-client thumb requests)
-  if (q.get('buildall') === '1') return handleBuildAll(req, res, abs);
   if (q.has('clearcache'))  return adminAction(req, res, () => clearcache(abs));
   if (q.has('movetotrash')) return adminAction(req, res, () => movetotrash(abs, q.get('movetotrash')));
   // exploretrash/restorefile/deletefile/restoreall/emptytrash are now global, served
@@ -1491,52 +1490,6 @@ async function handle(req, res) {
     hasPasskey: !!getPasskey(),
   });
   return sendText(res, 200, html, 'text/html; charset=utf-8');
-}
-
-// ---------- build endpoints ----------
-async function handleBuild(req, res, abs, q) {
-  const filename = q.get('build');
-  const inum = parseInt(q.get('inum') || '0', 10);
-  if (!filename || !isImage(filename)) return badRequest(res, 'bad filename');
-  try {
-    await ensureBuilt(abs, filename);
-    return sendText(res, 200, String(inum));
-  } catch (e) {
-    return sendText(res, 200, 'build failed: ' + e.message);
-  }
-}
-
-async function handleBuildAll(req, res, abs) {
-  // Fire-and-forget: enqueue + sweep orphans, return '1' so legacy clients consider it
-  // validated. Workers do the actual building in the background; clients can poll
-  // ?build-status for live progress instead of looping this endpoint.
-  const { images } = await listFolder(abs);
-  const queued = await buildQueue.enqueueFolder(abs);
-  // .v thumbnails and .resized.jpg previews stay as long as the original exists in the
-  // gallery OR in trash. Resize is the expensive op; we never throw the result away while
-  // the source is recoverable. Only after a hard-delete (or after the orphan sweep notices
-  // a file genuinely gone) do we reclaim the cache.
-  const presence = new Set(images);
-  const tslice = trashSliceDir(abs);
-  if (fs.existsSync(tslice)) {
-    for (const f of fs.readdirSync(tslice)) presence.add(f);
-  }
-  for (const sub of [GG_DIR]) {
-    const dir = path.join(abs, sub);
-    if (!fs.existsSync(dir)) continue;
-    for (const f of fs.readdirSync(dir)) {
-      if (isOrphanTmp(f)) { try { fs.unlinkSync(path.join(dir, f)); } catch {} continue; }
-      if (/^sprite(?:-h\d+)?-\d+\.(jpg|avif)$/.test(f) || f === '_sprite.json' || f === '_sprite_staging' || f === '_imagemap.bin' || /^_sprite_staging_h\d+$/.test(f)) continue;
-      let original = null;
-      const lod = f.match(/^(.+)\.h\d+\.(v|avif)$/);
-      if (lod) original = lod[1];
-      else if (f.endsWith('.resized.v'))   original = f.slice(0, -'.resized.v'.length);
-      else if (f.endsWith('.resized.jpg')) original = f.slice(0, -'.resized.jpg'.length);
-      if (!original) continue;
-      if (!presence.has(original)) { try { fs.unlinkSync(path.join(dir, f)); } catch {} }
-    }
-  }
-  return sendText(res, 200, `queued ${queued} job(s)\n1`);
 }
 
 // ---------- admin actions on a folder ----------

@@ -80,14 +80,6 @@
     if (!rt) return;
     rt.textContent = msg || '';
   }
-  function clearmonitor() {
-    if (waitingfor <= 0) {
-      note('');
-      requestbuildall();
-    }
-  }
-  function finalclearmonitor() { note(''); }
-
   // ---------- ajax (fetch wrapper that mirrors XHConn semantics) ----------
   function gghttp(method, qs, onText) {
     var url = folderURL + (qs ? '?' + qs : '');
@@ -99,18 +91,8 @@
   // (Auth is now an HttpOnly cookie — no client-side token handling needed.)
   function adminHeader() { return {}; }
 
-  // Server now owns validation/build. Fire-and-forget: ask the server to enqueue,
-  // then poll status for feedback. No more client-driven loop.
-  // Server owns validation/build. requestbuildall fires it explicitly and waits-with-poll
-  // for completion (then reloads). On a fresh page load we just monitor whatever is
-  // currently active — never reload, so we don't loop on stale historical totals.
-  function requestbuildall() {
-    note('Asking server to validate gallery…');
-    fetch(folderURL + '?buildall=1', { credentials: 'same-origin', headers: adminHeader() })
-      .then(function (r) { return r.text(); })
-      .then(function () { pollBuildStatus({ reloadOnComplete: true }); })
-      .catch(function () { note('(could not reach server)'); });
-  }
+  // Per-folder build was retired; the admin Full Rescan button (in /_admin/) covers
+  // everything site-wide. The page just monitors whatever the server is doing.
   var statusTimer = null;
   function pollBuildStatus(opts) {
     opts = opts || {};
@@ -1441,7 +1423,6 @@
     bar.innerHTML = inImage
       ? '<button onclick="ggMoveToTrash()">Move to trash</button>'
       : '<button onclick="ggClearCache()">Clear cache</button>' +
-        '<button onclick="ggRequestBuildAll()">Validate</button>' +
         '<button onclick="ggExploreTrash()">Explore trash</button>' +
         '<a href="/_admin/" style="margin-left:auto">Admin panel →</a>';
   }
@@ -1460,7 +1441,6 @@
     if (!confirm('Delete all cached thumbs and previews?')) return;
     gghttp('POST', 'clearcache=1', function (t) { note(t); });
   }
-  function ggRequestBuildAll() { requestbuildall(); }
   function ggExploreTrash() {
     fetch('/api/trash', { headers: adminHeader() })
       .then(function (r) { return r.json(); })
@@ -1709,7 +1689,6 @@
   window.displaythumbs = displaythumbs;
   window.ggMoveToTrash = ggMoveToTrash;
   window.ggClearCache = ggClearCache;
-  window.ggRequestBuildAll = ggRequestBuildAll;
   window.ggExploreTrash = ggExploreTrash;
   window.ggRestoreFile = ggRestoreFile;
   window.ggDeleteFile = ggDeleteFile;
