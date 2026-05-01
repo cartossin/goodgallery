@@ -103,7 +103,7 @@
       .then(function (p) {
         var active = (p.pending || 0) + (p.inProgress || 0);
         if (active > 0) {
-          note('Building thumbnails — ' + active + ' remaining (' + p.done + '/' + p.total + ' done)');
+          note('Building LoD cache — ' + active + ' remaining (' + p.done + '/' + p.total + ' done)');
           statusTimer = setTimeout(function () { pollBuildStatus({ reloadOnComplete: reloadOnComplete }); }, 700);
         } else if (reloadOnComplete && p.total > 0) {
           note('Build complete (' + p.done + '/' + p.total + '). Reloading…');
@@ -1281,7 +1281,7 @@
     }
     if (!window.spriteMeta) {
       thumbsEl.innerHTML = '<div style="padding:32px;text-align:center;color:#888">' +
-        '<div style="font-size:16px;margin-bottom:8px">Generating thumbnails…</div>' +
+        '<div style="font-size:16px;margin-bottom:8px">Building LoD cache…</div>' +
         '<div style="font-size:13px">' + lastimagevalue + ' images in this folder</div>' +
         '</div>';
       pollBuildStatus({ reloadOnComplete: true });
@@ -1634,7 +1634,7 @@
     // Show a loading placeholder while the binary imagemap is in flight, then run the
     // initial route once we have data. If there's no imagemap to load (e.g. sprite not
     // built yet) we still want to render — fall through to renderGallery which has its
-    // own "Generating thumbnails…" placeholder for the spriteMeta=null case.
+    // own "Building LoD cache…" placeholder for the spriteMeta=null case.
     function runInitialRoute() {
       var raw = decodeURIComponent(location.hash.slice(1) || '');
       if (!raw || raw.charAt(0) === ':') {
