@@ -599,45 +599,51 @@
       // ATLAS PATH: target row height is small enough that a sprite atlas at H<=50
       // covers it. One atlas image, many tiles drawn from offsets within it.
       var atlas = spriteMeta.atlases[String(atlasH)];
-      // Paint each visible tile as soon as ITS sprite is ready. We also kick
-      // off the full atlas load (cached promise) and register a per-sprite
-      // waiter that repaints just the affected tiles when each sprite arrives.
+      // Paint each visible tile from the BEST currently-cached atlas tier.
+      // bestCachedAtlasSrc walks h50 -> h10 -> h5 and returns whichever is
+      // loaded for this image. So if the user just dragged the slider into
+      // h50 territory but h50 isn't loaded yet, tiles render from h10 or h5
+      // (blurrier, scaled up) instead of leaving the dark canvas background
+      // visible. The picked atlas's per-sprite-arrival callback then upgrades
+      // each tile in place when the higher-res sprite lands.
       var aCellW = atlas.cellW, aCellH = atlas.cellH;
       var aPerSprite = atlas.cellsPerSprite, aAcross = atlas.across;
       var canonicalH = 200;
-      function paintTileFromAtlas(t, bitmaps) {
+      function paintTileFromBitmap(t, bitmap, atlasMeta) {
         var loc = spriteMeta.imageMap[t.name];
         if (!loc) return;
         var idx = loc.idx;
-        var spriteIdx = Math.floor(idx / aPerSprite);
-        var bitmap = bitmaps[spriteIdx];
-        if (!bitmap) return;
-        var posInSprite = idx % aPerSprite;
-        var row = Math.floor(posInSprite / aAcross);
-        var col = posInSprite % aAcross;
-        var srcW = Math.round(loc.w * (aCellH / canonicalH));
+        var spriteIdx = Math.floor(idx / atlasMeta.cellsPerSprite);
+        var posInSprite = idx % atlasMeta.cellsPerSprite;
+        var row = Math.floor(posInSprite / atlasMeta.across);
+        var col = posInSprite % atlasMeta.across;
+        var srcW = Math.round(loc.w * (atlasMeta.cellH / canonicalH));
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        ctx.drawImage(bitmap, col * aCellW, row * aCellH, srcW, aCellH, t.x, t.y - scrollY, t.w, t.h);
+        ctx.drawImage(bitmap, col * atlasMeta.cellW, row * atlasMeta.cellH, srcW, atlasMeta.cellH, t.x, t.y - scrollY, t.w, t.h);
       }
-      // First pass: paint tiles whose sprites are already cached.
-      var cachedBitmaps = atlasBitmapsSync[String(atlasH)];
-      if (cachedBitmaps) {
-        for (var k = 0; k < visible.length; k++) paintTileFromAtlas(visible[k], cachedBitmaps);
+      // First pass: paint each tile from the best cached atlas (any height).
+      // bestCachedAtlasSrc returns { bitmap, sx, sy, sw, sh } so we can blit
+      // directly without recomputing per-atlas geometry.
+      for (var k = 0; k < visible.length; k++) {
+        var t = visible[k];
+        var as = bestCachedAtlasSrc(t.name);
+        if (as) {
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          ctx.drawImage(as.bitmap, as.sx, as.sy, as.sw, as.sh, t.x, t.y - scrollY, t.w, t.h);
+        }
       }
-      // Kick off load (no-op if cached) + register per-sprite waiter so newly
-      // arriving sprites paint without waiting for the whole atlas.
+      // Kick off the picked atlas's load + register a per-sprite waiter that
+      // upgrades just the affected tiles when each higher-res sprite lands.
       loadSpriteBitmapsForAtlas(atlasH);
       var visibleSnapshot = visible;
       onSpriteBitmapReady(atlasH, function (bm, spriteIdx) {
         if (!canvasEl || renderFrame !== myFrame) return;
-        var bitmaps = atlasBitmapsSync[String(atlasH)];
-        if (!bitmaps) return;
         for (var k = 0; k < visibleSnapshot.length; k++) {
           var t = visibleSnapshot[k];
           var loc = spriteMeta.imageMap[t.name];
           if (!loc) continue;
           if (Math.floor(loc.idx / aPerSprite) === spriteIdx) {
-            paintTileFromAtlas(t, bitmaps);
+            paintTileFromBitmap(t, bm, atlas);
           }
         }
       });
@@ -1011,20 +1017,9 @@
     var dpr = devicePixelRatio();
     var ctx = mainEl.getContext('2d', { alpha: false });
     ctx.imageSmoothingQuality = 'high';
-    // Bail BEFORE touching the canvas if there's nothing to paint. This is the
-    // only way to guarantee the user never sees a momentarily-black canvas:
-    // we keep showing the previous frame until we have a new bitmap to install.
-    // The .then() callbacks below gate WRITES to mainDrawSrc by capturedIdx, so
-    // we never install stale data — and so calls to paintMain() that fire
-    // mid-load (during scrubs, sprite-fetch waits, etc) just no-op until the
-    // new source actually exists.
-    if (!mainDrawSrc || !mainDrawSrc.bitmap) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, g.W, g.mainH);
-    // Order matters here. We want: scale around image center, THEN translate by
-    // (imgTx, imgTy) so a 100px finger drag moves the image 100px on screen
-    // regardless of zoom level.
     if (imgTx !== 0 || imgTy !== 0) ctx.translate(imgTx, imgTy);
     if (mainScale !== 1) {
       var cx = g.W / 2, cy = g.mainH / 2;
@@ -1032,11 +1027,13 @@
       ctx.scale(mainScale, mainScale);
       ctx.translate(-cx, -cy);
     }
-    ctx.drawImage(
-      mainDrawSrc.bitmap,
-      mainDrawSrc.sx, mainDrawSrc.sy, mainDrawSrc.sw, mainDrawSrc.sh,
-      g.dx, g.dy, g.dw, g.dh
-    );
+    if (mainDrawSrc && mainDrawSrc.bitmap) {
+      ctx.drawImage(
+        mainDrawSrc.bitmap,
+        mainDrawSrc.sx, mainDrawSrc.sy, mainDrawSrc.sw, mainDrawSrc.sh,
+        g.dx, g.dy, g.dw, g.dh
+      );
+    }
   }
 
   function drawMainImage() {
