@@ -300,33 +300,14 @@ class BuildQueue {
 
 const buildQueue = new BuildQueue(BUILD_CONCURRENCY);
 
-// ---------- filesystem watcher ----------
-// Detect new images dropped via scp/rsync/mv and queue them. fs.watch supports recursive
-// on Linux as of Node 20.11+ (this CT runs 20.19).
-function startWatcher() {
-  try {
-    fs.watch(GALLERIES_ROOT, { recursive: true }, (eventType, rel) => {
-      if (!rel) return;
-      if (rel.split('/').some(seg => seg.startsWith('.') || RESERVED.has(seg))) return;
-      if (isOrphanTmp(rel)) return;
-      const full = path.join(GALLERIES_ROOT, rel);
-      const dir = path.dirname(full);
-      // Any change in the directory makes the sprite metadata potentially stale; drop the
-      // cached entry so the next pageview rechecks (sprite rebuild also invalidates by
-      // refreshing the cached value).
-      spriteMetaCache.delete(dir);
-      fs.stat(full, (err, st) => {
-        if (err || !st.isFile()) return;
-        const base = path.basename(full);
-        if (!isImage(base) || isOrphanTmp(base)) return;
-        buildQueue.enqueue(dir, base);
-      });
-    });
-    console.log('Watching', GALLERIES_ROOT, 'recursively for new images.');
-  } catch (e) {
-    console.warn('fs.watch failed:', e.message, '— file additions will only be picked up on next startup scan.');
-  }
-}
+// ---------- no filesystem watcher ----------
+// fs.watch(root, { recursive: true }) on Linux re-walks the tree on every event to
+// keep its inotify watch set in sync. With a 100k-entry thumbcache and constant
+// vips writes, that meant ~90% of one Node core was spent in libuv getdents64 — and
+// the event loop was starved enough that a pageview to '/' could take 16 seconds.
+// (Measured 2026-05-01.) Killing the watcher dropped Node CPU 109%->16% and 30x'd
+// vips throughput. The uploader writes files we already know about; rsync drops are
+// rare and pick up via the admin "Full rescan" button instead.
 
 // ---------- in-memory state ----------
 const sessions         = new Map();  // token -> { createdAt }
@@ -428,10 +409,10 @@ function readBody(req, limit = 32 * 1024 * 1024) {
 }
 
 // ---------- listing ----------
-async function listFolder(absDir, { withSizes = false } = {}) {
+async function listFolder(absDir) {
   let entries;
   try { entries = await fsp.readdir(absDir, { withFileTypes: true }); }
-  catch { return { folders: [], images: [], sizes: [] }; }
+  catch { return { folders: [], images: [] }; }
 
   const folders = [];
   const images  = [];
@@ -447,14 +428,7 @@ async function listFolder(absDir, { withSizes = false } = {}) {
   const cmp = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' }).compare;
   folders.sort(cmp);
   images.sort(cmp);
-  let sizes = [];
-  if (withSizes) {
-    sizes = await Promise.all(images.map(async n => {
-      try { const st = await fsp.stat(path.join(absDir, n)); return st.size; }
-      catch { return 0; }
-    }));
-  }
-  return { folders, images, sizes };
+  return { folders, images };
 }
 
 // ---------- image build via vipsthumbnail ----------
@@ -1328,14 +1302,13 @@ async function handle(req, res) {
   }
 
   // Render gallery page
-  const { folders, images, sizes } = await listFolder(abs, { withSizes: true });
+  const { folders, images } = await listFolder(abs);
   let spriteMeta = await readSpriteMeta(abs);
   if (!spriteIsCurrent(spriteMeta, images, abs)) spriteMeta = null;
   const html = galleryHTML({
     urlPath: pathname,
     folders,
     images,
-    sizes,
     spriteMeta,
     isAdminFlag: isAdmin(req),
     hasPasskey: !!getPasskey(),
@@ -1589,6 +1562,20 @@ async function handleAdminAPI(req, res, pathname, method) {
   if (method === 'GET' && pathname === '/api/admin/status') {
     return sendJson(res, 200, { passkeyExists: !!getPasskey() });
   }
+  if (method === 'POST' && pathname === '/api/admin/fullrescan') {
+    if (!isAdmin(req)) return sendJson(res, 401, { error: 'admin only' });
+    // Fire-and-forget across all phases. scanAll walks the tree once per phase and
+    // enqueues anything missing for that phase. Returns immediately so the UI doesn't
+    // block; client can poll ?build-status on individual galleries.
+    (async () => {
+      try {
+        const a = await buildQueue.scanAll(GALLERIES_ROOT, { phase: 'v' });
+        const b = await buildQueue.scanAll(GALLERIES_ROOT, { phase: 'avif' });
+        console.log('[fullrescan] enqueued v=' + a + ' avif=' + b);
+      } catch (e) { console.warn('[fullrescan]', e.message); }
+    })();
+    return sendJson(res, 200, { ok: true, started: true });
+  }
   if (method === 'POST' && pathname === '/api/admin/register/start') {
     if (getPasskey()) return sendJson(res, 400, { error: 'passkey already registered' });
     const challenge = crypto.randomBytes(32);
@@ -1738,7 +1725,6 @@ const server = http.createServer((req, res) => {
   const swept = await sweepOrphanTmps(GALLERIES_ROOT);
   if (swept) console.log(`Swept ${swept} orphan tmp file(s) at startup.`);
   await migrateLegacyTrash();
-  startWatcher();
   // Two-phase build:
   //   Phase 1 (.v) — atlas inputs across every gallery. Fast (no AVIF encoding),
   //                  unblocks the gallery as soon as atlases can build.

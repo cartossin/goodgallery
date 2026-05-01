@@ -87,6 +87,7 @@
     <div class="row" style="margin-top:8px">
       <button id="validateBtn">Validate / build all</button>
       <button id="clearCacheBtn">Clear cache</button>
+      <button id="fullRescanBtn" title="Re-scan every gallery for files added outside the uploader (e.g. rsync, mv).">Full rescan</button>
       <button id="exploreTrashBtn">Explore trash</button>
     </div>
     <pre id="actionLog" style="font-size:12px;color:#9bff9b;max-height:120px;overflow:auto;margin-top:8px"></pre>
@@ -308,6 +309,13 @@ document.getElementById('clearCacheBtn').addEventListener('click', async () => {
   log(await r.text());
 });
 document.getElementById('exploreTrashBtn').addEventListener('click', exploreTrash);
+
+document.getElementById('fullRescanBtn').addEventListener('click', async () => {
+  log('full rescan...');
+  var r = await fetch('/api/admin/fullrescan', { method: 'POST', credentials: 'same-origin' });
+  var j = await r.json().catch(() => ({}));
+  log(r.ok ? 'rescan started; check individual galleries for build progress.' : ('rescan failed: ' + (j.error || r.status)));
+});
 
 async function exploreTrash() {
   var trashEl = document.getElementById('trashPanel');
