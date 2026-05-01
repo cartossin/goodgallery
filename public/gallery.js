@@ -328,6 +328,14 @@
   // Per-atlas-height ImageBitmap cache. Each atlas height (5/10/50) is loaded once,
   // lazily, and reused across renders.
   var spriteBitmapsByHeight = {};      // { '50': Promise<[ImageBitmap, ...]>, ... }
+  // Cache the raw AVIF Blob bytes so we can re-decode without re-fetching from the
+  // server. Each atlas blob is small (~150 KB); keeping all of them costs ~5 MB total
+  // for the OI 41k case. ImageBitmaps (which are the ~1.5 GB monsters) get evicted
+  // on tier transitions; blobs stay around so the re-decode is local + fast.
+  var spriteBlobs = {};                // { '50': [Blob, Blob, ...] }
+  // True while the user is actively dragging the zoom slider. While true,
+  // pickAtlasHeight pins to the smallest available atlas tier.
+  var isSliderDragging = false;
   // Sync mirror of the resolved atlas bitmap arrays — populated by the .then() below.
   // Used by drag-paint where we need to draw prev/next images mid-gesture without an
   // async hop (a microtask on every drag frame would visibly stutter).
@@ -366,32 +374,62 @@
     if (spriteBitmapsByHeight[key]) return spriteBitmapsByHeight[key];
     var atlas = window.spriteMeta && spriteMeta.atlases && spriteMeta.atlases[key];
     if (!atlas) return Promise.resolve([]);
-    // Populate atlasBitmapsSync[key] IMMEDIATELY as a sparse array of nulls. As each
-    // sprite finishes decoding, fill its slot. getAtlasSrcSync already null-checks
-    // the per-slot bitmap, so any image whose sprite IS loaded becomes drawable
-    // even while siblings are still in flight. This is what stops the main canvas
-    // from going black for ~1s when entering OI focus mode (32 h50 sprites to load).
     atlasBitmapsSync[key] = new Array(atlas.sprites.length).fill(null);
+    if (!spriteBlobs[key]) spriteBlobs[key] = new Array(atlas.sprites.length).fill(null);
+    // If we have all the blobs already (post-eviction case), skip the network and
+    // re-decode locally — much faster than refetching from the server.
+    var allBlobsCached = spriteBlobs[key].every(function (b) { return b != null; });
+
     spriteBitmapsByHeight[key] = Promise.all(atlas.sprites.map(function (sp, i) {
-      var url = folderURL + GG_DIR + '/' + sp.file;
-      return fetch(url, { credentials: 'same-origin' })
-        .then(function (r) { return r.blob(); })
+      var blobP;
+      if (allBlobsCached) {
+        blobP = Promise.resolve(spriteBlobs[key][i]);
+      } else {
+        var url = folderURL + GG_DIR + '/' + sp.file;
+        blobP = fetch(url, { credentials: 'same-origin' })
+          .then(function (r) { return r.blob(); })
+          .then(function (b) { spriteBlobs[key][i] = b; return b; });
+      }
+      return blobP
         .then(function (b) { return createImageBitmap(b); })
         .then(function (bm) {
           atlasBitmapsSync[key][i] = bm;
-          // Notify any registered waiters — they'll typically inspect whether the
-          // newly-arrived sprite covers the image they currently need to paint.
           var ws = spriteBitmapWaiters[key];
           if (ws) for (var w = 0; w < ws.length; w++) {
             try { ws[w](bm, i); } catch (_) {}
           }
           return bm;
         });
-    })).then(function (bitmaps) {
-      // Already populated incrementally; this just resolves the all-done promise.
-      return bitmaps;
-    });
+    }));
     return spriteBitmapsByHeight[key];
+  }
+
+  function evictAtlasBitmaps(atlasH) {
+    var key = String(atlasH);
+    var bitmaps = atlasBitmapsSync[key];
+    if (bitmaps) {
+      for (var i = 0; i < bitmaps.length; i++) {
+        var bm = bitmaps[i];
+        if (bm && typeof bm.close === 'function') {
+          try { bm.close(); } catch (_) {}
+        }
+      }
+    }
+    delete atlasBitmapsSync[key];
+    delete spriteBitmapsByHeight[key];
+    delete spriteBitmapWaiters[key];
+    // spriteBlobs[key] kept for cheap re-decode without refetching.
+  }
+
+  // Drop ImageBitmaps for every atlas tier we don't currently need. Always keep
+  // h5 around as a permanent low-cost fallback for bestCachedAtlasSrc.
+  function evictUnusedAtlases(activeAtlasH) {
+    var keep = { '5': true };
+    if (activeAtlasH != null) keep[String(activeAtlasH)] = true;
+    var keys = Object.keys(atlasBitmapsSync);
+    for (var i = 0; i < keys.length; i++) {
+      if (!keep[keys[i]]) evictAtlasBitmaps(keys[i]);
+    }
   }
 
   // Atlas pick: smallest atlas height >= target. Returns null if target exceeds the
@@ -399,10 +437,20 @@
   function pickAtlasHeight(targetH) {
     if (!window.spriteMeta || !spriteMeta.atlases) return null;
     var heights = Object.keys(spriteMeta.atlases).map(Number).sort(function (a, b) { return a - b; });
+    // While the slider is being dragged, pin to the smallest atlas tier already
+    // in memory. Dragging stays smooth (we never trigger an h50 fetch+decode of
+    // ~30 sprites mid-drag) and we never balloon memory for tiers the user is
+    // just scrubbing past.
+    if (isSliderDragging) {
+      for (var j = 0; j < heights.length; j++) {
+        if (atlasBitmapsSync[String(heights[j])]) return heights[j];
+      }
+      return heights[0];
+    }
     for (var i = 0; i < heights.length; i++) {
       if (heights[i] >= targetH) return heights[i];
     }
-    return null;  // target is larger than any atlas — caller uses per-image AVIF
+    return null;
   }
 
   // Per-image LoD: pick the smallest available tier height >= target. Tier 0 is a
@@ -1600,7 +1648,22 @@
     if (!sl) return;
     sl.value = String(getZoom());
     sl.addEventListener('input', function () {
+      isSliderDragging = true;
       handleZoomChange(parseInt(sl.value, 10));
+    });
+    // 'change' fires on release (mouse up / touch end). Clear the drag flag,
+    // re-render at the now-settled tier, and evict bitmaps for tiers we no
+    // longer need.
+    sl.addEventListener('change', function () {
+      isSliderDragging = false;
+      handleZoomChange(parseInt(sl.value, 10));
+      // Defer eviction by a frame so the new render gets a chance to populate
+      // atlasBitmapsSync for the active tier first (otherwise we'd evict it).
+      requestAnimationFrame(function () {
+        var H = (typeof currentRowHeight !== 'undefined' && currentRowHeight) || targetRowHeight(getZoom());
+        var activeAtlasH = pickAtlasHeight(H);
+        evictUnusedAtlases(activeAtlasH);
+      });
     });
   }
 
