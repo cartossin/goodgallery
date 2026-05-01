@@ -404,6 +404,36 @@
     return spriteBitmapsByHeight[key];
   }
 
+  // Drop every per-image ImageBitmap whose tier doesn't match keepTier (and isn't 0,
+  // since tier 0 = original image fetched on demand). Closes the bitmap to free GPU
+  // memory and clears both the promise cache and the sync mirror. Re-loading later
+  // requires re-fetch + re-decode (HTTP cache typically saves the network round-trip).
+  function evictPerImageBitmapsExcept(keepTier) {
+    var keys = Array.from(perImageBitmaps.keys());
+    for (var i = 0; i < keys.length; i++) {
+      var key = keys[i];
+      var bar = key.lastIndexOf('|');
+      var tier = bar < 0 ? -1 : parseInt(key.slice(bar + 1), 10);
+      if (tier === keepTier) continue;
+      var bm = perImageBitmapsSync.get(key);
+      if (bm && typeof bm.close === 'function') {
+        try { bm.close(); } catch (_) {}
+      }
+      perImageBitmaps.delete(key);
+      perImageBitmapsSync.delete(key);
+    }
+  }
+
+  // Wait for a brief "user paused" window after a slider release before doing the
+  // expensive load+decode of the high-quality target tier. If the user starts
+  // dragging again within the window, the settle is cancelled — avoids spamming
+  // h800 fetches when the user is rapid-tapping the slider.
+  var SETTLE_DELAY_MS = 250;
+  var settleTimer = null;
+  function cancelSettle() {
+    if (settleTimer) { clearTimeout(settleTimer); settleTimer = null; }
+  }
+
   function evictAtlasBitmaps(atlasH) {
     var key = String(atlasH);
     var bitmaps = atlasBitmapsSync[key];
@@ -1649,21 +1679,40 @@
     sl.value = String(getZoom());
     sl.addEventListener('input', function () {
       isSliderDragging = true;
+      cancelSettle();
       handleZoomChange(parseInt(sl.value, 10));
     });
-    // 'change' fires on release (mouse up / touch end). Clear the drag flag,
-    // re-render at the now-settled tier, and evict bitmaps for tiers we no
-    // longer need.
+    // 'change' fires on release. Don't snap to the high-quality tier immediately;
+    // wait SETTLE_DELAY_MS in case the user is rapid-tapping. If they start
+    // dragging again within the window, cancelSettle() above stops the snap.
     sl.addEventListener('change', function () {
       isSliderDragging = false;
-      handleZoomChange(parseInt(sl.value, 10));
-      // Defer eviction by a frame so the new render gets a chance to populate
-      // atlasBitmapsSync for the active tier first (otherwise we'd evict it).
-      requestAnimationFrame(function () {
-        var H = (typeof currentRowHeight !== 'undefined' && currentRowHeight) || targetRowHeight(getZoom());
-        var activeAtlasH = pickAtlasHeight(H);
-        evictUnusedAtlases(activeAtlasH);
-      });
+      // Keep rendering at the drag-pinned tier (h5) right now — don't trigger
+      // the heavy load until SETTLE_DELAY_MS of quiet has passed.
+      cancelSettle();
+      var sliderValue = parseInt(sl.value, 10);
+      settleTimer = setTimeout(function () {
+        settleTimer = null;
+        // Re-render at the actual target tier. handleZoomChange will trigger
+        // renderGallery -> drawCanvasForScroll which loads the right tier.
+        handleZoomChange(sliderValue);
+        // After one frame so the new render gets a chance to populate the
+        // active tier's bitmaps before we evict the OLD ones.
+        requestAnimationFrame(function () {
+          var H = (typeof currentRowHeight !== 'undefined' && currentRowHeight) || targetRowHeight(getZoom());
+          var activeAtlasH = pickAtlasHeight(H);
+          evictUnusedAtlases(activeAtlasH);
+          // If the active rendering is per-image (no atlas covers the target
+          // height), evict per-image bitmaps not at this tier. If atlas IS
+          // active, drop ALL per-image bitmaps — they're not in use.
+          if (activeAtlasH == null) {
+            var perTier = pickPerImageTier(H);
+            evictPerImageBitmapsExcept(perTier);
+          } else {
+            evictPerImageBitmapsExcept(-1);  // -1 matches nothing -> drops all
+          }
+        });
+      }, SETTLE_DELAY_MS);
     });
   }
 
