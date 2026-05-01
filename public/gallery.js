@@ -1011,18 +1011,20 @@
     var dpr = devicePixelRatio();
     var ctx = mainEl.getContext('2d', { alpha: false });
     ctx.imageSmoothingQuality = 'high';
+    // Bail BEFORE touching the canvas if there's nothing to paint. This is the
+    // only way to guarantee the user never sees a momentarily-black canvas:
+    // we keep showing the previous frame until we have a new bitmap to install.
+    // The .then() callbacks below gate WRITES to mainDrawSrc by capturedIdx, so
+    // we never install stale data — and so calls to paintMain() that fire
+    // mid-load (during scrubs, sprite-fetch waits, etc) just no-op until the
+    // new source actually exists.
+    if (!mainDrawSrc || !mainDrawSrc.bitmap) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, g.W, g.mainH);
     // Order matters here. We want: scale around image center, THEN translate by
     // (imgTx, imgTy) so a 100px finger drag moves the image 100px on screen
-    // regardless of zoom level. In canvas, the LAST transform applied is the
-    // INNERMOST (closest to drawImage), and operations apply right-to-left, so:
-    //   ctx.translate(tx, ty)        ← applied last in source = first in math
-    // ...wait, actually the convention is: source-order transforms are applied to
-    // coordinates left-to-right (each one wraps the previous), so ctx.translate
-    // before drawImage applies to the draw coords. To translate AFTER scale, the
-    // translate must come BEFORE the scale block in source.
+    // regardless of zoom level.
     if (imgTx !== 0 || imgTy !== 0) ctx.translate(imgTx, imgTy);
     if (mainScale !== 1) {
       var cx = g.W / 2, cy = g.mainH / 2;
@@ -1030,18 +1032,11 @@
       ctx.scale(mainScale, mainScale);
       ctx.translate(-cx, -cy);
     }
-    // Always draw whatever's in mainDrawSrc — even if it's the *previous* image.
-    // This is what stops the canvas from going black during scrubs / focus shifts:
-    // worst case the user sees the last good frame for a few ms while the new
-    // tier (or atlas) loads, then we swap in place. The .then() callbacks below
-    // gate WRITES to mainDrawSrc by capturedIdx, so we never install stale data.
-    if (mainDrawSrc && mainDrawSrc.bitmap) {
-      ctx.drawImage(
-        mainDrawSrc.bitmap,
-        mainDrawSrc.sx, mainDrawSrc.sy, mainDrawSrc.sw, mainDrawSrc.sh,
-        g.dx, g.dy, g.dw, g.dh
-      );
-    }
+    ctx.drawImage(
+      mainDrawSrc.bitmap,
+      mainDrawSrc.sx, mainDrawSrc.sy, mainDrawSrc.sw, mainDrawSrc.sh,
+      g.dx, g.dy, g.dw, g.dh
+    );
   }
 
   function drawMainImage() {
