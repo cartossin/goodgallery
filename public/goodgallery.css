@@ -191,6 +191,10 @@ html, body { overflow-x: hidden; }
   background: transparent; color: var(--fg); border: 1px solid var(--border);
   border-radius: 4px; padding: 4px 12px; min-width: 36px;
   font: inherit; line-height: 1.2; cursor: pointer;
+  /* Block iOS double-tap-to-zoom on the buttons themselves so rapid
+     tapping the +/- doesn't accidentally zoom the page. Keeps pinch
+     and scroll fully functional. */
+  touch-action: manipulation;
 }
 .zoom-control button:disabled { opacity: 0.35; cursor: default; }
 .zoom-control button:hover:not(:disabled) { background: var(--border); }
