@@ -893,25 +893,40 @@
     }
     filmstripEl.addEventListener('wheel', cancelChaseFromUser, { passive: true });
 
-    // Mouse-wheel snap: each wheel tick advances exactly one image. Trackpads get
-    // native scroll (smooth + momentum). Detection heuristic:
-    //   - deltaMode != 0 (LINE / PAGE) -> wheel (rare on Mac, common on Windows/Linux).
-    //   - deltaMode == 0 (PIXEL) with integer deltaY -> wheel (Mac mouse wheel
-    //     emits 4, 8, 16, 120 etc).
-    //   - deltaMode == 0 with fractional deltaY -> trackpad (continuous).
-    // Throttle so wheel acceleration on mac (which fires multiple events per tick
-    // with growing deltaY) only advances once per ~150ms.
+    // Mouse-wheel snap: each wheel tick advances exactly one image. Trackpad
+    // gets native scroll. The trick is detecting them apart on macOS, where both
+    // arrive as deltaMode=0 (PIXEL) wheel events with arbitrary deltaY. We latch
+    // a classification per "scroll session" (200 ms gap = new session) and decide
+    // off the FIRST event in each session:
+    //   - deltaMode != 0 (Win/Linux scroll line/page) -> wheel
+    //   - deltaY is an integer with |deltaY| >= 4 -> wheel (mac wheel emits 4, 8,
+    //     16, 32, 120 etc per tick / acceleration burst)
+    //   - otherwise (small or fractional) -> trackpad
+    // Then throttle wheel snaps to one per 80 ms so the acceleration burst that
+    // fires 3-4 events per physical tick still advances by exactly one.
+    var lastWheelEventAt = 0;
     var lastWheelTickAt = 0;
+    var sessionClass = null;  // 'wheel' | 'trackpad' | null
     var WHEEL_TICK_MIN_MS = 80;
-    function isMouseWheel(e) {
-      if (e.deltaMode !== 0) return true;
-      if (e.deltaY === 0) return false;
-      return e.deltaY === Math.trunc(e.deltaY);
+    var WHEEL_SESSION_GAP_MS = 200;
+    function classifyWheel(e, now) {
+      if (now - lastWheelEventAt > WHEEL_SESSION_GAP_MS) sessionClass = null;
+      lastWheelEventAt = now;
+      if (sessionClass) return sessionClass;
+      if (e.deltaMode !== 0) { sessionClass = 'wheel'; return sessionClass; }
+      var ay = Math.abs(e.deltaY);
+      if (ay >= 4 && e.deltaY === Math.trunc(e.deltaY)) {
+        sessionClass = 'wheel';
+      } else {
+        sessionClass = 'trackpad';
+      }
+      return sessionClass;
     }
     filmstripEl.addEventListener('wheel', function (e) {
-      if (!isMouseWheel(e)) return;  // trackpad — let native scroll handle it
-      e.preventDefault();
       var now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+      var cls = classifyWheel(e, now);
+      if (cls !== 'wheel') return;
+      e.preventDefault();
       if (now - lastWheelTickAt < WHEEL_TICK_MIN_MS) return;
       lastWheelTickAt = now;
       shiftFocus(e.deltaY > 0 ? +1 : -1);
