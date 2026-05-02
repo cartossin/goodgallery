@@ -1832,7 +1832,10 @@
         // #sizeN deep link: route through refreshfromhash which already parses it.
         refreshfromhash();
       } else if (!raw || raw.charAt(0) === ':') {
-        displaythumbs();
+        // Empty hash on first load: route through refreshfromhash so the
+        // default-level logic applies (displaythumbs alone reads the initial
+        // lastGridLevelIdx=0 and renders at All).
+        refreshfromhash();
       } else if (lastimagevalue > 0) {
         var found = 0;
         for (var j = 1; j <= lastimagevalue; j++) if (raw === images[j]) { inum = j; found = 1; break; }
