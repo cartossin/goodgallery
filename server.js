@@ -42,7 +42,8 @@ const LOD_TIERS = [
   { h: 100, format: 'avif', quality: 80 },
   { h: 200, format: 'avif', quality: 80 },
   { h: 400, format: 'avif', quality: 80 },
-  { h: 800, format: 'avif', quality: 80 },
+  { h: 800,  format: 'avif', quality: 80 },
+  { h: 1600, format: 'avif', quality: 80 },
 ];
 function lodPath(thumbDir, filename, height, format) {
   return path.join(thumbDir, filename + '.h' + height + '.' + format);

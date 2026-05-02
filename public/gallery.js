@@ -67,7 +67,7 @@
 
   // Original-image URL for a name. Per-image LoDs and atlases are built separately
   // (see getBestSrcForFocus / loadPerImageBitmap / sprite atlas). Originals are only
-  // fetched when a focused image needs more pixels than h800 provides.
+  // fetched when a focused image needs more pixels than h1600 provides.
   function originalURL(name)      { return folderURL + encodeURIComponent(name); }
 
   function $(id) { return document.getElementById(id); }
@@ -417,9 +417,9 @@
 
   // Per-image LoD: pick the smallest available tier height >= target. Tier 0 is a
   // sentinel meaning "the original file" — used when the canvas needs more pixels than
-  // h800 provides (high-DPI focus on a 1080p+ display). Available pre-built tiers match
+  // h1600 provides (4K display + retina). Available pre-built tiers match
   // the server's LOD_TIERS list.
-  var PER_IMAGE_TIERS = [100, 200, 400, 800];
+  var PER_IMAGE_TIERS = [100, 200, 400, 800, 1600];
   function pickPerImageTier(targetH) {
     for (var i = 0; i < PER_IMAGE_TIERS.length; i++) {
       if (PER_IMAGE_TIERS[i] >= targetH) return PER_IMAGE_TIERS[i];
