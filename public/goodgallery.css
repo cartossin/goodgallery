@@ -184,28 +184,15 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 /* prevent horizontal scroll due to row gap rounding */
 html, body { overflow-x: hidden; }
 
-/* Single zoom slider, visible in both grid and focus mode. Pulling the slider to 100%
-   focuses on the centered image; pulling below 100% in focus mode exits back to grid. */
+/* Discrete zoom-level control: [−] Label [+] in grid mode, [← back] in focus. */
 #prevnext { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 8px 12px; }
-#prevnext .zoom-nav { display: flex; align-items: center; gap: 8px; width: 100%; max-width: 360px; }
-.zoom-icon { color: var(--muted); font-size: 16px; line-height: 1; }
-#zoomSlider {
-  -webkit-appearance: none;
-  appearance: none;
-  flex: 1;
-  height: 4px;
-  background: var(--border);
-  border-radius: 2px;
-  outline: none;
+.zoom-control { display: flex; align-items: center; gap: 4px; user-select: none; }
+.zoom-control button {
+  background: transparent; color: var(--fg); border: 1px solid var(--border);
+  border-radius: 4px; padding: 4px 12px; min-width: 36px;
+  font: inherit; line-height: 1.2; cursor: pointer;
 }
-#zoomSlider::-webkit-slider-thumb {
-  -webkit-appearance: none;
-  appearance: none;
-  width: 14px; height: 14px;
-  background: var(--fg);
-  border-radius: 50%;
-  cursor: pointer;
-}
-#zoomSlider::-moz-range-thumb {
-  width: 14px; height: 14px; background: var(--fg); border-radius: 50%; cursor: pointer; border: none;
-}
+.zoom-control button:disabled { opacity: 0.35; cursor: default; }
+.zoom-control button:hover:not(:disabled) { background: var(--border); }
+.zoom-control .zoom-label { min-width: 80px; text-align: center; color: var(--fg); }
+.zoom-control .zoom-back { padding: 4px 14px; }

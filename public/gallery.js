@@ -200,6 +200,9 @@
   // approximation underestimates because justification can stretch rows taller than H.
   function fitAllHeight() {
     if (!window.spriteMeta || lastimagevalue < 1) return 100;
+    // images[1..N] is populated by loadImagemap. Before that loads,
+    // simulateLayoutHeight would crash on undefined entries.
+    if (!images[1]) return 100;
     var W = layoutWidth();
     var H = layoutHeight();
     var lo = 2, hi = CANONICAL_H;
@@ -251,14 +254,121 @@
     return totalH;
   }
 
-  // Zoom is in-memory only — every fresh page load starts at fit-all (0). Dragging
-  // the slider updates this value but it never persists; reload resets the view.
+  // Discrete zoom levels: each is a target row-height in CSS px (or a special
+  // 'focus' marker that swaps to the focus-mode UI). The level array is FILTERED
+  // per-gallery in availableLevels() so that small galleries (where fit-all
+  // already exceeds 'Tiny' / 'Small') don't show redundant buttons.
+  var ZOOM_LEVELS = [
+    { name: 'All',    h: null  },  // null → use fitAllHeight()
+    { name: 'Tiny',   h: 30   },
+    { name: 'Small',  h: 80   },
+    { name: 'Medium', h: 200  },
+    { name: 'Large',  h: 600  },
+    { name: 'Focus',  h: 'focus' },
+  ];
+  // Index into the filtered level list. Set on init from the hash; updated by
+  // user actions (button click, pinch, hash change). The grid level is also
+  // remembered for the back-button-from-focus → return to grid at same zoom.
+  var currentLevelIdx = 0;
+  var lastGridLevelIdx = 0;
+  // Maps the old continuous slider value (0-100) to a row height. Kept because
+  // targetRowHeight() still uses it as the canonical zoom transform.
   var currentZoom = 0;
   function getZoom() { return currentZoom; }
   function setZoom(t) {
     if (isNaN(t) || t < 0) t = 0;
     if (t > 100) t = 100;
     currentZoom = t;
+  }
+
+  // Compute the displayable (collapsed-duplicates) level list for the current
+  // gallery. Always includes index 0 (All) and the last index (Focus). Skips
+  // intermediate levels whose H is <= the previous distinct level's H.
+  function availableLevels() {
+    if (!window.spriteMeta) return [ZOOM_LEVELS[0], ZOOM_LEVELS[ZOOM_LEVELS.length - 1]];
+    var H_all = fitAllHeight();
+    var out = [];
+    var lastH = -Infinity;
+    for (var i = 0; i < ZOOM_LEVELS.length; i++) {
+      var lv = ZOOM_LEVELS[i];
+      if (lv.h === 'focus') { out.push(lv); continue; }
+      var h = (lv.h == null) ? H_all : Math.max(lv.h, H_all);
+      if (h <= lastH + 0.5) continue;  // collapses with previous level
+      out.push({ name: lv.name, h: h });
+      lastH = h;
+    }
+    return out;
+  }
+
+  // Map a row-height to the closest 0-100 zoom value, by inverting
+  // targetRowHeight()'s formula H = Hmin * (Hmax/Hmin) ** (t/100).
+  function rowHeightToZoom(H) {
+    if (!window.spriteMeta) return 0;
+    var Hmin = fitAllHeight();
+    var Hmax = CANONICAL_H;
+    if (H <= Hmin) return 0;
+    if (H >= Hmax) return 100;
+    return 100 * Math.log(H / Hmin) / Math.log(Hmax / Hmin);
+  }
+
+  // Apply a level by index. Special-cases: 'focus' marker enters focus mode
+  // on the centered-most visible image. Updates hash to reflect the new state.
+  function setLevel(idx) {
+    var levels = availableLevels();
+    if (idx < 0) idx = 0;
+    if (idx > levels.length - 1) idx = levels.length - 1;
+    currentLevelIdx = idx;
+    var lv = levels[idx];
+    if (lv.h === 'focus') {
+      var name = findCenteredImageName();
+      if (name == null && images[1]) name = images[1];  // fallback to first image
+      if (name) {
+        location.hash = encodeURIComponent(name);
+      }
+      return;
+    }
+    lastGridLevelIdx = idx;
+    setZoom(rowHeightToZoom(lv.h));
+    // If we were in focus mode, leave it.
+    if (focusedIdx > 0) {
+      location.hash = '#size' + idx;
+      return;
+    }
+    // Already in grid: just update hash + re-render.
+    var newHash = '#size' + idx;
+    if (location.hash !== newHash) {
+      // Use replaceState so back-button doesn't get cluttered with every zoom step.
+      try { history.replaceState(null, '', newHash); } catch (_) {}
+      hashmirror = 'size' + idx;
+    }
+    scheduleRender();
+    renderZoomControl();
+  }
+
+  // Build the [-] Label [+] (grid) or [<- back] (focus) control inside #zoomControl.
+  function renderZoomControl() {
+    var el = document.getElementById('zoomControl');
+    if (!el) return;
+    if (focusedIdx > 0) {
+      el.innerHTML = '<button class="zoom-back" title="Back to thumbnails">← Back</button>';
+      el.querySelector('button').addEventListener('click', function () {
+        location.hash = '#size' + lastGridLevelIdx;
+      });
+      return;
+    }
+    var levels = availableLevels();
+    var idx = currentLevelIdx;
+    if (idx < 0) idx = 0;
+    if (idx > levels.length - 1) idx = levels.length - 1;
+    var name = levels[idx].name;
+    el.innerHTML =
+      '<button class="zoom-minus" title="Zoom out"' + (idx === 0 ? ' disabled' : '') + '>−</button>' +
+      '<span class="zoom-label">' + name + '</span>' +
+      '<button class="zoom-plus" title="Zoom in">+</button>';
+    var minus = el.querySelector('.zoom-minus');
+    var plus = el.querySelector('.zoom-plus');
+    if (minus) minus.addEventListener('click', function () { setLevel(currentLevelIdx - 1); });
+    if (plus) plus.addEventListener('click', function () { setLevel(currentLevelIdx + 1); });
   }
 
   function targetRowHeight(t) {
@@ -905,7 +1015,7 @@
     var target = filmScrollForIdx1(focusedIdx, W);
     filmstripEl.scrollLeft = target;
     commandedIdx = focusedIdx;
-    var sl = $('zoomSlider'); if (sl) sl.value = '100';
+    renderZoomControl();
 
     drawFilmstrip();
     drawMainImage();
@@ -1534,8 +1644,6 @@
     }
 
     window.__lastTileRects = lastTileRects;
-    // Slider always mirrors the current zoom in grid mode.
-    var slGrid = $('zoomSlider'); if (slGrid) slGrid.value = String(Math.round(getZoom()));
     // Trigger initial paint. drawCanvasForScroll picks the right atlas + lazy-loads it.
     drawCanvasForScroll();
   }
@@ -1545,39 +1653,62 @@
   function displaythumbs() {
     showAdminBar();
     focusedIdx = 0;
-    if (location.hash) location.hash = '';
     hashmirror = '';
     setText('counter', '');
     document.body.classList.add('thumb-view');
     document.body.classList.remove('image-view');
     renderGallery();
+    renderZoomControl();
   }
 
   // ---------- hash routing ----------
   function refreshfromhash() {
     hashmirror = location.hash.slice(1);
     var raw = decodeURIComponent(hashmirror || '');
-    if (!raw || raw.charAt(0) === ':') {
-      // Empty hash (or legacy ':N') = grid view. Clear any focus and re-render.
+    // #sizeN = grid view at zoom level N (per the discrete level system).
+    var sizeMatch = raw.match(/^size(\d+)$/);
+    if (sizeMatch) {
+      var idx = parseInt(sizeMatch[1], 10);
+      var levels = availableLevels();
+      if (idx > levels.length - 1) idx = levels.length - 1;
+      currentLevelIdx = idx;
+      lastGridLevelIdx = idx;
+      var lv = levels[idx];
+      if (lv.h !== 'focus') setZoom(rowHeightToZoom(lv.h));
       focusedIdx = 0;
       document.body.classList.add('thumb-view');
       document.body.classList.remove('image-view');
       renderGallery();
+      renderZoomControl();
+      return;
+    }
+    if (!raw || raw.charAt(0) === ':') {
+      // Empty hash (or legacy ':N') = grid view at default level (All).
+      currentLevelIdx = 0;
+      lastGridLevelIdx = 0;
+      setZoom(0);
+      focusedIdx = 0;
+      document.body.classList.add('thumb-view');
+      document.body.classList.remove('image-view');
+      renderGallery();
+      renderZoomControl();
     } else {
       // #filename = focus on that image. Find by canonical name lookup.
       for (var i = 1; i <= lastimagevalue; i++) {
         if (raw === images[i]) {
           focusedIdx = i;
-          inum = i;  // keep legacy alias in sync
+          inum = i;
           document.body.classList.add('image-view');
           document.body.classList.remove('thumb-view');
           renderGallery();
+          renderZoomControl();
           return;
         }
       }
       // Unknown name — fall through to grid
       focusedIdx = 0;
       renderGallery();
+      renderZoomControl();
     }
   }
 
@@ -1645,46 +1776,16 @@
   function ggEmptyTrash()   { if (!confirm('Permanently delete ALL trashed files?')) return; trashApi('empty').then(ggExploreTrash); }
 
   // ---------- touch swipe ----------
-  function setupZoomSlider() {
-    var sl = $('zoomSlider');
-    if (!sl) return;
-    sl.value = String(getZoom());
-    sl.addEventListener('input', function () {
-      handleZoomChange(parseInt(sl.value, 10));
-    });
-  }
+  function setupZoomSlider() { renderZoomControl(); }
 
-  // Single source of truth for zoom changes. Boundary at 100:
-  //   grid + v>=100 → enter focus on centered image
-  //   focus + v<100 from the SLIDER → exit focus to grid at v
-  //   focus + v<100 from PINCH → no-op (pinch in focus is reserved for image
-  //     zoom; for now we just refuse to exit so the user doesn't get yanked
-  //     out unexpectedly. ESC + slider drag remain as exit paths.)
-  function handleZoomChange(v, fromPinch) {
-    if (isNaN(v)) v = 0;
-    if (v < 0) v = 0; if (v > 100) v = 100;
-    if (focusedIdx === 0 && v >= 100) {
-      var name = findCenteredImageName();
-      if (name) {
-        setZoom(100);
-        var sl = $('zoomSlider'); if (sl) sl.value = '100';
-        location.hash = encodeURIComponent(name);
-        return;
-      }
-    }
-    if (focusedIdx > 0 && v < 100) {
-      if (fromPinch) {
-        var slKeep = $('zoomSlider'); if (slKeep) slKeep.value = '100';
-        return;
-      }
-      setZoom(v);
-      var sl2 = $('zoomSlider'); if (sl2) sl2.value = String(v);
-      location.hash = '';
-      return;
-    }
-    setZoom(v);
-    var sl3 = $('zoomSlider'); if (sl3) sl3.value = String(Math.round(v));
-    if (focusedIdx === 0) scheduleRender();
+  // Pinch-driven level shift. Each doubling/halving of finger distance =
+  // one level. We re-baseline pinch.d0 each crossing so subsequent pinching
+  // continues to step at the same ratio.
+  function pinchAdjustLevel(d, d0) {
+    var levelDelta = Math.round(Math.log2(d / d0));
+    if (levelDelta === 0) return false;
+    setLevel(currentLevelIdx + levelDelta);
+    return true;
   }
 
   // Picks the image whose tile center is closest to viewport center. Used when the
@@ -1748,7 +1849,7 @@
     document.addEventListener('touchstart', function (e) {
       if (touchOnMain) { pinch = null; return; }
       if (e.touches.length === 2) {
-        pinch = { d0: dist(e.touches[0], e.touches[1]), v0: focusedIdx > 0 ? 100 : getZoom() };
+        pinch = { d0: dist(e.touches[0], e.touches[1]) };
         e.preventDefault();
       } else if (e.touches.length > 2) {
         pinch = null;
@@ -1763,12 +1864,9 @@
       if (!pinch || e.touches.length !== 2) return;
       var d = dist(e.touches[0], e.touches[1]);
       if (d < 1 || pinch.d0 < 1) return;
-      var newVal = Math.max(0, Math.min(100, pinch.v0 + Math.log2(d / pinch.d0) * 25));
-      handleZoomChange(newVal, true);
-      // After a mode flip the pinch baseline is stale (we may have just entered/exited
-      // focus). Reseed so further finger movement keeps tracking.
-      pinch.d0 = d;
-      pinch.v0 = focusedIdx > 0 ? 100 : newVal;
+      // Snap by level on doubling / halving of finger distance.
+      var changed = pinchAdjustLevel(d, pinch.d0);
+      if (changed) pinch.d0 = d;
     }, { passive: false });
     document.addEventListener('touchend', function (e) {
       if (e.touches.length < 2) pinch = null;

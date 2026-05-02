@@ -1483,11 +1483,7 @@ function galleryHTML({ urlPath, folders, images, spriteMeta, isAdminFlag, hasPas
 ${folders.length ? `<section id="folders">${folderCards}</section>` : ''}
 
 <div id="prevnext">
-  <div class="zoom-nav" title="Zoom — pull to 100% to focus on the centered image">
-    <span class="zoom-icon" aria-hidden="true">▫</span>
-    <input id="zoomSlider" type="range" min="0" max="100" />
-    <span class="zoom-icon" aria-hidden="true">▣</span>
-  </div>
+  <div id="zoomControl" class="zoom-control"></div>
 </div>
 
 <div id="counter"></div>
