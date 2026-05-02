@@ -839,10 +839,7 @@
   var filmstripEl = null; // filmstrip scroll container
   var filmCanvasEl = null;// canvas inside filmstrip
   var filmSpacerEl = null;
-  // Transform state for the focused image (pinch-zoom). Scale anchored at the image
-  // center; reset on every focusedIdx change so each photo opens at 1x.
-  var mainScale = 1;
-  var imgTx = 0, imgTy = 0;  // pan offset applied AFTER scale, so a finger drag of N px moves the image N px in screen space (independent of zoom level).
+  // (Image-pinch and pan removed — pinch is left to the browser's native page-zoom.)
   // Drag state for iCloud-style swipe: while dragging, the focused image translates
   // by dragDX and prev/next images are painted at offset ±viewportW from center, so
   // they peek in from the side as the finger moves. On release we either commit
@@ -850,9 +847,6 @@
   var dragActive = false;
   var dragDX = 0;
   var dragRaf = null;     // animation id for commit/revert
-  // Pan state (single-finger drag while mainScale > 1).
-  var panActive = false;
-  var panStart = null;    // { sx, sy, tx0, ty0 }
   // The source we should draw into the main canvas: bitmap + sub-rect. Updated by
   // drawMainImage (atlas low-res) and upgradeMainImage (high-LoD). Held synchronously
   // so pinch can redraw without the microtask gap that was causing a black flicker
@@ -1132,8 +1126,6 @@
     var newCenterIdx = filmCenteredIdx1(scrollLeft, W);
     if (newCenterIdx !== focusedIdx) {
       focusedIdx = newCenterIdx;
-      mainScale = 1;
-      imgTx = 0; imgTy = 0;
       // Don't null mainDrawSrc — keep it as a placeholder so the next paintMain
       // shows SOMETHING (last good frame) instead of black. drawMainImage will be
       // called next from onFilmstripScroll and will install a fresh source
@@ -1180,13 +1172,6 @@
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, g.W, g.mainH);
-    if (imgTx !== 0 || imgTy !== 0) ctx.translate(imgTx, imgTy);
-    if (mainScale !== 1) {
-      var cx = g.W / 2, cy = g.mainH / 2;
-      ctx.translate(cx, cy);
-      ctx.scale(mainScale, mainScale);
-      ctx.translate(-cx, -cy);
-    }
     if (mainDrawSrc && mainDrawSrc.bitmap) {
       ctx.drawImage(
         mainDrawSrc.bitmap,
@@ -1348,8 +1333,6 @@
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, W, mainH);
-    // No transform when dragging (we only enter the drag path at mainScale === 1).
-    // imgTx/Ty are reset to 0 on focus change, so they don't need to be applied here.
 
     function paintAt(idx1, offsetX) {
       if (idx1 < 1 || idx1 > lastimagevalue) return;
@@ -1415,7 +1398,6 @@
         mainDrawSrc = { bitmap: newSrc.bitmap, sx: newSrc.sx, sy: newSrc.sy, sw: newSrc.sw, sh: newSrc.sh, forIdx: newIdx };
       }
       focusedIdx = newIdx;
-      mainScale = 1;
       dragDX = 0;
       dragActive = false;
       // Sync the filmstrip to the new image (no chase animation needed — visual
@@ -1443,103 +1425,40 @@
   function setupMainImageGestures() {
     if (!mainEl) return;
     var swipeStart = null;
-    var pinchStart = null;
-    function tdist(t1, t2) {
-      var dx = t1.clientX - t2.clientX, dy = t1.clientY - t2.clientY;
-      return Math.sqrt(dx * dx + dy * dy);
-    }
     mainEl.addEventListener('touchstart', function (e) {
       touchOnMain = true;
       if (e.touches.length === 1) {
         swipeStart = { x: e.touches[0].clientX, y: e.touches[0].clientY, t: Date.now() };
-        pinchStart = null;
-      } else if (e.touches.length === 2) {
-        pinchStart = { d: tdist(e.touches[0], e.touches[1]), scale: mainScale };
-        swipeStart = null;
-        e.preventDefault();
-        e.stopPropagation();
       }
-    }, { passive: false });
+    }, { passive: true });
     mainEl.addEventListener('touchmove', function (e) {
-      if (pinchStart && e.touches.length === 2) {
+      if (!swipeStart || e.touches.length !== 1) return;
+      // iCloud-style horizontal commit/revert swipe between images.
+      var dx = e.touches[0].clientX - swipeStart.x;
+      var dy = e.touches[0].clientY - swipeStart.y;
+      if (!dragActive && Math.abs(dy) > Math.abs(dx) && Math.abs(dy) > 8) return;
+      if (dragActive || Math.abs(dx) > 6) {
         e.preventDefault();
-        e.stopPropagation();
-        var d = tdist(e.touches[0], e.touches[1]);
-        if (d < 1 || pinchStart.d < 1) return;
-        var newScale = pinchStart.scale * (d / pinchStart.d);
-        if (newScale < 1) newScale = 1;
-        if (newScale > 6) newScale = 6;
-        mainScale = newScale;
-        paintMain();
-        return;
-      }
-      // Single-finger drag.
-      if (swipeStart && e.touches.length === 1) {
-        e.preventDefault();  // unconditionally — touch-action:none on the main canvas
-                             // already kills native scroll, but defensive in case the
-                             // browser ignores touch-action for synthesized events.
-        if (mainScale > 1) {
-          // Pan the zoomed image. Initialize panStart on first move past the deadzone.
-          if (!panActive) {
-            var dxp = e.touches[0].clientX - swipeStart.x;
-            var dyp = e.touches[0].clientY - swipeStart.y;
-            if (Math.abs(dxp) < 6 && Math.abs(dyp) < 6) return;
-            panActive = true;
-            panStart = { sx: e.touches[0].clientX, sy: e.touches[0].clientY, tx0: imgTx, ty0: imgTy };
-          }
-          imgTx = panStart.tx0 + (e.touches[0].clientX - panStart.sx);
-          imgTy = panStart.ty0 + (e.touches[0].clientY - panStart.sy);
-          paintMain();
-          return;
-        }
-        // Not zoomed: iCloud-style horizontal commit/revert swipe.
-        var dx = e.touches[0].clientX - swipeStart.x;
-        var dy = e.touches[0].clientY - swipeStart.y;
-        if (!dragActive && Math.abs(dy) > Math.abs(dx) && Math.abs(dy) > 8) return;
-        if (dragActive || Math.abs(dx) > 6) {
-          dragActive = true;
-          dragDX = dx;
-          paintMainDragged(dragDX);
-        }
+        dragActive = true;
+        dragDX = dx;
+        paintMainDragged(dragDX);
       }
     }, { passive: false });
-    mainEl.addEventListener('touchend', function (e) {
-      // Pinch end: snap back to 1x if user released near identity.
-      if (pinchStart && e.touches.length < 2) {
-        if (mainScale < 1.05) {
-          mainScale = 1;
-          imgTx = 0; imgTy = 0;
-          paintMain();
-        }
-        pinchStart = null;
-      }
-      // Pan end: just settle. (No snap behavior — leave the image where the user left it.)
-      if (panActive) {
-        panActive = false;
-        panStart = null;
-        swipeStart = null;
-      }
-      // Drag end: commit if dragged > 30% of viewport OR flicked fast. Otherwise revert.
+    mainEl.addEventListener('touchend', function () {
       if (dragActive) {
         var W = layoutWidth();
-        var dt = Math.max(1, Date.now() - swipeStart.t);
-        var velocity = dragDX / dt;  // px/ms
+        var dt = Math.max(1, Date.now() - (swipeStart ? swipeStart.t : Date.now()));
+        var velocity = dragDX / dt;
         var commit = (Math.abs(dragDX) > W * 0.30) || (Math.abs(velocity) > 0.5 && Math.abs(dragDX) > 30);
-        if (commit) {
-          // dragDX > 0 means user dragged right → previous image. direction = -1.
-          commitDrag(dragDX > 0 ? -1 : +1);
-        } else {
-          revertDrag();
-        }
-        swipeStart = null;
-      } else if (swipeStart) {
-        swipeStart = null;
+        if (commit) commitDrag(dragDX > 0 ? -1 : +1);
+        else revertDrag();
       }
-      if (e.touches.length === 0) touchOnMain = false;
+      swipeStart = null;
+      touchOnMain = false;
     });
     mainEl.addEventListener('touchcancel', function () {
-      pinchStart = null; swipeStart = null; touchOnMain = false;
-      panActive = false; panStart = null;
+      swipeStart = null;
+      touchOnMain = false;
       if (dragActive) revertDrag();
     });
   }
@@ -1778,15 +1697,7 @@
   // ---------- touch swipe ----------
   function setupZoomSlider() { renderZoomControl(); }
 
-  // Pinch-driven level shift. Each doubling/halving of finger distance =
-  // one level. We re-baseline pinch.d0 each crossing so subsequent pinching
-  // continues to step at the same ratio.
-  function pinchAdjustLevel(d, d0) {
-    var levelDelta = Math.round(Math.log2(d / d0));
-    if (levelDelta === 0) return false;
-    setLevel(currentLevelIdx + levelDelta);
-    return true;
-  }
+
 
   // Picks the image whose tile center is closest to viewport center. Used when the
   // slider is dragged to 100% in grid mode to choose what image to focus on.
@@ -1826,52 +1737,6 @@
       }
     }, { passive: false });
 
-    // Pinch-to-zoom drives the slider regardless of where the gesture starts on
-    // the page. The handlers are bound at the document level for two reasons:
-    //   1. iOS Safari deliberately ignores user-scalable=no — the only reliable way
-    //      to block native pinch-zoom is preventDefault on every 2-finger touchmove
-    //      AND on Safari's gesture* events. Binding to #thumbs only would let a pinch
-    //      that started in the topbar/footer fall through to native browser zoom.
-    //   2. The user expects to pinch anywhere; a thumbs-bound handler felt arbitrary.
-    // Mapping is logarithmic: a doubling of finger distance moves the slider +25.
-    var pinch = null;
-    function dist(t1, t2) {
-      var dx = t1.clientX - t2.clientX, dy = t1.clientY - t2.clientY;
-      return Math.sqrt(dx * dx + dy * dy);
-    }
-    // Safari-only "gesture*" events represent the pinch directly. Blocking them is
-    // the most reliable suppressor of browser pinch-zoom on iOS / desktop Safari.
-    function blockGesture(e) { e.preventDefault(); }
-    document.addEventListener('gesturestart',  blockGesture, { passive: false });
-    document.addEventListener('gesturechange', blockGesture, { passive: false });
-    document.addEventListener('gestureend',    blockGesture, { passive: false });
-
-    document.addEventListener('touchstart', function (e) {
-      if (touchOnMain) { pinch = null; return; }
-      if (e.touches.length === 2) {
-        pinch = { d0: dist(e.touches[0], e.touches[1]) };
-        e.preventDefault();
-      } else if (e.touches.length > 2) {
-        pinch = null;
-        e.preventDefault();
-      } else {
-        pinch = null;
-      }
-    }, { passive: false });
-    document.addEventListener('touchmove', function (e) {
-      if (touchOnMain) return;  // mainEl handler owns this gesture
-      if (e.touches.length >= 2) e.preventDefault();  // unconditionally block native pinch zoom
-      if (!pinch || e.touches.length !== 2) return;
-      var d = dist(e.touches[0], e.touches[1]);
-      if (d < 1 || pinch.d0 < 1) return;
-      // Snap by level on doubling / halving of finger distance.
-      var changed = pinchAdjustLevel(d, pinch.d0);
-      if (changed) pinch.d0 = d;
-    }, { passive: false });
-    document.addEventListener('touchend', function (e) {
-      if (e.touches.length < 2) pinch = null;
-    });
-    document.addEventListener('touchcancel', function () { pinch = null; });
   }
 
   // ---------- thumb click delegation ----------
