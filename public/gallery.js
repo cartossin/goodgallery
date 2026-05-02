@@ -928,9 +928,14 @@
     filmstripEl.addEventListener('mousedown', cancelChaseFromUser);
     setupMainImageGestures();
 
+    // Position the filmstrip; this is NOT a chase animation (just a sync seek
+    // to the focused image). Don't set focusInProgrammaticScroll — doing so
+    // without a chase to clear it leaves the flag stuck true, which makes
+    // shiftFocus permanently use commandedIdx as the base instead of focusedIdx.
+    // Result: arrow keys could only ever go to commandedIdx +/- 1.
     var target = filmScrollForIdx1(focusedIdx, W);
-    focusInProgrammaticScroll = true;
     filmstripEl.scrollLeft = target;
+    commandedIdx = focusedIdx;
     var sl = $('zoomSlider'); if (sl) sl.value = '100';
 
     drawFilmstrip();
