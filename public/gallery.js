@@ -965,7 +965,48 @@
       var lastSp = Math.floor(flast / atlasMeta.cellsPerSprite);
       for (var fs = firstSp; fs <= lastSp; fs++) loadSpriteAt(atlasH, fs);
     })();
-    var bitmapsPromise = Promise.resolve([]);
+    // Paint synchronously from atlasBitmapsSync — sprites populate the sparse
+    // mirror as they decode. Tiles whose sprite isn't yet loaded skip; the
+    // onSpriteBitmapReady waiter below re-runs the paint when each sprite
+    // arrives so the strip fills in incrementally.
+    if (!filmCanvasEl) return;
+    var paintFilmstripTiles = function () {
+      if (!filmCanvasEl) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.fillStyle = '#0a0a0a';
+      ctx.fillRect(0, 0, W, FILM_H);
+      var bitmaps = atlasBitmapsSync[String(atlasH)] || [];
+      var n = filmTilePos.length;
+      var lo2 = 0, hi2 = n - 1;
+      while (lo2 < hi2) {
+        var mid = (lo2 + hi2) >> 1;
+        if (filmTilePos[mid] + filmTileW[mid] <= leftEdge) lo2 = mid + 1;
+        else hi2 = mid;
+      }
+      var aCellW = atlas.cellW, aCellH = atlas.cellH;
+      var aPerSprite = atlas.cellsPerSprite, aAcross = atlas.across;
+      var srcScale = aCellH / FILM_TILE_H;
+      for (var ti = lo2; ti < n; ti++) {
+        var tx = filmTilePos[ti];
+        var tw = filmTileW[ti];
+        if (tx > rightEdge) break;
+        var screenX = tx - leftEdge;
+        var spriteIdx = Math.floor(ti / aPerSprite);
+        var posInSprite = ti % aPerSprite;
+        var row = Math.floor(posInSprite / aAcross);
+        var col = posInSprite % aAcross;
+        var bm = bitmaps[spriteIdx];
+        if (!bm) continue;
+        var srcW = Math.round(tw * srcScale);
+        ctx.drawImage(bm, col * aCellW, row * aCellH, srcW, aCellH, screenX, yPad, tw, FILM_TILE_H);
+        if (ti + 1 === focusedIdx) {
+          ctx.strokeStyle = '#fff';
+          ctx.lineWidth = 1.5;
+          ctx.strokeRect(screenX + 0.5, yPad + 0.5, tw - 1, FILM_TILE_H - 1);
+        }
+      }
+    };
+    onSpriteBitmapReady(atlasH, function () { paintFilmstripTiles(); });
 
     var scrollLeft = filmstripEl.scrollLeft;
     var leftEdge = scrollLeft - filmPadL;
@@ -984,44 +1025,7 @@
       try { history.replaceState(null, '', '#' + encodeURIComponent(images[focusedIdx])); } catch (_) {}
     }
 
-    bitmapsPromise.then(function (bitmaps) {
-      if (!filmCanvasEl) return;
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.fillStyle = '#0a0a0a';
-      ctx.fillRect(0, 0, W, FILM_H);
-      var n = filmTilePos.length;
-      var lo = 0, hi = n - 1;
-      while (lo < hi) {
-        var mid = (lo + hi) >> 1;
-        if (filmTilePos[mid] + filmTileW[mid] <= leftEdge) lo = mid + 1;
-        else hi = mid;
-      }
-      var aCellW = atlas.cellW, aCellH = atlas.cellH;
-      var aPerSprite = atlas.cellsPerSprite, aAcross = atlas.across;
-      // Source from the atlas at its full h50 cell size; drawImage downscales to
-      // FILM_TILE_H (=30) for the displayed thumb. srcW = atlas-cell width for
-      // this image (loc.w * 50/CANONICAL_H == filmTileW * 50/FILM_TILE_H).
-      var srcScale = aCellH / FILM_TILE_H;
-      for (var i = lo; i < n; i++) {
-        var tx = filmTilePos[i];
-        var tw = filmTileW[i];
-        if (tx > rightEdge) break;
-        var screenX = tx - leftEdge;
-        var spriteIdx = Math.floor(i / aPerSprite);
-        var posInSprite = i % aPerSprite;
-        var row = Math.floor(posInSprite / aAcross);
-        var col = posInSprite % aAcross;
-        var bitmap = bitmaps[spriteIdx];
-        if (!bitmap) continue;
-        var srcW = Math.round(tw * srcScale);
-        ctx.drawImage(bitmap, col * aCellW, row * aCellH, srcW, aCellH, screenX, yPad, tw, FILM_TILE_H);
-        if (i + 1 === focusedIdx) {
-          ctx.strokeStyle = '#fff';
-          ctx.lineWidth = 1.5;
-          ctx.strokeRect(screenX + 0.5, yPad + 0.5, tw - 1, FILM_TILE_H - 1);
-        }
-      }
-    });
+    paintFilmstripTiles();
   }
 
   // Geometry helper: where + how big to draw the main image. Shared by drawMainImage
