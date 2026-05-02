@@ -269,13 +269,25 @@
   // Index into the filtered level list. Set on init from the hash; updated by
   // user actions (button click, pinch, hash change). The grid level is also
   // remembered for the back-button-from-focus → return to grid at same zoom.
-  // Default to Small (idx 2) instead of All. For huge galleries (OI 41k) the
-  // All view shows pixel-sized thumbs that invite pinch-to-zoom; opening at
-  // Small gives a usable starting state. availableLevels() may collapse this
-  // down for small galleries — clampLevelToAvailable() handles that.
-  var DEFAULT_LEVEL_IDX = 2;
-  var currentLevelIdx = DEFAULT_LEVEL_IDX;
-  var lastGridLevelIdx = DEFAULT_LEVEL_IDX;
+  // Default opens at "Small" — name-based so the meaning is stable across
+  // galleries (a fixed index would land on different levels depending on which
+  // collapsed in availableLevels for that particular gallery's fit-all H).
+  var DEFAULT_LEVEL_NAME = 'Small';
+  function defaultLevelIdx() {
+    var levels = availableLevels();
+    for (var i = 0; i < levels.length; i++) {
+      if (levels[i].name === DEFAULT_LEVEL_NAME) return i;
+    }
+    // Small isn't present (very tiny gallery where it collapses with All) —
+    // fall back to the largest non-Focus level.
+    var fallback = 0;
+    for (var j = 0; j < levels.length; j++) {
+      if (levels[j].h !== 'focus') fallback = j;
+    }
+    return fallback;
+  }
+  var currentLevelIdx = 0;
+  var lastGridLevelIdx = 0;
   // Discrete level system sets levelTargetH directly, bypassing the continuous
   // zoom transform (which caps at CANONICAL_H = 200 — Medium and Large
   // collapsed onto the same render).
@@ -1649,9 +1661,8 @@
     if (!raw || raw.charAt(0) === ':') {
       // Empty hash (or legacy ':N') = grid view at the default level. Don't
       // touch the URL — it stays clean even though we render at level idx.
+      var idx = defaultLevelIdx();
       var levels = availableLevels();
-      var idx = DEFAULT_LEVEL_IDX;
-      if (idx > levels.length - 1) idx = levels.length - 1;
       currentLevelIdx = idx;
       lastGridLevelIdx = idx;
       var lv = levels[idx];
