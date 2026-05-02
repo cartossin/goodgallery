@@ -104,7 +104,7 @@
         var active = (p.pending || 0) + (p.inProgress || 0);
         if (active > 0) {
           note('Building LoD cache — ' + active + ' remaining (' + p.done + '/' + p.total + ' done)');
-          statusTimer = setTimeout(function () { pollBuildStatus({ reloadOnComplete: reloadOnComplete }); }, 700);
+          statusTimer = setTimeout(function () { pollBuildStatus({ reloadOnComplete: reloadOnComplete }); }, 5000);
         } else if (reloadOnComplete && p.total > 0) {
           note('Build complete (' + p.done + '/' + p.total + '). Reloading…');
           setTimeout(function () { location.reload(); }, 800);
