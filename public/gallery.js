@@ -269,8 +269,13 @@
   // Index into the filtered level list. Set on init from the hash; updated by
   // user actions (button click, pinch, hash change). The grid level is also
   // remembered for the back-button-from-focus → return to grid at same zoom.
-  var currentLevelIdx = 0;
-  var lastGridLevelIdx = 0;
+  // Default to Small (idx 2) instead of All. For huge galleries (OI 41k) the
+  // All view shows pixel-sized thumbs that invite pinch-to-zoom; opening at
+  // Small gives a usable starting state. availableLevels() may collapse this
+  // down for small galleries — clampLevelToAvailable() handles that.
+  var DEFAULT_LEVEL_IDX = 2;
+  var currentLevelIdx = DEFAULT_LEVEL_IDX;
+  var lastGridLevelIdx = DEFAULT_LEVEL_IDX;
   // Discrete level system sets levelTargetH directly, bypassing the continuous
   // zoom transform (which caps at CANONICAL_H = 200 — Medium and Large
   // collapsed onto the same render).
@@ -1594,10 +1599,15 @@
       return;
     }
     if (!raw || raw.charAt(0) === ':') {
-      // Empty hash (or legacy ':N') = grid view at default level (All).
-      currentLevelIdx = 0;
-      lastGridLevelIdx = 0;
-      setZoom(0);
+      // Empty hash (or legacy ':N') = grid view at the default level. Don't
+      // touch the URL — it stays clean even though we render at level idx.
+      var levels = availableLevels();
+      var idx = DEFAULT_LEVEL_IDX;
+      if (idx > levels.length - 1) idx = levels.length - 1;
+      currentLevelIdx = idx;
+      lastGridLevelIdx = idx;
+      var lv = levels[idx];
+      if (lv.h !== 'focus') levelTargetH = lv.h;
       focusedIdx = 0;
       document.body.classList.add('thumb-view');
       document.body.classList.remove('image-view');
