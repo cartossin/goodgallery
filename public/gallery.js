@@ -893,43 +893,36 @@
     }
     filmstripEl.addEventListener('wheel', cancelChaseFromUser, { passive: true });
 
-    // Mouse-wheel snap: each wheel tick advances exactly one image. Trackpad
-    // gets native scroll. The trick is detecting them apart on macOS, where both
-    // arrive as deltaMode=0 (PIXEL) wheel events with arbitrary deltaY. We latch
-    // a classification per "scroll session" (200 ms gap = new session) and decide
-    // off the FIRST event in each session:
-    //   - deltaMode != 0 (Win/Linux scroll line/page) -> wheel
-    //   - deltaY is an integer with |deltaY| >= 4 -> wheel (mac wheel emits 4, 8,
-    //     16, 32, 120 etc per tick / acceleration burst)
-    //   - otherwise (small or fractional) -> trackpad
-    // Then throttle wheel snaps to one per 80 ms so the acceleration burst that
-    // fires 3-4 events per physical tick still advances by exactly one.
+    // Filmstrip wheel handling. We intercept ALL wheel events (regardless of
+    // source) and translate them to image shifts via an accumulator. This works
+    // identically for mouse wheel, trackpad, and Magic Mouse without trying to
+    // distinguish between them, which is unreliable on macOS (both arrive as
+    // deltaMode=0 pixel events with arbitrary deltaY).
+    //
+    // The accumulator collects deltaY values until they cross IMG_WIDTH worth of
+    // "distance", at which point we shift one image. This gives:
+    //   - Mouse wheel single click (deltaY=4): accumulates over multiple ticks
+    //     until it crosses the threshold, then snaps. Adjustable via WHEEL_PER_IMAGE.
+    //   - Mouse wheel acceleration burst (deltaY=120): instantly crosses, advances
+    //     1-2 images per burst.
+    //   - Trackpad swipe (deltaY=200 over 20 events): smooth advance through
+    //     ~3 images, paced by the swipe.
+    // 200ms gap = new session (resets the accumulator).
+    var WHEEL_PER_IMAGE = 60;  // pixels of scroll wheel that = one image
+    var wheelAccum = 0;
     var lastWheelEventAt = 0;
-    var lastWheelTickAt = 0;
-    var sessionClass = null;  // 'wheel' | 'trackpad' | null
-    var WHEEL_TICK_MIN_MS = 80;
-    var WHEEL_SESSION_GAP_MS = 200;
-    function classifyWheel(e, now) {
-      if (now - lastWheelEventAt > WHEEL_SESSION_GAP_MS) sessionClass = null;
-      lastWheelEventAt = now;
-      if (sessionClass) return sessionClass;
-      if (e.deltaMode !== 0) { sessionClass = 'wheel'; return sessionClass; }
-      var ay = Math.abs(e.deltaY);
-      if (ay >= 4 && e.deltaY === Math.trunc(e.deltaY)) {
-        sessionClass = 'wheel';
-      } else {
-        sessionClass = 'trackpad';
-      }
-      return sessionClass;
-    }
     filmstripEl.addEventListener('wheel', function (e) {
-      var now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
-      var cls = classifyWheel(e, now);
-      if (cls !== 'wheel') return;
       e.preventDefault();
-      if (now - lastWheelTickAt < WHEEL_TICK_MIN_MS) return;
-      lastWheelTickAt = now;
-      shiftFocus(e.deltaY > 0 ? +1 : -1);
+      var now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+      if (now - lastWheelEventAt > 200) wheelAccum = 0;
+      lastWheelEventAt = now;
+      // deltaY is the dominant axis on Mac (vertical wheel auto-translates to
+      // horizontal on overflow-x:auto) but include deltaX for completeness.
+      wheelAccum += (Math.abs(e.deltaY) >= Math.abs(e.deltaX)) ? e.deltaY : e.deltaX;
+      while (Math.abs(wheelAccum) >= WHEEL_PER_IMAGE) {
+        shiftFocus(wheelAccum > 0 ? +1 : -1);
+        wheelAccum -= (wheelAccum > 0 ? 1 : -1) * WHEEL_PER_IMAGE;
+      }
     }, { passive: false });
     filmstripEl.addEventListener('touchstart', cancelChaseFromUser, { passive: true });
     filmstripEl.addEventListener('mousedown', cancelChaseFromUser);
