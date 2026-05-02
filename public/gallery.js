@@ -349,20 +349,58 @@
   var thumbsScrollAttached = false;
   var pendingScrollDraw = false;
 
+  // Per-atlas-height per-sprite-index callbacks: { '50': [fn, fn, ...] } where
+  // fn(bitmap, spriteIdx) fires when that particular sprite finishes decoding.
+  // Used by drawMainImage / drawCanvasForScroll to repaint the moment the sprite
+  // they need becomes available, instead of waiting for the whole-atlas Promise.all.
+  var spriteBitmapWaiters = {};
+
+  function onSpriteBitmapReady(atlasH, fn) {
+    var key = String(atlasH);
+    if (!spriteBitmapWaiters[key]) spriteBitmapWaiters[key] = [];
+    spriteBitmapWaiters[key].push(fn);
+  }
+
+  // Per-sprite promise cache: spritePromises['50'][7] is the in-flight or
+  // resolved promise for sprite 7 of the h50 atlas. Loading on-demand instead of
+  // whole-atlas-at-once prevents the ~1.7 GB decode spike when entering focus
+  // on a 41k-image gallery (which kills iOS Safari and stresses Chrome).
+  var spritePromises = {};
+
+  function loadSpriteAt(atlasH, spriteIdx) {
+    var key = String(atlasH);
+    if (!spritePromises[key]) spritePromises[key] = {};
+    if (spritePromises[key][spriteIdx]) return spritePromises[key][spriteIdx];
+    var atlas = window.spriteMeta && spriteMeta.atlases && spriteMeta.atlases[key];
+    if (!atlas || !atlas.sprites[spriteIdx]) return Promise.resolve(null);
+    if (!atlasBitmapsSync[key]) atlasBitmapsSync[key] = new Array(atlas.sprites.length).fill(null);
+    var url = folderURL + GG_DIR + '/' + atlas.sprites[spriteIdx].file;
+    spritePromises[key][spriteIdx] = fetch(url, { credentials: 'same-origin' })
+      .then(function (r) { return r.blob(); })
+      .then(function (b) { return createImageBitmap(b); })
+      .then(function (bm) {
+        atlasBitmapsSync[key][spriteIdx] = bm;
+        var ws = spriteBitmapWaiters[key];
+        if (ws) for (var w = 0; w < ws.length; w++) {
+          try { ws[w](bm, spriteIdx); } catch (_) {}
+        }
+        return bm;
+      });
+    return spritePromises[key][spriteIdx];
+  }
+
+  // Backwards-compat: load every sprite for an atlas height. Used by the few
+  // callers that genuinely need everything (currently none after the per-sprite
+  // refactor below; kept as a safety helper).
   function loadSpriteBitmapsForAtlas(atlasH) {
     var key = String(atlasH);
     if (spriteBitmapsByHeight[key]) return spriteBitmapsByHeight[key];
     var atlas = window.spriteMeta && spriteMeta.atlases && spriteMeta.atlases[key];
     if (!atlas) return Promise.resolve([]);
-    spriteBitmapsByHeight[key] = Promise.all(atlas.sprites.map(function (sp) {
-      var url = folderURL + GG_DIR + '/' + sp.file;
-      return fetch(url, { credentials: 'same-origin' })
-        .then(function (r) { return r.blob(); })
-        .then(function (b) { return createImageBitmap(b); });
-    })).then(function (bitmaps) {
-      atlasBitmapsSync[key] = bitmaps;
-      return bitmaps;
-    });
+    if (!atlasBitmapsSync[key]) atlasBitmapsSync[key] = new Array(atlas.sprites.length).fill(null);
+    var ps = [];
+    for (var i = 0; i < atlas.sprites.length; i++) ps.push(loadSpriteAt(atlasH, i));
+    spriteBitmapsByHeight[key] = Promise.all(ps);
     return spriteBitmapsByHeight[key];
   }
 
@@ -571,27 +609,60 @@
       // ATLAS PATH: target row height is small enough that a sprite atlas at H<=50
       // covers it. One atlas image, many tiles drawn from offsets within it.
       var atlas = spriteMeta.atlases[String(atlasH)];
-      loadSpriteBitmapsForAtlas(atlasH).then(function (bitmaps) {
-        if (!canvasEl || renderFrame !== myFrame) return;
+      // Paint each visible tile from the BEST currently-cached atlas tier.
+      // bestCachedAtlasSrc walks h50 -> h10 -> h5 and returns whichever is
+      // loaded for this image. So if the user just dragged the slider into
+      // h50 territory but h50 isn't loaded yet, tiles render from h10 or h5
+      // (blurrier, scaled up) instead of leaving the dark canvas background
+      // visible. The picked atlas's per-sprite-arrival callback then upgrades
+      // each tile in place when the higher-res sprite lands.
+      var aCellW = atlas.cellW, aCellH = atlas.cellH;
+      var aPerSprite = atlas.cellsPerSprite, aAcross = atlas.across;
+      var canonicalH = 200;
+      function paintTileFromBitmap(t, bitmap, atlasMeta) {
+        var loc = spriteMeta.imageMap[t.name];
+        if (!loc) return;
+        var idx = loc.idx;
+        var spriteIdx = Math.floor(idx / atlasMeta.cellsPerSprite);
+        var posInSprite = idx % atlasMeta.cellsPerSprite;
+        var row = Math.floor(posInSprite / atlasMeta.across);
+        var col = posInSprite % atlasMeta.across;
+        var srcW = Math.round(loc.w * (atlasMeta.cellH / canonicalH));
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        var aCellW = atlas.cellW, aCellH = atlas.cellH;
-        var aPerSprite = atlas.cellsPerSprite, aAcross = atlas.across;
-        var canonicalH = 200;
-        for (var k = 0; k < visible.length; k++) {
-          var t = visible[k];
+        ctx.drawImage(bitmap, col * atlasMeta.cellW, row * atlasMeta.cellH, srcW, atlasMeta.cellH, t.x, t.y - scrollY, t.w, t.h);
+      }
+      // First pass: paint each tile from the best cached atlas (any height).
+      // bestCachedAtlasSrc returns { bitmap, sx, sy, sw, sh } so we can blit
+      // directly without recomputing per-atlas geometry.
+      for (var k = 0; k < visible.length; k++) {
+        var t = visible[k];
+        var as = bestCachedAtlasSrc(t.name);
+        if (as) {
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          ctx.drawImage(as.bitmap, as.sx, as.sy, as.sw, as.sh, t.x, t.y - scrollY, t.w, t.h);
+        }
+      }
+      // Load ONLY sprites that contain visible tiles. This is the key change for
+      // iOS memory: prevents 30-sprite parallel decode spike on focus entry.
+      var visibleSnapshot = visible;
+      var neededIdxs = {};
+      for (var nk = 0; nk < visible.length; nk++) {
+        var nloc = spriteMeta.imageMap[visible[nk].name];
+        if (nloc) neededIdxs[Math.floor(nloc.idx / aPerSprite)] = true;
+      }
+      onSpriteBitmapReady(atlasH, function (bm, spriteIdx) {
+        if (!canvasEl || renderFrame !== myFrame) return;
+        for (var k = 0; k < visibleSnapshot.length; k++) {
+          var t = visibleSnapshot[k];
           var loc = spriteMeta.imageMap[t.name];
           if (!loc) continue;
-          var idx = loc.idx;
-          var spriteIdx = Math.floor(idx / aPerSprite);
-          var posInSprite = idx % aPerSprite;
-          var row = Math.floor(posInSprite / aAcross);
-          var col = posInSprite % aAcross;
-          var bitmap = bitmaps[spriteIdx];
-          if (!bitmap) continue;
-          var srcW = Math.round(loc.w * (aCellH / canonicalH));
-          ctx.drawImage(bitmap, col * aCellW, row * aCellH, srcW, aCellH, t.x, t.y - scrollY, t.w, t.h);
+          if (Math.floor(loc.idx / aPerSprite) === spriteIdx) {
+            paintTileFromBitmap(t, bm, atlas);
+          }
         }
       });
+      var needList = Object.keys(neededIdxs);
+      for (var ni = 0; ni < needList.length; ni++) loadSpriteAt(atlasH, parseInt(needList[ni], 10));
     } else {
       // PER-IMAGE PATH: target row height too big for the atlas. Each tile fetches its
       // own AVIF at the appropriate LoD tier. Decodes happen in parallel and the canvas
@@ -870,7 +941,31 @@
     var atlasH = 50;
     var atlas = spriteMeta.atlases && spriteMeta.atlases[String(atlasH)];
     if (!atlas) return;
-    var bitmapsPromise = loadSpriteBitmapsForAtlas(atlasH);
+    // Load only sprites that cover the visible filmstrip range. Avoids the
+    // ~1.7 GB decode burst from loading all 30 OI h50 sprites on focus entry.
+    (function () {
+      if (!filmTilePos || filmTilePos.length === 0) return;
+      var atlasMeta = spriteMeta && spriteMeta.atlases && spriteMeta.atlases[String(atlasH)];
+      if (!atlasMeta) return;
+      var fsl = filmstripEl.scrollLeft;
+      var leftE = fsl - filmPadL;
+      var rightE = leftE + W;
+      var fn = filmTilePos.length;
+      var flo = 0, fhi = fn - 1;
+      while (flo < fhi) {
+        var fmid = (flo + fhi) >> 1;
+        if (filmTilePos[fmid] + filmTileW[fmid] <= leftE) flo = fmid + 1; else fhi = fmid;
+      }
+      var ffirst = flo, flast = flo;
+      for (var fi = flo; fi < fn; fi++) {
+        if (filmTilePos[fi] > rightE) break;
+        flast = fi;
+      }
+      var firstSp = Math.floor(ffirst / atlasMeta.cellsPerSprite);
+      var lastSp = Math.floor(flast / atlasMeta.cellsPerSprite);
+      for (var fs = firstSp; fs <= lastSp; fs++) loadSpriteAt(atlasH, fs);
+    })();
+    var bitmapsPromise = Promise.resolve([]);
 
     var scrollLeft = filmstripEl.scrollLeft;
     var leftEdge = scrollLeft - filmPadL;
@@ -882,7 +977,10 @@
       focusedIdx = newCenterIdx;
       mainScale = 1;
       imgTx = 0; imgTy = 0;
-      mainDrawSrc = null;  // cached bitmap is for the previous image
+      // Don't null mainDrawSrc — keep it as a placeholder so the next paintMain
+      // shows SOMETHING (last good frame) instead of black. drawMainImage will be
+      // called next from onFilmstripScroll and will install a fresh source
+      // immediately (atlas h50 falls out of getBestSrcForFocus).
       try { history.replaceState(null, '', '#' + encodeURIComponent(images[focusedIdx])); } catch (_) {}
     }
 
@@ -962,15 +1060,6 @@
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, g.W, g.mainH);
-    // Order matters here. We want: scale around image center, THEN translate by
-    // (imgTx, imgTy) so a 100px finger drag moves the image 100px on screen
-    // regardless of zoom level. In canvas, the LAST transform applied is the
-    // INNERMOST (closest to drawImage), and operations apply right-to-left, so:
-    //   ctx.translate(tx, ty)        ← applied last in source = first in math
-    // ...wait, actually the convention is: source-order transforms are applied to
-    // coordinates left-to-right (each one wraps the previous), so ctx.translate
-    // before drawImage applies to the draw coords. To translate AFTER scale, the
-    // translate must come BEFORE the scale block in source.
     if (imgTx !== 0 || imgTy !== 0) ctx.translate(imgTx, imgTy);
     if (mainScale !== 1) {
       var cx = g.W / 2, cy = g.mainH / 2;
@@ -978,7 +1067,7 @@
       ctx.scale(mainScale, mainScale);
       ctx.translate(-cx, -cy);
     }
-    if (mainDrawSrc && mainDrawSrc.forIdx === focusedIdx) {
+    if (mainDrawSrc && mainDrawSrc.bitmap) {
       ctx.drawImage(
         mainDrawSrc.bitmap,
         mainDrawSrc.sx, mainDrawSrc.sy, mainDrawSrc.sw, mainDrawSrc.sh,
@@ -1000,12 +1089,10 @@
     var src = getBestSrcForFocus(focusedIdx, targetH);
     if (src) {
       mainDrawSrc = { bitmap: src.bitmap, sx: src.sx, sy: src.sy, sw: src.sw, sh: src.sh, forIdx: focusedIdx };
-      paintMain();
-    } else {
-      // Atlas not loaded yet on first ever entry; clear and wait for atlas .then.
-      mainDrawSrc = null;
-      paintMain();
     }
+    // If src is null (atlas not loaded yet), keep the previous mainDrawSrc so
+    // paintMain still shows the last good frame instead of a black flash.
+    paintMain();
 
     // Kick off the target-tier load if not already in flight; when it resolves we
     // upgrade mainDrawSrc and repaint. No debounce — we want the highest-res tier
@@ -1020,17 +1107,21 @@
       });
     }
 
-    // If we didn't have any bitmap at all, also kick off the atlas so the first
-    // frame after entry isn't black for long.
+    // If we didn't have any bitmap at all yet, kick off atlas load AND register
+    // a per-sprite waiter so we paint the instant OUR sprite arrives — rather than
+    // waiting for every sprite in the atlas to decode. With OI's 32 h50 sprites
+    // that turns ~1s of black canvas into <100ms.
     if (!src) {
       var atlasH = 50;
       var atlas = spriteMeta.atlases && spriteMeta.atlases[String(atlasH)];
       if (atlas) {
-        loadSpriteBitmapsForAtlas(atlasH).then(function () {
+        var neededSpriteIdx = Math.floor((capturedIdx - 1) / atlas.cellsPerSprite);
+        loadSpriteAt(atlasH, neededSpriteIdx);
+        onSpriteBitmapReady(atlasH, function (bm, spriteIdx) {
+          if (spriteIdx !== neededSpriteIdx) return;
           if (!mainEl || focusedIdx !== capturedIdx) return;
           var atlasSrc = getAtlasSrcSync(capturedIdx);
           if (!atlasSrc) return;
-          // Only set if we still don't have a better bitmap.
           if (!mainDrawSrc || mainDrawSrc.forIdx !== capturedIdx) {
             mainDrawSrc = { bitmap: atlasSrc.bitmap, sx: atlasSrc.sx, sy: atlasSrc.sy, sw: atlasSrc.sw, sh: atlasSrc.sh, forIdx: capturedIdx };
             paintMain();
@@ -1196,11 +1287,12 @@
       while (newIdx > lastimagevalue) newIdx -= lastimagevalue;
       // Pre-populate the new mainDrawSrc from the atlas if available, so the next paint
       // doesn't black-flicker while the atlas .then() resolves on a microtask.
-      var newSrc = getAtlasSrcSync(newIdx);
+      // Pre-populate with best cached source for the new image. If nothing's
+      // cached, keep the previous mainDrawSrc as a placeholder so paintMain doesn't
+      // black-flash; drawMainImage's load callback will overwrite when ready.
+      var newSrc = getBestSrcForFocus(newIdx, mainImageGeom() && mainImageGeom().dh);
       if (newSrc) {
         mainDrawSrc = { bitmap: newSrc.bitmap, sx: newSrc.sx, sy: newSrc.sy, sw: newSrc.sw, sh: newSrc.sh, forIdx: newIdx };
-      } else {
-        mainDrawSrc = null;
       }
       focusedIdx = newIdx;
       mainScale = 1;
