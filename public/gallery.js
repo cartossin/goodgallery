@@ -1759,7 +1759,10 @@
     // own "Building LoD cache…" placeholder for the spriteMeta=null case.
     function runInitialRoute() {
       var raw = decodeURIComponent(location.hash.slice(1) || '');
-      if (!raw || raw.charAt(0) === ':') {
+      if (raw && raw.match(/^size\d+$/)) {
+        // #sizeN deep link: route through refreshfromhash which already parses it.
+        refreshfromhash();
+      } else if (!raw || raw.charAt(0) === ':') {
         displaythumbs();
       } else if (lastimagevalue > 0) {
         var found = 0;
