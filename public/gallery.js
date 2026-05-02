@@ -1813,6 +1813,15 @@
       } else {
         displaythumbs();
       }
+      // layoutHeight() depends on #thumbs's getBoundingClientRect().top, which on
+      // first paint may not reflect the final position of the chrome above it
+      // (slider, breadcrumbs, etc). Re-render after the next two animation frames
+      // so the second pass measures correctly. Without this the filmstrip on
+      // a deep-link load can sit below the bottom of the viewport until the
+      // first window resize.
+      requestAnimationFrame(function () {
+        requestAnimationFrame(function () { scheduleRender(); });
+      });
     }
 
     if (window.imagemapURL && window.spriteMeta) {
