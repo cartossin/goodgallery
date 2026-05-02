@@ -534,18 +534,42 @@
     return 0;  // request the original
   }
 
+  // Concurrency limiter for per-image loads. Without this, scrolling through a
+  // large gallery at Small/Medium queues hundreds of concurrent fetches and
+  // Chrome aborts them with ERR_INSUFFICIENT_RESOURCES (no fd / connection
+  // budget left). 8 in flight at a time matches HTTP/2 stream concurrency
+  // sweet-spot and finishes fast enough to never block the visible viewport.
+  var PER_IMAGE_MAX_INFLIGHT = 8;
+  var perImageInflight = 0;
+  var perImageQueue = [];
+  function _runPerImageJob(job) {
+    perImageInflight++;
+    fetch(job.url, { credentials: 'same-origin' })
+      .then(function (r) { return r.blob(); })
+      .then(function (b) { return createImageBitmap(b); })
+      .catch(function () { return null; })
+      .then(function (bm) {
+        perImageInflight--;
+        job.resolve(bm);
+        if (bm) perImageBitmapsSync.set(job.key, bm);
+        // Drain queue.
+        if (perImageQueue.length && perImageInflight < PER_IMAGE_MAX_INFLIGHT) {
+          _runPerImageJob(perImageQueue.shift());
+        }
+      });
+  }
   function loadPerImageBitmap(name, tierH) {
     var key = name + '|' + tierH;
     if (perImageBitmaps.has(key)) return perImageBitmaps.get(key);
     var url = tierH === 0
       ? folderURL + encodeURIComponent(name)
       : folderURL + GG_DIR + '/' + encodeURIComponent(name) + '.h' + tierH + '.avif';
-    var prom = fetch(url, { credentials: 'same-origin' })
-      .then(function (r) { return r.blob(); })
-      .then(function (b) { return createImageBitmap(b); })
-      .catch(function () { return null; });
-    prom.then(function (bm) { if (bm) perImageBitmapsSync.set(key, bm); });
+    var resolveFn;
+    var prom = new Promise(function (res) { resolveFn = res; });
     perImageBitmaps.set(key, prom);
+    var job = { key: key, url: url, resolve: resolveFn };
+    if (perImageInflight < PER_IMAGE_MAX_INFLIGHT) _runPerImageJob(job);
+    else perImageQueue.push(job);
     return prom;
   }
   function getPerImageBitmapSync(name, tierH) {
@@ -1571,6 +1595,15 @@
     focusedIdx = 0;
     hashmirror = '';
     setText('counter', '');
+    // Apply the current grid level so the render matches the displayed label.
+    // Without this, an empty-hash initial load would show "Small" in the toolbar
+    // but render at fit-all (because levelTargetH was never set).
+    var levels = availableLevels();
+    var idx = lastGridLevelIdx;
+    if (idx > levels.length - 1) idx = levels.length - 1;
+    currentLevelIdx = idx;
+    var lv = levels[idx];
+    if (lv && lv.h !== 'focus') levelTargetH = lv.h;
     document.body.classList.add('thumb-view');
     document.body.classList.remove('image-view');
     renderGallery();
