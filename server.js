@@ -87,16 +87,15 @@ const RP_NAME          = SITE_TITLE;
 const GG_DIR = 'gg';
 const RESERVED = new Set([GG_DIR, 'thumbcache', 'previewcache', 'ggTrash']);
 
-// Cache-busting query string for the two static client assets. Computed once at
-// startup from each file's mtime. As long as the file isn't edited the URL stays
-// the same, so browsers cache normally; the moment we deploy a new gallery.js
-// the URL changes and clients pick up the new version on the next pageview.
+// Cache-busting query string for the two static client assets. Read mtime per
+// pageview (one fs.statSync per file, microseconds) so post-deploy edits get
+// picked up immediately without a server restart. Stable URL for an unchanged
+// file → browsers cache normally; URL changes the moment the file changes →
+// fresh fetch on next pageview.
 function _assetVer(name) {
   try { return String(Math.floor(fs.statSync(path.join(PUBLIC_DIR, name)).mtimeMs)); }
   catch { return Date.now().toString(); }
 }
-const ASSET_VER_GALLERY_JS = _assetVer('gallery.js');
-const ASSET_VER_GALLERY_CSS = _assetVer('goodgallery.css');
 const SUPPORTED_EXT = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.avif']);
 
 // ---------- bootstrap ----------
@@ -1468,7 +1467,7 @@ function galleryHTML({ urlPath, folders, images, spriteMeta, isAdminFlag, hasPas
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
 <title>${hxEscape(SITE_TITLE)} — ${hxEscape(urlPath)}</title>
-<link rel="stylesheet" href="/_static/goodgallery.css?v=${ASSET_VER_GALLERY_CSS}" />
+<link rel="stylesheet" href="/_static/goodgallery.css?v=${_assetVer('goodgallery.css')}" />
 <link rel="icon" type="image/svg+xml" href="/_static/favicon.svg" />
 </head>
 <body>
@@ -1505,7 +1504,7 @@ var folderURL        = ${jsString(urlPath)};
 var spriteMeta       = ${spriteMeta ? JSON.stringify(spriteMeta) : 'null'};
 var imagemapURL      = ${imagemapURL};
 </script>
-<script src="/_static/gallery.js?v=${ASSET_VER_GALLERY_JS}"></script>
+<script src="/_static/gallery.js?v=${_assetVer('gallery.js')}"></script>
 
 </body>
 </html>`;
