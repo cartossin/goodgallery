@@ -542,6 +542,17 @@
   var PER_IMAGE_MAX_INFLIGHT = 8;
   var perImageInflight = 0;
   var perImageQueue = [];
+  // Drop everything not yet in flight. Resolve their promises with null and
+  // un-cache the keys so a future loadPerImageBitmap() re-queues them. In-flight
+  // requests are NOT aborted — their completions are cheap and the renderFrame
+  // guard in drawCanvasForScroll discards their paints if no longer visible.
+  function clearPendingPerImageLoads() {
+    while (perImageQueue.length) {
+      var job = perImageQueue.shift();
+      job.resolve(null);
+      perImageBitmaps.delete(job.key);
+    }
+  }
   function _runPerImageJob(job) {
     perImageInflight++;
     fetch(job.url, { credentials: 'same-origin' })
@@ -799,6 +810,10 @@
       // own AVIF at the appropriate LoD tier. Decodes happen in parallel and the canvas
       // fills in progressively as bitmaps resolve.
       var tierH = pickPerImageTier(currentRowHeight);
+      // Each render frame replaces the pending-load queue with only what's
+      // currently visible + prefetched. Without this, fast scrolls accumulate
+      // hundreds of stale jobs that load images the user is no longer looking at.
+      clearPendingPerImageLoads();
       visible.forEach(function (t) {
         // Paint whatever's already in cache so the tile never goes black during a
         // zoom slide. Prefer the picked tier; fall back to any smaller cached tier;
