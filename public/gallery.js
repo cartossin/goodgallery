@@ -892,6 +892,30 @@
       }
     }
     filmstripEl.addEventListener('wheel', cancelChaseFromUser, { passive: true });
+
+    // Mouse-wheel snap: each wheel tick advances exactly one image. Trackpads get
+    // native scroll (smooth + momentum). Detection heuristic:
+    //   - deltaMode != 0 (LINE / PAGE) -> wheel (rare on Mac, common on Windows/Linux).
+    //   - deltaMode == 0 (PIXEL) with integer deltaY -> wheel (Mac mouse wheel
+    //     emits 4, 8, 16, 120 etc).
+    //   - deltaMode == 0 with fractional deltaY -> trackpad (continuous).
+    // Throttle so wheel acceleration on mac (which fires multiple events per tick
+    // with growing deltaY) only advances once per ~150ms.
+    var lastWheelTickAt = 0;
+    var WHEEL_TICK_MIN_MS = 80;
+    function isMouseWheel(e) {
+      if (e.deltaMode !== 0) return true;
+      if (e.deltaY === 0) return false;
+      return e.deltaY === Math.trunc(e.deltaY);
+    }
+    filmstripEl.addEventListener('wheel', function (e) {
+      if (!isMouseWheel(e)) return;  // trackpad — let native scroll handle it
+      e.preventDefault();
+      var now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+      if (now - lastWheelTickAt < WHEEL_TICK_MIN_MS) return;
+      lastWheelTickAt = now;
+      shiftFocus(e.deltaY > 0 ? +1 : -1);
+    }, { passive: false });
     filmstripEl.addEventListener('touchstart', cancelChaseFromUser, { passive: true });
     filmstripEl.addEventListener('mousedown', cancelChaseFromUser);
     setupMainImageGestures();
