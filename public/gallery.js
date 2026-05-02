@@ -271,8 +271,10 @@
   // remembered for the back-button-from-focus → return to grid at same zoom.
   var currentLevelIdx = 0;
   var lastGridLevelIdx = 0;
-  // Maps the old continuous slider value (0-100) to a row height. Kept because
-  // targetRowHeight() still uses it as the canonical zoom transform.
+  // Discrete level system sets levelTargetH directly, bypassing the continuous
+  // zoom transform (which caps at CANONICAL_H = 200 — Medium and Large
+  // collapsed onto the same render).
+  var levelTargetH = null;
   var currentZoom = 0;
   function getZoom() { return currentZoom; }
   function setZoom(t) {
@@ -300,17 +302,6 @@
     return out;
   }
 
-  // Map a row-height to the closest 0-100 zoom value, by inverting
-  // targetRowHeight()'s formula H = Hmin * (Hmax/Hmin) ** (t/100).
-  function rowHeightToZoom(H) {
-    if (!window.spriteMeta) return 0;
-    var Hmin = fitAllHeight();
-    var Hmax = CANONICAL_H;
-    if (H <= Hmin) return 0;
-    if (H >= Hmax) return 100;
-    return 100 * Math.log(H / Hmin) / Math.log(Hmax / Hmin);
-  }
-
   // Apply a level by index. Special-cases: 'focus' marker enters focus mode
   // on the centered-most visible image. Updates hash to reflect the new state.
   function setLevel(idx) {
@@ -328,7 +319,7 @@
       return;
     }
     lastGridLevelIdx = idx;
-    setZoom(rowHeightToZoom(lv.h));
+    levelTargetH = lv.h;
     // If we were in focus mode, leave it.
     if (focusedIdx > 0) {
       location.hash = '#size' + idx;
@@ -376,6 +367,7 @@
     if (focusedIdx > 0) {
       return Math.max(50, layoutHeight() * 0.7);
     }
+    if (levelTargetH != null) return levelTargetH;
     var Hmin = fitAllHeight();
     var Hmax = CANONICAL_H;
     if (Hmax <= Hmin) return Hmax;
@@ -1593,7 +1585,7 @@
       currentLevelIdx = idx;
       lastGridLevelIdx = idx;
       var lv = levels[idx];
-      if (lv.h !== 'focus') setZoom(rowHeightToZoom(lv.h));
+      if (lv.h !== 'focus') levelTargetH = lv.h;
       focusedIdx = 0;
       document.body.classList.add('thumb-view');
       document.body.classList.remove('image-view');
