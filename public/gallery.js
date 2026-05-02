@@ -953,7 +953,7 @@
     var dpr = devicePixelRatio();
     mainEl.width  = Math.round(W * dpr);
     mainEl.height = Math.round(mainH * dpr);
-    mainEl.style.cssText = 'display:block; width:' + W + 'px; height:' + mainH + 'px; background:#000; touch-action:none;';
+    mainEl.style.cssText = 'display:block; width:' + W + 'px; height:' + mainH + 'px; background:#000; touch-action:pan-y pinch-zoom;';
     thumbsEl.appendChild(mainEl);
 
     filmstripEl = document.createElement('div');
