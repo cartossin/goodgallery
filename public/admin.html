@@ -254,13 +254,14 @@ async function loadFolder() {
   var folEl = document.getElementById('folders');
   var imgEl = document.getElementById('images');
   folEl.innerHTML = data.folders.length
-    ? data.folders.map(n => `<li><a href="#" data-name="${escapeHtml(n)}">📁 ${escapeHtml(n)}</a></li>`).join('')
+    ? data.folders.map(n => `<li><a href="#" data-name="${escapeHtml(n)}">📁 ${escapeHtml(n)}</a><button data-deletefolder="${escapeHtml(n)}" title="Move all images in this folder to trash, then delete the folder">trash</button></li>`).join('')
     : '<li><small>(no subfolders)</small></li>';
   folEl.querySelectorAll('a').forEach(a => a.addEventListener('click', e => {
     e.preventDefault();
     setCWD(cwdPath + a.getAttribute('data-name') + '/');
     loadFolder();
   }));
+  folEl.querySelectorAll('button[data-deletefolder]').forEach(b => b.addEventListener('click', () => deleteFolder(b.getAttribute('data-deletefolder'))));
   document.getElementById('imgCount').textContent = '(' + data.images.length + ')';
   imgEl.innerHTML = data.images.length
     ? data.images.map(n => `<li><a href="${escapeHtml(cwdPath + encodeURIComponent(n))}" target="_blank">${escapeHtml(n)}</a><button data-trash="${escapeHtml(n)}">trash</button></li>`).join('')
@@ -269,6 +270,13 @@ async function loadFolder() {
 }
 
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+async function deleteFolder(name) {
+  if (!confirm('Delete folder "' + name + '"? All images inside will be moved to trash. This cannot be undone via the UI (use Explore Trash to restore individual files).')) return;
+  var r = await fetch(cwdPath + encodeURIComponent(name) + '/?deletefolder=1', { method: 'POST', headers: authHeaders() });
+  log(await r.text());
+  loadFolder();
+}
 
 async function trashImage(name) {
   // No confirm — trash is reversible (Explore Trash button restores).

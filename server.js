@@ -578,6 +578,12 @@ async function manifestAddFolder(galleryAbs, name) {
     if (insortUnique(m.folders, name)) { m.builtAt = Date.now(); await writeManifest(galleryAbs, m); }
   } catch (e) { console.warn('[manifest:addFolder]', galleryAbs, name, e.message); }
 }
+async function manifestRemoveFolder(galleryAbs, name) {
+  try {
+    const m = await loadManifest(galleryAbs);
+    if (spliceName(m.folders, name)) { m.builtAt = Date.now(); await writeManifest(galleryAbs, m); }
+  } catch (e) { console.warn('[manifest:removeFolder]', galleryAbs, name, e.message); }
+}
 
 // Rebuild from disk (drift correction). Used by Full Rescan.
 async function rebuildManifest(galleryAbs) {
@@ -1611,6 +1617,11 @@ async function handle(req, res) {
   // build/scan was retired — admin "Full rescan" covers all real cases globally.
   const q = u.searchParams;
   if (q.has('clearcache'))  return adminAction(req, res, () => clearcache(abs));
+  if (q.has('deletefolder')) return adminAction(req, res, async () => {
+    if (abs === GALLERIES_ROOT) throw new Error('cannot delete the gallery root');
+    const n = await deleteFolderToTrash(abs);
+    return `${path.basename(abs)} deleted (${n} image${n === 1 ? '' : 's'} moved to trash)`;
+  });
   if (q.has('movetotrash')) return adminAction(req, res, () => movetotrash(abs, q.get('movetotrash')));
   // exploretrash/restorefile/deletefile/restoreall/emptytrash are now global, served
   // out of /api/trash/* (single trash, see below). Old per-folder query routes removed.
@@ -1724,6 +1735,60 @@ async function restoreByPath(relPath) {
     parent = path.dirname(parent);
   }
   return `restored ${relPath}`;
+}
+
+// Move every image in a folder (recursively) to the global trash, then delete
+// the now-empty source folder + its gg/ cache. Updates the parent's manifest
+// and drops the folder's entries from manifestCache. Returns the count of
+// images trashed. Refuses to delete the gallery root itself.
+async function deleteFolderToTrash(galleryAbs) {
+  if (!galleryAbs.startsWith(GALLERIES_ROOT) || galleryAbs === GALLERIES_ROOT ||
+      path.dirname(galleryAbs).indexOf(GALLERIES_ROOT) !== 0) {
+    throw new Error('refusing: not a deletable gallery folder');
+  }
+  let trashed = 0;
+  async function walk(dir) {
+    let entries;
+    try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (e.name.startsWith('.')) continue;
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        if (RESERVED.has(e.name)) {
+          // gg/, ggTrash/, etc. — pure derived state, no need to keep.
+          await fsp.rm(full, { recursive: true, force: true }).catch(() => {});
+        } else {
+          await walk(full);
+          // After contents trashed, drop manifestCache for this subfolder.
+          manifestCache.delete(full);
+        }
+      } else if (e.isFile() && isImage(e.name)) {
+        const dst = trashPathFor(dir, e.name);
+        await fsp.mkdir(path.dirname(dst), { recursive: true });
+        if (fs.existsSync(dst)) {
+          const ext = path.extname(e.name);
+          const base = e.name.slice(0, -ext.length);
+          const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+          await fsp.rename(full, path.join(path.dirname(dst), `${base}.trashed-${stamp}${ext}`));
+        } else {
+          await fsp.rename(full, dst);
+        }
+        trashed++;
+      } else {
+        // Non-image leaf (stray file). Delete outright.
+        try { await fsp.unlink(full); } catch {}
+      }
+    }
+  }
+  await walk(galleryAbs);
+  // Remove the now-empty folder tree.
+  await fsp.rm(galleryAbs, { recursive: true, force: true });
+  // Update parent's manifest.
+  const parentAbs = path.dirname(galleryAbs);
+  const folderName = path.basename(galleryAbs);
+  await manifestRemoveFolder(parentAbs, folderName);
+  manifestCache.delete(galleryAbs);
+  return trashed;
 }
 
 async function deleteByPath(relPath) {
