@@ -25,6 +25,12 @@
   .progress > div { height: 100%; background: #4caf50; width: 0%; transition: width .15s; }
   .pathbar { font-family: ui-monospace, Menlo, monospace; padding: 8px 10px; background: #000; border: 1px solid #2a2a2a; border-radius: 3px; word-break: break-all; }
   .drop { border: 2px dashed #444; border-radius: 6px; padding: 24px; text-align: center; color: #888; }
+  /* Upload progress list — bounded height, internal scrollbar so the page
+     stays usable when a big batch is in flight. Newest items at the top. */
+  #uploadList { max-height: 240px; overflow-y: auto; border: 1px solid #2a2a2a;
+    border-radius: 4px; background: #0a0a0a; margin-top: 8px; padding: 0 10px; }
+  #uploadList:empty { display: none; }
+  #uploadList > div:first-child { padding-top: 6px; }
   .drop.over { border-color: #cfcfcf; color: #cfcfcf; background: #1a1a1a; }
   small { color: #888; }
 </style>
@@ -458,7 +464,8 @@ function makeUploadRow(label) {
   row.style = 'padding:6px 0;border-bottom:1px solid #1f1f1f';
   row.innerHTML = '<div style="display:flex;justify-content:space-between;gap:8px"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1"></span><small style="white-space:nowrap"></small></div><div class="progress"><div></div></div>';
   row.querySelector('span').textContent = label;
-  list.appendChild(row);
+  if (list.firstChild) list.insertBefore(row, list.firstChild);
+  else list.appendChild(row);
   return {
     bar: row.querySelector('.progress > div'),
     sm:  row.querySelector('small'),
