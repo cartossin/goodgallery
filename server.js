@@ -245,14 +245,14 @@ async function sweepOrphanTmps(rootDir) {
 // process: it can own the queue, watch the filesystem, and just *do* the work.
 //
 // Design rules:
-//   - Bounded concurrency (default min(4, CPU)) — never fork-bomb on a 60k mass upload.
+//   - Concurrency = number of CPUs (overridable via BUILD_CONCURRENCY env). vips itself is single-threaded per process, so saturating cores with N parallel children is the right move on a build-dedicated box.
 //   - Per (folder,file) dedupe — repeated triggers for the same file collapse into one job.
 //   - Idempotent — if the thumb already exists ensureBuilt is a no-op.
 //   - Crash-safe — atomicity is enforced inside ensureBuilt; the queue itself is in-memory
 //     and is rebuilt from disk state on the next startup scan, so a process kill loses
 //     only the in-memory progress counters, never on-disk integrity.
 import os from 'os';
-const BUILD_CONCURRENCY = Math.max(1, Math.min(4, os.cpus().length));
+const BUILD_CONCURRENCY = parseInt(process.env.BUILD_CONCURRENCY || '0', 10) || os.cpus().length;
 
 class BuildQueue {
   constructor(concurrency) {
