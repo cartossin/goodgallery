@@ -941,38 +941,50 @@ async function buildAtlasAtHeight(thumbDir, images, aspects, height, inputFormat
       const tmp = spriteAbs + '.__tmp.avif';
       const vTmp = tmp + '.v';
 
-      if (inputPaths.length <= ARRAYJOIN_TILES_PER_CALL) {
-        // Single arrayjoin — fits in one argv pass.
-        console.log('[sprite] building ' + spriteFile + ': ' + chunk.length + ' tiles, cell ' + cellW + 'x' + cellH + ', across ' + across);
-        await runStep('vips', [
-          'arrayjoin', ...inputPaths, vTmp,
-          '--across', String(across),
-          '--hspacing', String(cellW),
-          '--vspacing', String(cellH),
-          '--background', '0',
-        ], vTmp);
-      } else {
-        // Chunked arrayjoin: build row-strip sub-atlases (K complete rows each),
-        // then vertical-arrayjoin the strips. K is chosen so K * across ≤
-        // ARRAYJOIN_TILES_PER_CALL, keeping each sub's argv well under the limit.
-        // Math works because each strip is exactly K * across tiles in row-major
-        // order; stacking strips vertically preserves the row index a tile would
-        // have in a single non-chunked atlas. See spec discussion 2026-05-01.
-        const rowsPerSub = Math.max(1, Math.floor(ARRAYJOIN_TILES_PER_CALL / across));
-        const tilesPerSub = rowsPerSub * across;
-        const numSubs = Math.ceil(inputPaths.length / tilesPerSub);
-        console.log('[sprite] building ' + spriteFile + ': ' + chunk.length + ' tiles via ' + numSubs + ' sub-atlas(es) of ' + rowsPerSub + ' rows each, cell ' + cellW + 'x' + cellH + ', across ' + across);
-        const stagingDir = path.join(thumbDir, '_sprite_staging_h' + height);
-        await fsp.mkdir(stagingDir, { recursive: true });
-        const subPaths = [];
-        try {
+      // vips arrayjoin takes a SINGLE argv arg of space-separated paths and
+      // parses them internally, which breaks on filenames containing spaces
+      // (e.g. "2023-12-24 12.39.44.jpg" gets split into two paths). Solution:
+      // hardlink each input into a per-build staging dir under sequential safe
+      // names (0.v, 1.v, ...) — that argv string has no embedded spaces.
+      const stagingDir = path.join(thumbDir, '_sprite_staging_h' + height);
+      await fsp.rm(stagingDir, { recursive: true, force: true }).catch(()=>{});
+      await fsp.mkdir(stagingDir, { recursive: true });
+      try {
+        async function linkBatch(paths, prefix) {
+          const links = [];
+          for (let i = 0; i < paths.length; i++) {
+            const link = path.join(stagingDir, prefix + i + '.v');
+            try { await fsp.unlink(link); } catch {}
+            await fsp.link(paths[i], link);
+            links.push(link);
+          }
+          return links;
+        }
+
+        if (inputPaths.length <= ARRAYJOIN_TILES_PER_CALL) {
+          console.log('[sprite] building ' + spriteFile + ': ' + chunk.length + ' tiles, cell ' + cellW + 'x' + cellH + ', across ' + across);
+          const links = await linkBatch(inputPaths, 't');
+          await runStep('vips', [
+            'arrayjoin', links.join(' '), vTmp,
+            '--across', String(across),
+            '--hspacing', String(cellW),
+            '--vspacing', String(cellH),
+            '--background', '0',
+          ], vTmp);
+        } else {
+          const rowsPerSub = Math.max(1, Math.floor(ARRAYJOIN_TILES_PER_CALL / across));
+          const tilesPerSub = rowsPerSub * across;
+          const numSubs = Math.ceil(inputPaths.length / tilesPerSub);
+          console.log('[sprite] building ' + spriteFile + ': ' + chunk.length + ' tiles via ' + numSubs + ' sub-atlas(es) of ' + rowsPerSub + ' rows each, cell ' + cellW + 'x' + cellH + ', across ' + across);
+          const subPaths = [];
           for (let si = 0; si < numSubs; si++) {
             const subStart = si * tilesPerSub;
             const subEnd = Math.min(inputPaths.length, subStart + tilesPerSub);
             const subTiles = inputPaths.slice(subStart, subEnd);
-            const subTmp = path.join(stagingDir, 'c' + c + '_sub' + si + '.v');
+            const subLinks = await linkBatch(subTiles, 'c' + c + 's' + si + '_t');
+            const subTmp = path.join(stagingDir, 'c' + c + 's' + si + '.v');
             await runStep('vips', [
-              'arrayjoin', ...subTiles, subTmp,
+              'arrayjoin', subLinks.join(' '), subTmp,
               '--across', String(across),
               '--hspacing', String(cellW),
               '--vspacing', String(cellH),
@@ -980,21 +992,17 @@ async function buildAtlasAtHeight(thumbDir, images, aspects, height, inputFormat
             ], subTmp);
             subPaths.push(subTmp);
           }
-          // Vertical-stack the row-strips. vspacing = rowsPerSub * cellH so all
-          // strips line up; the last strip may be shorter (partial rows) but is
-          // placed in the same vspacing slot — leaves background pixels below it
-          // which the client never indexes into.
+          // Vertical-stack the row-strips.
           await runStep('vips', [
-            'arrayjoin', ...subPaths, vTmp,
+            'arrayjoin', subPaths.join(' '), vTmp,
             '--across', '1',
             '--hspacing', String(across * cellW),
             '--vspacing', String(rowsPerSub * cellH),
             '--background', '0',
           ], vTmp);
-        } finally {
-          // Always clean up sub-atlases + staging dir.
-          await fsp.rm(stagingDir, { recursive: true, force: true }).catch(()=>{});
         }
+      } finally {
+        await fsp.rm(stagingDir, { recursive: true, force: true }).catch(()=>{});
       }
 
       await runStep('vips', ['heifsave', vTmp, tmp, '--Q', '80'], tmp);
