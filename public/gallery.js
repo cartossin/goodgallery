@@ -105,6 +105,12 @@
         if (active > 0) {
           note('Building LoD cache — ' + active + ' remaining (' + p.done + '/' + p.total + ' done)');
           statusTimer = setTimeout(function () { pollBuildStatus({ reloadOnComplete: reloadOnComplete }); }, 5000);
+        } else if (reloadOnComplete && p.total > 0 && p.spriteUpToDate === false) {
+          // Builds drained but sprite hasn't been rebuilt yet (debounced).
+          // Keep polling until the sprite is current; reloading now would
+          // just hit the same "Building LoD cache" placeholder.
+          note('Build complete; finalizing…');
+          statusTimer = setTimeout(function () { pollBuildStatus({ reloadOnComplete: reloadOnComplete }); }, 2000);
         } else if (reloadOnComplete && p.total > 0) {
           note('Build complete (' + p.done + '/' + p.total + '). Reloading…');
           setTimeout(function () { location.reload(); }, 800);

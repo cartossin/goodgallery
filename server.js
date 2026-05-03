@@ -1099,7 +1099,7 @@ async function maybeBuildSpriteAtTier(galleryAbs, tierH) {
 // 1000 sprite rebuilds (one per fs.watch + queue-drain). With this, we wait for the
 // dust to settle (5s of quiet) and rebuild once. Safe because the sprite is just a
 // derived cache — never being current for a few seconds isn't a correctness problem.
-const SPRITE_DEBOUNCE_MS = parseInt(process.env.SPRITE_DEBOUNCE_MS || '5000', 10);
+const SPRITE_DEBOUNCE_MS = parseInt(process.env.SPRITE_DEBOUNCE_MS || '1000', 10);
 const spriteDebounceTimers = new Map();
 function scheduleSpriteBuild(galleryAbs) {
   const existing = spriteDebounceTimers.get(galleryAbs);
@@ -1594,7 +1594,19 @@ async function handle(req, res) {
   // exploretrash/restorefile/deletefile/restoreall/emptytrash are now global, served
   // out of /api/trash/* (single trash, see below). Old per-folder query routes removed.
   if (q.has('build-status')) {
-    return sendJson(res, 200, buildQueue.progressFor(abs));
+    // Include a sprite-up-to-date signal so the client knows whether reloading
+    // will actually show new images. Without this, a reload right after the
+    // queue drains lands BEFORE the debounced sprite build runs, the new page
+    // sees no spriteMeta, polls again, reloads again — infinite loop.
+    const status = buildQueue.progressFor(abs);
+    let spriteOk = false;
+    try {
+      const sMeta = await readSpriteMeta(abs);
+      const sMan = await loadManifest(abs).catch(() => ({ images: [] }));
+      spriteOk = spriteIsCurrent(sMeta, sMan.images, abs);
+    } catch {}
+    status.spriteUpToDate = spriteOk;
+    return sendJson(res, 200, status);
   }
   if (q.get('api') === 'list') {
     const { folders, images } = await listFolder(abs);
