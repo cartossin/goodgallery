@@ -965,7 +965,7 @@ async function buildAtlasAtHeight(thumbDir, images, aspects, height, inputFormat
       // (e.g. "2023-12-24 12.39.44.jpg" gets split into two paths). Solution:
       // hardlink each input into a per-build staging dir under sequential safe
       // names (0.v, 1.v, ...) — that argv string has no embedded spaces.
-      const stagingDir = path.join(thumbDir, '_sprite_staging_h' + height);
+      const stagingDir = path.join(STATE_DIR, '_staging', 'gg-stg-' + crypto.randomBytes(8).toString('hex') + '-h' + height);
       await fsp.rm(stagingDir, { recursive: true, force: true }).catch(()=>{});
       await fsp.mkdir(stagingDir, { recursive: true });
       try {
@@ -1626,18 +1626,24 @@ async function handle(req, res) {
   // exploretrash/restorefile/deletefile/restoreall/emptytrash are now global, served
   // out of /api/trash/* (single trash, see below). Old per-folder query routes removed.
   if (q.has('build-status')) {
-    // Include a sprite-up-to-date signal so the client knows whether reloading
-    // will actually show new images. Without this, a reload right after the
-    // queue drains lands BEFORE the debounced sprite build runs, the new page
-    // sees no spriteMeta, polls again, reloads again — infinite loop.
     const status = buildQueue.progressFor(abs);
     let spriteOk = false;
+    let imgCount = 0;
     try {
       const sMeta = await readSpriteMeta(abs);
       const sMan = await loadManifest(abs).catch(() => ({ images: [] }));
+      imgCount = sMan.images.length;
       spriteOk = spriteIsCurrent(sMeta, sMan.images, abs);
     } catch {}
     status.spriteUpToDate = spriteOk;
+    // Self-heal: if the queue is idle for this folder AND it has images AND no
+    // current sprite, kick off a sprite build. Catches folders where the
+    // _runOne drain-finally trigger never fired (race during heavy concurrent
+    // uploads, or files that appeared on disk via scp/rsync without going
+    // through the upload pipeline at all).
+    if (!spriteOk && imgCount > 0 && status.pending === 0 && status.inProgress === 0) {
+      scheduleSpriteBuild(abs);
+    }
     return sendJson(res, 200, status);
   }
   if (q.get('api') === 'list') {
@@ -1968,7 +1974,30 @@ async function handleAdminAPI(req, res, pathname, method) {
           queuedV += await buildQueue.scanAll(GALLERIES_ROOT, { phase: 'h' + tierH });
         }
         const b = await buildQueue.scanAll(GALLERIES_ROOT, { phase: 'avif' });
-        console.log('[fullrescan] manifests=' + rebuilt + ' v=' + queuedV + ' avif=' + b);
+        // Wait for everything to drain, then force-sprite every folder. This
+        // catches folders where the per-job _runOne trigger never fired, or
+        // fired prematurely between phases.
+        await buildQueue.drainPromise();
+        let spriteOk = 0, spriteSkipped = 0;
+        async function forceWalk(dir) {
+          let entries;
+          try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { return; }
+          let hasImages = false;
+          const subs = [];
+          for (const e of entries) {
+            if (e.name.startsWith('.')) continue;
+            if (e.isDirectory()) {
+              if (!RESERVED.has(e.name)) subs.push(e.name);
+            } else if (e.isFile() && isImage(e.name)) hasImages = true;
+          }
+          if (hasImages) {
+            try { await maybeBuildSprite(dir); spriteOk++; }
+            catch (e) { console.warn('[fullrescan:sprite]', dir, e.message); spriteSkipped++; }
+          }
+          for (const sub of subs) await forceWalk(path.join(dir, sub));
+        }
+        await forceWalk(GALLERIES_ROOT);
+        console.log('[fullrescan] manifests=' + rebuilt + ' v=' + queuedV + ' avif=' + b + ' sprites=' + spriteOk);
       } catch (e) { console.warn('[fullrescan]', e.message); }
     })();
     return sendJson(res, 200, { ok: true, started: true });
