@@ -945,7 +945,7 @@ async function buildAtlasAtHeight(thumbDir, images, aspects, height, inputFormat
         // Single arrayjoin — fits in one argv pass.
         console.log('[sprite] building ' + spriteFile + ': ' + chunk.length + ' tiles, cell ' + cellW + 'x' + cellH + ', across ' + across);
         await runStep('vips', [
-          'arrayjoin', inputPaths.join(' '), vTmp,
+          'arrayjoin', ...inputPaths, vTmp,
           '--across', String(across),
           '--hspacing', String(cellW),
           '--vspacing', String(cellH),
@@ -972,7 +972,7 @@ async function buildAtlasAtHeight(thumbDir, images, aspects, height, inputFormat
             const subTiles = inputPaths.slice(subStart, subEnd);
             const subTmp = path.join(stagingDir, 'c' + c + '_sub' + si + '.v');
             await runStep('vips', [
-              'arrayjoin', subTiles.join(' '), subTmp,
+              'arrayjoin', ...subTiles, subTmp,
               '--across', String(across),
               '--hspacing', String(cellW),
               '--vspacing', String(cellH),
@@ -985,7 +985,7 @@ async function buildAtlasAtHeight(thumbDir, images, aspects, height, inputFormat
           // placed in the same vspacing slot — leaves background pixels below it
           // which the client never indexes into.
           await runStep('vips', [
-            'arrayjoin', subPaths.join(' '), vTmp,
+            'arrayjoin', ...subPaths, vTmp,
             '--across', '1',
             '--hspacing', String(across * cellW),
             '--vspacing', String(rowsPerSub * cellH),
