@@ -657,17 +657,30 @@ function vipsHeightThumbAVIF(srcAbs, dstAbs, height, quality) {
   });
 }
 
+// Build a height-targeted .v thumbnail and force the output to exactly 3 bands
+// (sRGB, no alpha). vips arrayjoin requires uniform band count across all
+// inputs and explodes with 'not one band or 4 bands' on a mixed set
+// (e.g. RGB JPGs + RGBA PNGs). Pipeline:
+//   thumbnail → colourspace srgb (gray→RGB, RGB→RGB, RGBA→RGBA)
+//             → extract_band 0 n=3 (drops alpha if present, keeps RGB)
 function vipsHeightThumbV(srcAbs, dstAbs, height) {
   return new Promise((resolve, reject) => {
-    const tmp = dstAbs + '.__tmp.v';
-    const args = [
-      'thumbnail', srcAbs, tmp, '99999',
+    const t1 = dstAbs + '.__tmp.step1.v';
+    const t2 = dstAbs + '.__tmp.step2.v';
+    const tFinal = dstAbs + '.__tmp.v';
+    runStep('vips', [
+      'thumbnail', srcAbs, t1, '99999',
       '--height', String(height),
       '--size', 'down',
-    ];
-    runStep('vips', args, tmp).then(() =>
-      fs.promises.rename(tmp, dstAbs).then(resolve, reject)
-    ).catch(reject);
+    ], t1).then(() =>
+      runStep('vips', ['colourspace', t1, t2, 'srgb'], t2)
+    ).then(() =>
+      runStep('vips', ['extract_band', t2, tFinal, '0', '--n', '3'], tFinal)
+    ).then(() => {
+      fs.promises.unlink(t1).catch(()=>{});
+      fs.promises.unlink(t2).catch(()=>{});
+      return fs.promises.rename(tFinal, dstAbs);
+    }).then(resolve, reject);
   });
 }
 
