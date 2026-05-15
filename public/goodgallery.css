@@ -78,29 +78,51 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 }
 #adminnotify.on { display: flex; }
 
+#foldersWrap {
+  margin: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #141414;
+}
+#foldersWrap > summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 8px 12px;
+  font-size: 14px;
+  color: #ccc;
+  user-select: none;
+}
+#foldersWrap > summary::-webkit-details-marker { display: none; }
+#foldersWrap > summary::before {
+  content: '\25B6';
+  display: inline-block;
+  width: 1em;
+  margin-right: 6px;
+  font-size: 10px;
+  transition: transform .12s ease;
+}
+#foldersWrap[open] > summary::before { transform: rotate(90deg); }
+#foldersWrap > summary:hover { color: var(--accent); }
 #folders {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
-  gap: 10px;
-  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  max-height: 320px;
+  overflow-y: auto;
+  border-top: 1px solid var(--border);
 }
 #folders .folder {
   display: flex;
-  flex-direction: column;
   align-items: center;
-  justify-content: center;
-  padding: 18px 8px;
-  background: #141414;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  text-align: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid #1c1c1c;
   word-break: break-word;
-  min-height: 100px;
-  transition: background .15s;
+  transition: background .12s;
 }
+#folders .folder:last-child { border-bottom: 0; }
 #folders .folder:hover { background: #1c1c1c; color: var(--accent); }
-#folders .folder-icon { font-size: 32px; line-height: 1; }
-#folders .folder-name { margin-top: 6px; font-size: 13px; }
+#folders .folder-icon { font-size: 18px; line-height: 1; flex-shrink: 0; }
+#folders .folder-name { font-size: 13px; }
 
 #prevnext {
   display: flex;
@@ -134,20 +156,6 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   position: relative;
   overflow: hidden;  /* JS toggles overflowX/Y per mode; default is no scrollbars */
 }
-#thumbs a {
-  background: var(--thumb-bg);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: var(--thumb-pad);
-}
-#thumbs a:hover img { opacity: 0.8; }
-#thumbs img {
-  display: block;
-  height: 120px;       /* fixed display height -> uniform rows */
-  width: auto;         /* width follows aspect ratio */
-  max-width: 320px;    /* sanity cap for ultra-wide panoramas */
-}
 
 
 
@@ -171,10 +179,9 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* mobile */
 @media (max-width: 700px) {
-  #folders { grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); padding: 8px; }
-  #thumbs img { height: 90px; max-width: 220px; }
+  #foldersWrap { margin: 6px 8px; }
+  #folders { max-height: 240px; }
   #prevnext button { min-width: 88px; }
-  #photospot img { max-height: 78vh; }
 }
 
 /* Single-canvas thumb rendering — see gallery.js renderGallery(). */
@@ -200,3 +207,86 @@ html, body { overflow-x: hidden; }
 .zoom-control button:hover:not(:disabled) { background: var(--border); }
 .zoom-control .zoom-label { min-width: 80px; text-align: center; color: var(--fg); }
 .zoom-control .zoom-back { padding: 4px 14px; }
+
+/* Hidden folders (admin view only — see server.js sethidden endpoint). The
+   little (hidden) tag and dimmed cell make them obvious without changing the
+   click target's position. */
+#folders .folder.folder-hidden { opacity: 0.55; }
+#folders .folder-hidden-tag {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--accent);
+  font-style: italic;
+  white-space: nowrap;
+}
+
+
+/* ===========================================================================
+   Auto-hiding top controls. The #topcontrols wrapper slides out of view by
+   default; body.controls-revealed brings it back. #thumbs flows to the very
+   top of the viewport so the image / grid uses every pixel.
+   - Desktop: pointer near the top 80px reveals (JS).
+   - Touch: tap on #topreveal pill reveals (JS).
+   =========================================================================== */
+#topcontrols {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: var(--scrollbar-w, 0px);
+  z-index: 30;
+  transform: translateY(-100%);
+  transition: transform 220ms ease;
+  background: rgba(10,10,10,0.92);
+  backdrop-filter: blur(6px);
+  padding-top: env(safe-area-inset-top);
+}
+body.controls-revealed #topcontrols { transform: translateY(0); }
+
+/* Existing top elements were styled with position:sticky / margins assuming
+   they lived in the document flow. Inside the fixed wrapper they should be
+   plain block-level. */
+#topcontrols #topbar { position: static; background: transparent; backdrop-filter: none; border-bottom: 1px solid var(--border); }
+
+/* Affordance pill. Shown on all devices, with platform-specific reveal:
+   - Touch (hover: none): always visible.
+   - Desktop: visible when cursor is within 150px of pill center (body.pill-near,
+     set by JS) OR when drawer is open (body.controls-revealed).
+   - Empty galleries (body.gallery-empty): hidden; drawer is locked open. */
+#topreveal {
+  position: fixed;
+  top: env(safe-area-inset-top, 0px);
+  left: 50%;
+  transform: translateX(-50%);
+  width: 96px;
+  height: 44px;
+  background: rgba(20,20,20,0.7);
+  border: 1px solid rgba(255,255,255,0.18);
+  border-top: none;
+  border-radius: 0 0 16px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 31;
+  cursor: pointer;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 220ms ease;
+}
+#topreveal::before {
+  content: '';
+  width: 40px;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255,255,255,0.6);
+}
+body.pill-near #topreveal,
+body.controls-revealed #topreveal {
+  opacity: 1;
+  pointer-events: auto;
+}
+@media (hover: none) {
+  #topreveal { opacity: 1; pointer-events: auto; }
+}
+body.gallery-empty #topreveal { display: none; }

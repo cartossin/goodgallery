@@ -7,7 +7,11 @@
 <link rel="stylesheet" href="/_static/goodgallery.css" />
 <link rel="icon" type="image/svg+xml" href="/_static/favicon.svg" />
 <style>
-  body { padding: 16px; max-width: 900px; margin: 0 auto; height: auto; overflow: auto; }
+  /* Admin needs natural document scroll. The shared goodgallery.css locks
+     html/body to 100vh + overflow:hidden for the gallery's virtual-scroll canvas;
+     undo both here so a long admin page can be swipe-scrolled on touch. */
+  html { overflow: visible; height: auto; }
+  body { padding: 16px; max-width: 900px; margin: 0 auto; height: auto; overflow: visible; }
   h1 { font-size: 22px; font-weight: 500; margin: 8px 0 16px; }
   .panel { background: #141414; border: 1px solid #2a2a2a; border-radius: 6px; padding: 16px; margin-bottom: 14px; }
   .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
@@ -19,7 +23,8 @@
   .ok  { color: #9bff9b; }
   .hidden { display: none !important; }
   ul.files { list-style: none; padding: 0; margin: 0; max-height: 280px; overflow: auto; border: 1px solid #2a2a2a; border-radius: 4px; }
-  ul.files li { padding: 6px 10px; border-bottom: 1px solid #1f1f1f; display: flex; justify-content: space-between; gap: 8px; align-items: center; font-size: 13px; }
+  ul.files li { padding: 6px 10px; border-bottom: 1px solid #1f1f1f; display: flex; gap: 8px; align-items: center; font-size: 13px; }
+  ul.files li > a:first-child { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   ul.files li:last-child { border-bottom: 0; }
   .progress { height: 4px; background: #222; border-radius: 2px; overflow: hidden; margin-top: 4px; }
   .progress > div { height: 100%; background: #4caf50; width: 0%; transition: width .15s; }
@@ -59,7 +64,8 @@
       <span id="cwd" class="pathbar">/</span>
       <button id="upBtn">↑ up</button>
       <button id="reloadBtn">↻ reload</button>
-      <button id="logoutBtn" style="margin-left:auto">Log out</button>
+      <button id="genLoginLinkBtn" style="margin-left:auto" title="Generate a one-time link that signs in this account on another browser. Useful when the destination browser can't access your passkey. Expires in 10 minutes; works once.">Generate login link</button>
+      <button id="logoutBtn">Log out</button>
     </div>
     <div class="row">
       <input id="newDirName" type="text" placeholder="new subfolder name" />
@@ -93,14 +99,58 @@
     <div class="row" style="margin-top:8px">
       <button id="clearCacheBtn">Clear cache</button>
       <button id="fullRescanBtn" title="Re-scan every gallery for files added outside the uploader (e.g. rsync, mv).">Full rescan</button>
+      <button id="clearQueueBtn" title="Drop all queued LoD builds. In-flight workers finish their current tile then idle. Useful before a fresh rescan.">Clear build queue</button>
       <button id="exploreTrashBtn">Explore trash</button>
+      <button id="emptyTrashBtn" title="Permanently delete every trashed item in this folder. Fast — no need to load the list first.">Empty trash</button>
     </div>
     <pre id="actionLog" style="font-size:12px;color:#9bff9b;max-height:120px;overflow:auto;margin-top:8px"></pre>
   </div>
 
 </div>
 
+<div id="loginLinkModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:100;align-items:center;justify-content:center">
+  <div style="background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:20px;max-width:560px;width:92%;color:#eee">
+    <h3 style="margin:0 0 8px">One-time login link</h3>
+    <p style="font-size:13px;color:#aaa;margin:0 0 12px">
+      Open this link on the browser you want to sign in. It signs that browser
+      in as admin for 24 hours. Works once and expires after 10 minutes — anyone
+      who opens it first wins, so don't post it anywhere public.
+    </p>
+    <div style="display:flex;gap:8px;align-items:stretch">
+      <input id="loginLinkInput" type="text" readonly style="flex:1;font-family:monospace;font-size:12px;padding:8px;background:#0d0d0d;border:1px solid #333;color:#eee;border-radius:4px" />
+      <button id="loginLinkCopyBtn" style="padding:8px 14px">Copy</button>
+    </div>
+    <div style="margin-top:14px;text-align:right">
+      <button id="loginLinkCloseBtn">Close</button>
+    </div>
+  </div>
+</div>
+
 <script>
+// ---------- One-time login-link redemption ----------
+// If the URL fragment is #auth=<token>, POST it to the redeem endpoint, then
+// strip the hash and reload so the rest of the admin page boots with the
+// fresh session cookie. Runs before any other init.
+(function redeemAuthHash() {
+  var m = location.hash.match(/^#auth=([A-Za-z0-9_-]+)$/);
+  if (!m) return;
+  var token = m[1];
+  // Strip the hash immediately so reload doesn't loop and the token doesn't
+  // linger in window.location for other scripts to see.
+  history.replaceState(null, '', location.pathname + location.search);
+  fetch('/api/admin/login/redeem', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token: token })
+  }).then(function (r) {
+    if (r.ok) location.reload();
+    else r.text().then(function (t) { alert('Login link invalid or expired.' + (t ? '\n' + t : '')); });
+  }).catch(function () {
+    alert('Could not reach server to redeem login link.');
+  });
+})();
+
 // ---------- WebAuthn helpers ----------
 function b64ToBuf(s) {
   s = s.replace(/-/g,'+').replace(/_/g,'/');
@@ -137,8 +187,15 @@ async function checkAuth() {
   }
 
   // Cookie is sent automatically with this request; if it's valid, skip to main.
-  var probe = await fetch('/api/admin/probe', { credentials: 'same-origin' }).then(r => r.ok).catch(() => false);
-  if (probe) { showMain(); return; }
+  // Capture session origin so the link-mint button can be disabled on
+  // link-issued sessions (which aren't allowed to chain new links).
+  var probeResp = await fetch('/api/admin/probe', { credentials: 'same-origin' }).catch(() => null);
+  if (probeResp && probeResp.ok) {
+    var probeData = await probeResp.json().catch(() => ({}));
+    window.__sessionOrigin = probeData.origin || 'passkey';
+    showMain();
+    return;
+  }
 
   var status = await fetch('/api/admin/status').then(r => r.json()).catch(() => null);
   if (!status) { err.textContent = 'Cannot reach server.'; return; }
@@ -253,14 +310,20 @@ async function loadFolder() {
   var data = await r.json();
   var folEl = document.getElementById('folders');
   var imgEl = document.getElementById('images');
+  var hidden = new Set(data.hiddenFolders || []);
   folEl.innerHTML = data.folders.length
-    ? data.folders.map(n => `<li><a href="#" data-name="${escapeHtml(n)}">📁 ${escapeHtml(n)}</a><button data-deletefolder="${escapeHtml(n)}" title="Move all images in this folder to trash, then delete the folder">trash</button></li>`).join('')
+    ? data.folders.map(n => {
+        var tag = hidden.has(n) ? ' <small style="color:#888;font-style:italic">(hidden)</small>' : '';
+        var hideLabel = hidden.has(n) ? 'unhide' : 'hide';
+        return `<li><a href="#" data-name="${escapeHtml(n)}">📁 ${escapeHtml(n)}</a>${tag}<button data-hide="${escapeHtml(n)}" data-cur="${hidden.has(n) ? '1' : '0'}" title="Toggle whether this folder is listed publicly">${hideLabel}</button><button data-deletefolder="${escapeHtml(n)}" title="Move all images in this folder to trash, then delete the folder">trash</button></li>`;
+      }).join('')
     : '<li><small>(no subfolders)</small></li>';
   folEl.querySelectorAll('a').forEach(a => a.addEventListener('click', e => {
     e.preventDefault();
     setCWD(cwdPath + a.getAttribute('data-name') + '/');
     loadFolder();
   }));
+  folEl.querySelectorAll('button[data-hide]').forEach(b => b.addEventListener('click', () => toggleHidden(b.getAttribute('data-hide'), b.getAttribute('data-cur') === '1')));
   folEl.querySelectorAll('button[data-deletefolder]').forEach(b => b.addEventListener('click', () => deleteFolder(b.getAttribute('data-deletefolder'))));
   document.getElementById('imgCount').textContent = '(' + data.images.length + ')';
   imgEl.innerHTML = data.images.length
@@ -275,6 +338,13 @@ async function deleteFolder(name) {
   if (!confirm('Delete folder "' + name + '"? All images inside will be moved to trash. This cannot be undone via the UI (use Explore Trash to restore individual files).')) return;
   var r = await fetch(cwdPath + encodeURIComponent(name) + '/?deletefolder=1', { method: 'POST', headers: authHeaders() });
   log(await r.text());
+  loadFolder();
+}
+
+async function toggleHidden(name, currentlyHidden) {
+  var hide = currentlyHidden ? 0 : 1;
+  var r = await fetch(cwdPath + '?sethidden=' + encodeURIComponent(name) + '&hide=' + hide, { method: 'POST', headers: authHeaders() });
+  if (!r.ok) { log('toggleHidden failed: ' + r.status); return; }
   loadFolder();
 }
 
@@ -303,6 +373,52 @@ document.getElementById('logoutBtn').addEventListener('click', async () => {
   await fetch('/api/admin/logout', { method: 'POST', credentials: 'same-origin' });
   location.reload();
 });
+
+// Generate login link: POST -> server mints a one-time URL with a 10-min TTL.
+// We pop a modal with the URL and a Copy button; the link is intentionally not
+// clickable inside the admin page (it would just redeem here).
+// Disabled on link-issued sessions — chaining would let one leaked link
+// renew itself indefinitely.
+(function initLoginLinkButton() {
+  var btn = document.getElementById('genLoginLinkBtn');
+  if (window.__sessionOrigin === 'link') {
+    btn.disabled = true;
+    btn.title = 'This browser is signed in via a one-time link. Only passkey-authenticated sessions can generate new links — sign in with your passkey on a browser that has it.';
+  }
+})();
+document.getElementById('genLoginLinkBtn').addEventListener('click', async () => {
+  if (window.__sessionOrigin === 'link') return;
+  var r = await fetch('/api/admin/login/link', { method: 'POST', credentials: 'same-origin' });
+  if (!r.ok) {
+    var t = await r.text().catch(() => '');
+    alert('Failed to generate link: ' + r.status + (t ? ' — ' + t : ''));
+    return;
+  }
+  var data = await r.json();
+  var modal = document.getElementById('loginLinkModal');
+  var input = document.getElementById('loginLinkInput');
+  input.value = data.link;
+  modal.style.display = 'flex';
+  // Pre-select for keyboard copy as a fallback if clipboard API is blocked.
+  setTimeout(function () { input.focus(); input.select(); }, 0);
+});
+document.getElementById('loginLinkCopyBtn').addEventListener('click', async () => {
+  var input = document.getElementById('loginLinkInput');
+  var btn = document.getElementById('loginLinkCopyBtn');
+  var ok = false;
+  try {
+    await navigator.clipboard.writeText(input.value);
+    ok = true;
+  } catch (e) {
+    input.select(); ok = document.execCommand && document.execCommand('copy');
+  }
+  var prev = btn.textContent;
+  btn.textContent = ok ? 'Copied!' : 'Copy failed';
+  setTimeout(function () { btn.textContent = prev; }, 1500);
+});
+document.getElementById('loginLinkCloseBtn').addEventListener('click', () => {
+  document.getElementById('loginLinkModal').style.display = 'none';
+});
 document.getElementById('mkDirBtn').addEventListener('click', async () => {
   var name = document.getElementById('newDirName').value.trim();
   if (!name) return;
@@ -318,12 +434,38 @@ document.getElementById('clearCacheBtn').addEventListener('click', async () => {
 });
 document.getElementById('exploreTrashBtn').addEventListener('click', exploreTrash);
 
+document.getElementById('emptyTrashBtn').addEventListener('click', async () => {
+  if (!confirm('Permanently delete every trashed item in ' + (cwdPath || '/') + '? This cannot be undone.')) return;
+  var r = await fetch('/api/trash/empty', {
+    method: 'POST',
+    headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders()),
+    body: JSON.stringify({ folder: cwdRel() }),
+  });
+  var j = await r.json().catch(() => ({}));
+  log(r.ok ? (j.message || 'trash emptied') : ('empty failed: ' + (j.error || r.status)));
+  if (document.getElementById('trashPanel')) exploreTrash();
+});
+
 document.getElementById('fullRescanBtn').addEventListener('click', async () => {
   log('full rescan...');
   var r = await fetch('/api/admin/fullrescan', { method: 'POST', credentials: 'same-origin' });
   var j = await r.json().catch(() => ({}));
   log(r.ok ? 'rescan started; check individual galleries for build progress.' : ('rescan failed: ' + (j.error || r.status)));
 });
+
+document.getElementById('clearQueueBtn').addEventListener('click', async () => {
+  if (!confirm('Drop all queued LoD builds? In-flight tiles finish; pending work is dropped.')) return;
+  var r = await fetch('/api/admin/clearqueue', { method: 'POST', credentials: 'same-origin' });
+  var j = await r.json().catch(() => ({}));
+  log(r.ok ? ('cleared ' + j.dropped + ' queued items') : ('clear failed: ' + (j.error || r.status)));
+});
+
+// Trash UI is scoped to the current folder (cwdPath). Each folder owns its
+// own <folder>/gg/trash/ on disk; this panel only shows items from that
+// folder's trash.
+function cwdRel() {
+  return cwdPath.replace(/^\/+|\/+$/g, '');
+}
 
 async function exploreTrash() {
   var trashEl = document.getElementById('trashPanel');
@@ -333,27 +475,28 @@ async function exploreTrash() {
     trashEl.id = 'trashPanel';
     document.getElementById('adminMain').appendChild(trashEl);
   }
-  trashEl.innerHTML = '<strong>Trash <small style="color:#888">(global)</small></strong><div id="trashList" style="margin-top:8px"><small>Loading…</small></div>';
+  var folderLabel = cwdPath || '/';
+  trashEl.innerHTML = '<strong>Trash <small style="color:#888">in ' + escapeHtml(folderLabel) + '</small></strong>' +
+                      '<div id="trashList" style="margin-top:8px"><small>Loading…</small></div>';
 
-  var r = await fetch('/api/trash', { headers: authHeaders() });
+  var r = await fetch('/api/trash?folder=' + encodeURIComponent(cwdRel()), { headers: authHeaders() });
   var data = null; try { data = await r.json(); } catch (_) {}
   var listEl = document.getElementById('trashList');
-  if (!data || !data.files || !data.files.length) {
-    listEl.innerHTML = '<small>Trash is empty.</small>';
+  if (!data || !data.items || !data.items.length) {
+    listEl.innerHTML = '<small>Trash is empty in this folder.</small>';
     return;
   }
-  // Render origin path for each file so the user knows where it came from
-  var rows = data.files.map(function (f) {
-    var fromFolder = f.relPath.includes('/') ? f.relPath.slice(0, f.relPath.lastIndexOf('/')) : '/';
-    return '<li><span>' + escapeHtml(f.name) +
-           ' <small style="color:#888">from /' + escapeHtml(fromFolder === f.name ? '' : fromFolder) + '</small></span>' +
-           '<span><button data-restore="' + escapeHtml(f.relPath) + '">Restore</button> ' +
-           '<button data-delete="' + escapeHtml(f.relPath) + '">Delete</button></span></li>';
+  var rows = data.items.map(function (it) {
+    var icon = it.isFolder ? '📁' : '🖼';
+    var sizeNote = it.isFolder ? '' : ' <small style="color:#888">' + Math.round((it.size||0)/1024) + ' KB</small>';
+    return '<li><span>' + icon + ' ' + escapeHtml(it.name) + sizeNote + '</span>' +
+           '<span><button data-restore="' + escapeHtml(it.name) + '">Restore</button> ' +
+           '<button data-delete="' + escapeHtml(it.name) + '">Delete</button></span></li>';
   }).join('');
   listEl.innerHTML = '<ul class="files">' + rows + '</ul>' +
     '<div class="row" style="margin-top:8px">' +
     '<button id="restoreAllBtn">Restore all</button>' +
-    '<button id="emptyTrashBtn" style="margin-left:auto">Empty trash</button></div>';
+    '<button id="emptyTrashBtn2" style="margin-left:auto">Empty trash</button></div>';
 
   async function trashCall(url, body) {
     var rr = await fetch(url, {
@@ -363,24 +506,25 @@ async function exploreTrash() {
     });
     var j = null; try { j = await rr.json(); } catch (_) {}
     log((j && (j.message || j.error)) || (rr.ok ? 'ok' : 'http ' + rr.status));
+    return rr.ok;
   }
 
   listEl.querySelectorAll('button[data-restore]').forEach(b => b.addEventListener('click', async () => {
-    await trashCall('/api/trash/restore', { path: b.getAttribute('data-restore') });
+    await trashCall('/api/trash/restore', { folder: cwdRel(), name: b.getAttribute('data-restore') });
     exploreTrash(); loadFolder();
   }));
   listEl.querySelectorAll('button[data-delete]').forEach(b => b.addEventListener('click', async () => {
     if (!confirm('Permanently delete ' + b.getAttribute('data-delete') + '? This cannot be undone.')) return;
-    await trashCall('/api/trash/delete', { path: b.getAttribute('data-delete') });
+    await trashCall('/api/trash/delete', { folder: cwdRel(), name: b.getAttribute('data-delete') });
     exploreTrash();
   }));
   document.getElementById('restoreAllBtn').addEventListener('click', async () => {
-    await trashCall('/api/trash/restoreAll');
+    await trashCall('/api/trash/restoreAll', { folder: cwdRel() });
     exploreTrash(); loadFolder();
   });
-  document.getElementById('emptyTrashBtn').addEventListener('click', async () => {
-    if (!confirm('Permanently delete ALL trashed files? This cannot be undone.')) return;
-    await trashCall('/api/trash/empty');
+  document.getElementById('emptyTrashBtn2').addEventListener('click', async () => {
+    if (!confirm('Permanently delete ALL trashed items in this folder? This cannot be undone.')) return;
+    await trashCall('/api/trash/empty', { folder: cwdRel() });
     exploreTrash();
   });
 }
