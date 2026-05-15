@@ -3,7 +3,7 @@
 Fast, scalable photo gallery. Vanilla JS client, zero npm runtime deps, image
 resizing via libvips (`vipsthumbnail`).
 
-Preserves the URL/data layout of the 2014 PHP build:
+Preserves the URL/data layout of the 2008 PHP build:
 ```
 GALLERIES_ROOT/<path>/<image>                    # original
 GALLERIES_ROOT/<path>/thumbcache/<image>.resized.jpg

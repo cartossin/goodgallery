@@ -2,7 +2,7 @@
   "name": "goodgallery",
   "version": "2.0.0-dev",
   "type": "module",
-  "description": "Fast, scalable photo gallery — Node.js rewrite of the 2014 PHP Goodgallery",
+  "description": "Fast, scalable photo gallery — Node.js rewrite of the 2008 PHP Goodgallery",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
