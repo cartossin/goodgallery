@@ -1,28 +1,40 @@
-// Goodgallery 2.0 client. Vanilla JS, no third-party libraries.
-// Preserves the 2014 logic: images[], thumbs[], hash navigation,
-// 1-indexed nav (inum), per-page thumb rendering, on-demand build via onerror.
-
+// Goodgallery 2.0 client. Vanilla JS, zero deps.
+//
 // State injected by the server-rendered page:
-//   var images = [null, "a.jpg", "b.jpg", ...];   // 1-indexed
-//   var lastimagevalue = N;
-//   var thumbsperpage = 50;
-//   var xhrpush = 4;
-//   var isadmin = 0|1;
-//   var hasPasskey = true|false;
-//   var folderURL = "/path/with/trailing/slash/";
+//   images = [null, "a.jpg", ...]  (1-indexed)
+//   lastimagevalue, isadmin, hasPasskey, folderURL, spriteMeta, imagemapURL
 
 (function () {
   'use strict';
 
+  // One-time login-link redemption. If the URL fragment is #auth=<token>,
+  // strip it, redeem via the API, then reload so the page re-fetches with the
+  // new admin cookie. The link is supposed to "sign this browser in"; we don't
+  // try to preserve any other hash content since the link format is
+  // standalone (#auth=<token> only).
+  (function redeemAuthHash() {
+    var m = location.hash.match(/^#auth=([A-Za-z0-9_-]+)$/);
+    if (!m) return;
+    var token = m[1];
+    history.replaceState(null, '', location.pathname + location.search);
+    fetch('/api/admin/login/redeem', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: token })
+    }).then(function (r) {
+      if (r.ok) location.reload();
+      // On failure (expired / already used) we just stay on the page,
+      // unauthenticated. No alert here — the gallery is still usable for
+      // anyone, admin or not.
+    }).catch(function () {});
+  })();
+
   var CANONICAL_H = 200;
   var FOCUS_PREFETCH = 3;  // images on each side of focus to keep warm in the bitmap cache.
 
-  // Compact binary imagemap loader. The HTML page no longer ships an inline imageMap;
-  // client fetches a binary blob (.bin) and parses it via DataView for ~10x smaller
-  // bytes-on-the-wire and ~10x faster parse than equivalent JSON.
-  //   Format: 'GGMP' (4B) | version u16 LE | reserved u16 | count u32 LE
-  //           widths: count × u16 LE
-  //           names:  count NUL-terminated UTF-8 strings
+  // Binary imagemap format: 'GGMP' (4B) | version u16 LE | reserved u16 |
+  // count u32 LE | widths (count × u16 LE) | NUL-terminated UTF-8 names.
   async function loadImagemap() {
     if (!window.imagemapURL) return false;
     var resp = await fetch(window.imagemapURL, { credentials: 'same-origin' });
@@ -55,20 +67,12 @@
     return true;
   }
 
-  var thumbs        = [null];
-  // Per-gallery reserved subdir for all derived state (matches server.js GG_DIR).
   var GG_DIR = 'gg';
-  var inum = 1;             // legacy alias for focusedIdx — keep for any old refs
-  var focusedIdx = 0;       // 0 = no focus (grid view); 1..N = focused image index (1-based)
-  var isfullres = 0;        // unused after viewer removal; kept to satisfy any leftover refs
+  var inum = 1;
+  var focusedIdx = 0;       // 0 = grid view; 1..N = focused image
   var keyslocked = 0;
   var hashmirror = '';
-  var monitortimerid = null;
 
-  // Original-image URL for a name. Per-image LoDs and atlases are built separately
-  // (see getBestSrcForFocus / loadPerImageBitmap / sprite atlas). Originals are only
-  // fetched when a focused image needs more pixels than h1600 provides.
-  function originalURL(name)      { return folderURL + encodeURIComponent(name); }
 
   function $(id) { return document.getElementById(id); }
   function setText(id, t) { var e = $(id); if (e) e.textContent = t; }
@@ -80,7 +84,6 @@
     if (!rt) return;
     rt.textContent = msg || '';
   }
-  // ---------- ajax (fetch wrapper that mirrors XHConn semantics) ----------
   function gghttp(method, qs, onText) {
     var url = folderURL + (qs ? '?' + qs : '');
     fetch(url, { method: method, credentials: 'same-origin', headers: adminHeader() })
@@ -88,11 +91,10 @@
       .then(function (t) { onText(t); })
       .catch(function () { onText(''); });
   }
-  // (Auth is now an HttpOnly cookie — no client-side token handling needed.)
+  // Auth is an HttpOnly cookie; no client-side token handling needed.
   function adminHeader() { return {}; }
 
-  // Per-folder build was retired; the admin Full Rescan button (in /_admin/) covers
-  // everything site-wide. The page just monitors whatever the server is doing.
+  // The page just monitors server-side build state; mutations live in /_admin/.
   var statusTimer = null;
   function pollBuildStatus(opts) {
     opts = opts || {};
@@ -106,9 +108,7 @@
           note('Building LoD cache — ' + active + ' remaining (' + p.done + '/' + p.total + ' done)');
           statusTimer = setTimeout(function () { pollBuildStatus({ reloadOnComplete: reloadOnComplete }); }, 5000);
         } else if (reloadOnComplete && p.total > 0 && p.spriteUpToDate === false) {
-          // Builds drained but sprite hasn't been rebuilt yet (debounced).
-          // Keep polling until the sprite is current; reloading now would
-          // just hit the same "Building LoD cache" placeholder.
+          // Queue drained but sprite is still rebuilding (debounced).
           note('Build complete; finalizing…');
           statusTimer = setTimeout(function () { pollBuildStatus({ reloadOnComplete: reloadOnComplete }); }, 2000);
         } else if (reloadOnComplete && p.total > 0) {
@@ -122,8 +122,6 @@
   }
 
   // ---------- nav helpers ----------
-  function nextIndex(i) { return i === lastimagevalue ? 1 : i + 1; }
-  function prevIndex(i) { return i === 1 ? lastimagevalue : i - 1; }
 
   function nextimage()    { shiftFocus(+1); }
   function previousimage(){ shiftFocus(-1); }
@@ -131,16 +129,12 @@
   function isThumbView() { return focusedIdx === 0; }
   function leftbutton()  { if (focusedIdx > 0) shiftFocus(-1); }
   function rightbutton() { if (focusedIdx > 0) shiftFocus(+1); }
-  // commandedIdx tracks the most recently requested focus target. If a smooth-scroll
-  // animation is still playing when the user fires another shiftFocus (e.g. by mashing
-  // ArrowRight three times), each press accumulates against commandedIdx instead of
-  // the slowly-updating focusedIdx — so 3 fast presses jump 3 images and the animation
-  // chases the final target rather than gating the input.
+  // commandedIdx is the most-recently-requested focus target. Fast successive
+  // shifts accumulate against it so the chase animation tracks the final target.
   var commandedIdx = 0;
   function shiftFocus(delta) {
     if (lastimagevalue < 1) return;
-    // Use commandedIdx if we're mid-animation (it's ahead of focusedIdx); otherwise
-    // use focusedIdx (canonical when scroll has settled).
+    // Mid-animation → commandedIdx (ahead of focusedIdx). Settled → focusedIdx.
     var base = (focusInProgrammaticScroll && commandedIdx > 0) ? commandedIdx : focusedIdx;
     var next = base + delta;
     if (next < 1) next = lastimagevalue;
@@ -156,17 +150,42 @@
   // ---------- keys ----------
   function unlockkeys() { keyslocked = 0; }
   function keycheck(e) {
-    if (keyslocked) return;
+    // Don't hijack typing in inputs / textareas / contenteditable.
+    var tn = e.target && e.target.tagName;
+    if (tn === 'INPUT' || tn === 'TEXTAREA' || tn === 'SELECT' ||
+        (e.target && e.target.isContentEditable)) return;
+
     var k = e.which || e.keyCode;
+
+    // Grid view: scroll keys move the thumbs viewport. The thumbs container
+    // is a custom scroller (overflow:auto), so without explicit handling
+    // these keys do nothing until the user clicks the scrollbar to give the
+    // browser a focused scroll target. Don't lock — holding PageDown should
+    // keep paging.
+    if (focusedIdx === 0) {
+      var thumbsEl = document.getElementById('thumbs');
+      if (!thumbsEl) return;
+      var pageDelta = thumbsEl.clientHeight * 0.85;  // 15% overlap for context
+      var target = null;
+      if (k === 33) target = Math.max(0, thumbsEl.scrollTop - pageDelta);                       // PageUp / Fn+Up
+      else if (k === 34) target = thumbsEl.scrollTop + pageDelta;                               // PageDown / Fn+Down
+      else if (k === 36) target = 0;                                                            // Home / Fn+Left
+      else if (k === 35) target = thumbsEl.scrollHeight;                                        // End / Fn+Right
+      else if (e.metaKey && k === 38) target = 0;                                               // Cmd+Up (Mac)
+      else if (e.metaKey && k === 40) target = thumbsEl.scrollHeight;                           // Cmd+Down (Mac)
+      if (target !== null) {
+        e.preventDefault();
+        thumbsEl.scrollTo({ top: target, behavior: 'smooth' });
+        return;
+      }
+    }
+
+    if (keyslocked) return;
     var isArrow = (k === 37 || k === 38 || k === 39 || k === 40);
-    // In focus mode arrow keys shift focus — Up/Left = prev, Down/Right = next.
-    // We only consume the key (preventDefault) when we actually act on it; otherwise
-    // native page scroll continues to work in grid mode where #thumbs has focus.
+    // Focus mode: arrow keys shift focus. preventDefault blocks the native
+    // ~40px arrow-key scroll on the strip that would race with shiftFocus().
     if (focusedIdx > 0 && isArrow) {
-      e.preventDefault();  // stop the browser's native ~40px arrow-key scroll on the
-                           // focus strip, which would otherwise race with shiftFocus()
-                           // and produce the "slowly sliding" jitter when #thumbs has
-                           // keyboard focus (e.g. after the user clicked into it).
+      e.preventDefault();
       if (k === 37 || k === 38) leftbutton(); else rightbutton();
     } else if (k === 27 && focusedIdx > 0) {
       e.preventDefault();
@@ -179,8 +198,7 @@
 
   // ---------- view ----------
 
-  // rAF-throttled re-layout. Slider input + window resize fire many events; this
-  // collapses them to one renderGallery per frame.
+  // rAF-throttled re-layout: collapses bursts of resize/zoom events into one render per frame.
   var rafPending = false;
   function scheduleRender() {
     if (rafPending) return;
@@ -220,9 +238,7 @@
     return Math.max(2, lo);
   }
 
-  // Width available for thumbs (the #thumbs box) and height available below it. We use
-  // bounding rects so chrome (header + prev/next + footer + adminnotify) is accounted
-  // for exactly, without hardcoded estimates.
+  // Use bounding rects so chrome height is exact (no hardcoded estimates).
   function layoutWidth() {
     var el = document.getElementById('thumbs');
     return (el && el.clientWidth) || window.innerWidth;
@@ -235,13 +251,11 @@
     return Math.max(120, window.innerHeight - top - footH - 8);
   }
 
-  // Compute total layout height for a given row-height target without rendering. Mirrors
-  // layoutRows()/finalizeRow() exactly so fit-all is accurate.
-  // Proportional grid gap: 2.5% of the target row height. Floors to 0 at very small
-  // tile sizes so e.g. h5 atlas tiles butt up against each other (no visible gap).
+  // Total layout height for row-target H without rendering. Must mirror
+  // layoutRows()/finalizeRow() so fit-all stays accurate.
   function rowGap(H) { return Math.max(0, Math.floor(H * 0.04)); }
   function simulateLayoutHeight(H, W) {
-    if (!window.spriteMeta) return 0;
+    if (!window.spriteMeta || !spriteMeta.imageMap) return 0;
     var rows = 0, totalH = 0;
     var natRowW = 0, count = 0;
     for (var i = 1; i <= lastimagevalue; i++) {
@@ -249,43 +263,38 @@
       var loc = spriteMeta.imageMap[name];
       var natW = (loc ? loc.w : CANONICAL_H) * H / CANONICAL_H;
       if (count > 0 && (natRowW + rowGap(H) * count + natW) > W) {
-        // close row
         var rowScale = Math.min(1.5, (W - rowGap(H) * (count - 1)) / Math.max(1, natRowW));
         totalH += H * rowScale + rowGap(H);
         rows++; natRowW = 0; count = 0;
       }
       natRowW += natW; count++;
     }
-    if (count > 0) totalH += H + rowGap(H);  // last row at natural height
+    if (count > 0) totalH += H + rowGap(H);
     return totalH;
   }
 
-  // Discrete zoom levels: each is a target row-height in CSS px (or a special
-  // 'focus' marker that swaps to the focus-mode UI). The level array is FILTERED
-  // per-gallery in availableLevels() so that small galleries (where fit-all
-  // already exceeds 'Tiny' / 'Small') don't show redundant buttons.
+  // Zoom ladder. h is in DEVICE pixels (target image-pixel height the user
+  // wants painted). 'fit' resolves to fitAllHeight() (viewport-dependent, CSS px);
+  // 'focus' enters single-image mode. Hash form: #fit, #size0..#sizeN, #imagename.
   var ZOOM_LEVELS = [
-    { name: 'All',    h: null  },  // null → use fitAllHeight()
-    { name: 'Tiny',   h: 30   },
-    { name: 'Small',  h: 80   },
-    { name: 'Medium', h: 200  },
-    { name: 'Large',  h: 600  },
-    { name: 'Focus',  h: 'focus' },
+    { name: 'fit',   hash: 'fit',   h: null    },
+    { name: 'size0', hash: 'size0', h: 5       },
+    { name: 'size1', hash: 'size1', h: 10      },
+    { name: 'size2', hash: 'size2', h: 50      },
+    { name: 'size3', hash: 'size3', h: 100     },
+    { name: 'size4', hash: 'size4', h: 200     },
+    { name: 'size5', hash: 'size5', h: 400     },
+    { name: 'size6', hash: 'size6', h: 800     },
+    { name: 'focus', hash: null,    h: 'focus' },
   ];
-  // Index into the filtered level list. Set on init from the hash; updated by
-  // user actions (button click, pinch, hash change). The grid level is also
-  // remembered for the back-button-from-focus → return to grid at same zoom.
-  // Default opens at "Small" — name-based so the meaning is stable across
-  // galleries (a fixed index would land on different levels depending on which
-  // collapsed in availableLevels for that particular gallery's fit-all H).
-  var DEFAULT_LEVEL_NAME = 'Small';
+  // lastGridLevelIdx is preserved so back-from-focus restores the prior zoom.
+  var DEFAULT_LEVEL_NAME = 'size3';
   function defaultLevelIdx() {
     var levels = availableLevels();
     for (var i = 0; i < levels.length; i++) {
       if (levels[i].name === DEFAULT_LEVEL_NAME) return i;
     }
-    // Small isn't present (very tiny gallery where it collapses with All) —
-    // fall back to the largest non-Focus level.
+    // Default name missing → fall back to the largest non-focus level.
     var fallback = 0;
     for (var j = 0; j < levels.length; j++) {
       if (levels[j].h !== 'focus') fallback = j;
@@ -293,40 +302,28 @@
     return fallback;
   }
   var currentLevelIdx = 0;
-  var lastGridLevelIdx = 0;
-  // Discrete level system sets levelTargetH directly, bypassing the continuous
-  // zoom transform (which caps at CANONICAL_H = 200 — Medium and Large
-  // collapsed onto the same render).
+  // Default to size3; setLevel() / refreshfromhash() update this as the
+  // user picks zooms during the session. The up-arrow in focus view reads it
+  // back to restore zoom — initial value matters when the user enters via a
+  // focus URL without having visited the grid first.
+  var lastGridLevelIdx = defaultLevelIdx();
   var levelTargetH = null;
-  var currentZoom = 0;
-  function getZoom() { return currentZoom; }
-  function setZoom(t) {
-    if (isNaN(t) || t < 0) t = 0;
-    if (t > 100) t = 100;
-    currentZoom = t;
-  }
-
-  // Compute the displayable (collapsed-duplicates) level list for the current
-  // gallery. Always includes index 0 (All) and the last index (Focus). Skips
-  // intermediate levels whose H is <= the previous distinct level's H.
   function availableLevels() {
-    if (!window.spriteMeta) return [ZOOM_LEVELS[0], ZOOM_LEVELS[ZOOM_LEVELS.length - 1]];
-    var H_all = fitAllHeight();
+    // Returns ZOOM_LEVELS with raw h values: null for #fit, 'focus' sentinel
+    // for the focus entry, device-px numbers for sized levels. Don't substitute
+    // fitAllHeight() here — that value would propagate into levelTargetH and
+    // get incorrectly divided by dpr in targetRowHeight(). Resolve fit's null
+    // at the use site (targetRowHeight does it correctly).
     var out = [];
-    var lastH = -Infinity;
     for (var i = 0; i < ZOOM_LEVELS.length; i++) {
       var lv = ZOOM_LEVELS[i];
-      if (lv.h === 'focus') { out.push(lv); continue; }
-      var h = (lv.h == null) ? H_all : Math.max(lv.h, H_all);
-      if (h <= lastH + 0.5) continue;  // collapses with previous level
-      out.push({ name: lv.name, h: h });
-      lastH = h;
+      out.push({ name: lv.name, hash: lv.hash, h: lv.h });
     }
     return out;
   }
 
-  // Apply a level by index. Special-cases: 'focus' marker enters focus mode
-  // on the centered-most visible image. Updates hash to reflect the new state.
+  // Apply a zoom level. The 'focus' sentinel enters single-image mode on the
+  // centered visible image; everything else updates hash + re-renders.
   function setLevel(idx) {
     var levels = availableLevels();
     if (idx < 0) idx = 0;
@@ -335,38 +332,40 @@
     var lv = levels[idx];
     if (lv.h === 'focus') {
       var name = findCenteredImageName();
-      if (name == null && images[1]) name = images[1];  // fallback to first image
-      if (name) {
-        location.hash = encodeURIComponent(name);
-      }
+      if (name == null && images[1]) name = images[1];
+      if (name) location.hash = encodeURIComponent(name);
       return;
     }
     lastGridLevelIdx = idx;
     levelTargetH = lv.h;
-    // If we were in focus mode, leave it.
+    var newHash = '#' + lv.hash;
     if (focusedIdx > 0) {
-      location.hash = '#size' + idx;
+      location.hash = newHash;
       return;
     }
-    // Already in grid: just update hash + re-render.
-    var newHash = '#size' + idx;
     if (location.hash !== newHash) {
-      // Use replaceState so back-button doesn't get cluttered with every zoom step.
       try { history.replaceState(null, '', newHash); } catch (_) {}
-      hashmirror = 'size' + idx;
+      hashmirror = lv.hash;
     }
     scheduleRender();
     renderZoomControl();
   }
 
-  // Build the [-] Label [+] (grid) or [<- back] (focus) control inside #zoomControl.
+  // [-] Label [+] in grid mode; [↑] in focus mode.
   function renderZoomControl() {
     var el = document.getElementById('zoomControl');
     if (!el) return;
     if (focusedIdx > 0) {
-      el.innerHTML = '<button class="zoom-back" title="Back to thumbnails">← Back</button>';
+      el.innerHTML = '<button class="zoom-back" title="Up to gallery" aria-label="Up to gallery">↑</button>';
       el.querySelector('button').addEventListener('click', function () {
-        location.hash = '#size' + lastGridLevelIdx;
+        // Anchor the grid scroll on the image we were just viewing. renderGallery
+        // reads cachedAnchorName during relayout and sets scrollTop to put that
+        // image's row at the viewport top.
+        if (focusedIdx > 0 && images[focusedIdx]) {
+          cachedAnchorName = images[focusedIdx];
+        }
+        var lv = availableLevels()[lastGridLevelIdx];
+        location.hash = lv && lv.hash ? '#' + lv.hash : '#fit';
       });
       return;
     }
@@ -385,20 +384,16 @@
     if (plus) plus.addEventListener('click', function () { setLevel(currentLevelIdx + 1); });
   }
 
-  function targetRowHeight(t) {
+  function targetRowHeight() {
     if (!window.spriteMeta) return 100;
-    if (focusedIdx > 0) {
-      return Math.max(50, layoutHeight() * 0.7);
-    }
-    if (levelTargetH != null) return levelTargetH;
-    var Hmin = fitAllHeight();
-    var Hmax = CANONICAL_H;
-    if (Hmax <= Hmin) return Hmax;
-    return Hmin * Math.pow(Hmax / Hmin, t / 100);
+    if (focusedIdx > 0) return Math.max(50, layoutHeight() * 0.7);
+    // levelTargetH is in DEVICE px (from ZOOM_LEVELS); convert to CSS for layout.
+    if (levelTargetH != null) return levelTargetH / devicePixelRatio();
+    return fitAllHeight();
   }
 
   function layoutRows(H) {
-    if (!window.spriteMeta) return [];
+    if (!window.spriteMeta || !spriteMeta.imageMap) return [];
     var W = layoutWidth();
     var rows = [];
     var current = [];
@@ -407,7 +402,6 @@
       var name = images[i];
       var loc = spriteMeta.imageMap[name];
       var natW = (loc ? loc.w : CANONICAL_H) * H / CANONICAL_H;
-      // Available content width = W minus inter-thumb gaps for items already in row.
       var avail = W - rowGap(H) * Math.max(0, current.length - 1);
       if (current.length > 0 && (natRowW + natW + rowGap(H)) > W) {
         rows.push(finalizeRow(current, natRowW, H, W, false));
@@ -423,73 +417,76 @@
   function finalizeRow(items, natRowW, H, W, isLast) {
     var contentW = W - rowGap(H) * Math.max(0, items.length - 1);
     var rowScale = isLast ? 1 : Math.min(1.5, contentW / Math.max(1, natRowW));
+    var h = H * rowScale;
+    // Float widths: rounding each tile to an integer drifts the row total down
+    // by ~Math.round-error × tile-count, which at #fit on 100k images
+    // underfills rows by 20-40 px. WebGL takes fractional dst rects fine; each
+    // tile still starts exactly where the previous one ended, so seams are
+    // pixel-perfect even with fractional widths.
     return {
       items: items.map(function (it) {
-        return { index: it.index, w: Math.max(1, Math.round(it.natW * rowScale)), h: Math.max(1, Math.round(H * rowScale)) };
+        return { index: it.index, w: Math.max(0.5, it.natW * rowScale), h: h };
       }),
-      height: H * rowScale,
+      height: h,
     };
   }
 
-  // ---- virtual-scroll single canvas (option C, scaled) -----------------
-  // The canvas stays the size of the viewport — never grows with the gallery. The
-  // scroll container is sized to the full layout height via a spacer; as the user
-  // scrolls, we redraw the (small) canvas with whichever rows are currently visible.
-  // Memory and paint cost are bounded regardless of N (works for 60k+ images).
-  //
-  // Layout:
-  //   #thumbs (scroll container, overflow-y: auto, height = available viewport)
-  //     <canvas> (position: sticky; top: 0; height = viewport)
-  //     <div class="spacer" style="height = totalLayoutHeight - viewport">
-  //
-  // The canvas is the FIRST child + sticky top, the spacer comes AFTER. Scrolling pushes
-  // the spacer up; the canvas stays at the top of the viewport. On scroll we redraw with
-  // the appropriate Y window of the layout.
-  // Render at device-pixel density on retina — browser then displays 1:1 from the
-  // backing store rather than upsampling a CSS-px-density canvas. Capped at 2 since
-  // higher densities don't visibly help and just multiply paint cost.
+  // ---- virtual-scroll single canvas -----------------------------------
+  // The canvas is viewport-sized, position:sticky at the top of #thumbs.
+  // A spacer sibling holds the full layout height. On scroll we redraw the
+  // (small) canvas for the visible Y window — paint cost is bounded regardless
+  // of N, so 60k+ image galleries are fine.
+  // dpr cap at 2: higher densities multiply paint cost without visible gain.
   function devicePixelRatio() { return Math.min(window.devicePixelRatio || 1, 2); }
 
-  // Per-atlas-height ImageBitmap cache. Each atlas height (5/10/50) is loaded once,
-  // lazily, and reused across renders.
+  // Coalesce hash mutations during fast scrubs. Chrome's IPC flooding guard
+  // (crbug.com/1038223) trips around ~25 hash changes/sec sustained; once
+  // tripped, queued ops burst at once -> freeze, RAM spike, repaint chaos.
+  var pendingHashTimer = null;
+  function scheduleHashUpdate(newHash) {
+    if (pendingHashTimer) clearTimeout(pendingHashTimer);
+    pendingHashTimer = setTimeout(function () {
+      pendingHashTimer = null;
+      try { history.replaceState(null, '', newHash); } catch (_) {}
+    }, 200);
+  }
+
+  // Per-atlas-height ImageBitmap cache (h5/h10/h50, loaded lazily).
   var spriteBitmapsByHeight = {};      // { '50': Promise<[ImageBitmap, ...]>, ... }
-  // Sync mirror of the resolved atlas bitmap arrays — populated by the .then() below.
-  // Used by drag-paint where we need to draw prev/next images mid-gesture without an
-  // async hop (a microtask on every drag frame would visibly stutter).
-  var atlasBitmapsSync = {};           // { '50': [ImageBitmap, ...] | undefined }
-  // Per-image bitmap cache for high-zoom views. Keyed by `${name}|${tierH}`. At
-  // tierH=100/200/400/800 we fetch each visible image as its own AVIF; the canvas
-  // composites them. Only viewport-visible images are fetched, so memory is bounded.
+  // Sync mirror so drag-paint can blit prev/next without a microtask hop.
+  var atlasBitmapsSync = {};
+  // DEBUG: expose for memory-leak repro harness. Counts non-null bitmap refs
+  // per atlas height. Cheap, harmless to leave in production.
+  window.__memdbg = {
+    spriteRefCount: function (atlasH) {
+      var arr = atlasBitmapsSync[String(atlasH)] || [];
+      var n = 0;
+      for (var i = 0; i < arr.length; i++) if (arr[i]) n++;
+      return n;
+    },
+    atlasBitmapsSync: atlasBitmapsSync,
+    perImageBitmapsSync: perImageBitmapsSync,
+  };
+  // Per-image bitmaps for high-zoom views. Keyed by `${name}|${tierH}`.
   var perImageBitmaps = new Map();
-  // Sync mirror — populated by loadPerImageBitmap.then. Lets paintMain pick the
-  // best already-resolved tier without going through a Promise microtask.
-  var perImageBitmapsSync = new Map();   // key -> ImageBitmap
-  var currentRowHeight = 200;          // current target row height in CSS px
-  var renderFrame = 0;                 // increments per renderGallery; async draws check this
-  var lastTileRects = [];              // [{x, y, w, h, name}] in LAYOUT coords (not screen)
-  var lastTotalH = 0;                  // total layout height
+  // Sync mirror so paintMain can pick the best resolved tier without awaiting.
+  var perImageBitmapsSync = new Map();
+  // Names currently considered "warm" by the visible-buffer / focus-prefetch
+  // logic. Updated by drawCanvasForScroll (grid) and prefetchFilmstripVisible
+  // (focus); checked by _runPerImageJob so in-flight loads completing after
+  // the scroll stops can be closed immediately instead of leaking ~24 × 3MB
+  // bitmaps into perImageBitmapsSync with nothing to evict them.
+  var warmPerImageNames = new Set();
+  var currentRowHeight = 200;
+  var renderFrame = 0;                 // bumped per render; async draws check it before painting
+  var lastTileRects = [];              // [{x, y, w, h, name}] in layout coords
   var canvasEl = null;
   var spacerEl = null;
   var canvasClickAttached = false;
   var thumbsScrollAttached = false;
-  var pendingScrollDraw = false;
 
-  // Per-atlas-height per-sprite-index callbacks: { '50': [fn, fn, ...] } where
-  // fn(bitmap, spriteIdx) fires when that particular sprite finishes decoding.
-  // Used by drawMainImage / drawCanvasForScroll to repaint the moment the sprite
-  // they need becomes available, instead of waiting for the whole-atlas Promise.all.
-  var spriteBitmapWaiters = {};
-
-  function onSpriteBitmapReady(atlasH, fn) {
-    var key = String(atlasH);
-    if (!spriteBitmapWaiters[key]) spriteBitmapWaiters[key] = [];
-    spriteBitmapWaiters[key].push(fn);
-  }
-
-  // Per-sprite promise cache: spritePromises['50'][7] is the in-flight or
-  // resolved promise for sprite 7 of the h50 atlas. Loading on-demand instead of
-  // whole-atlas-at-once prevents the ~1.7 GB decode spike when entering focus
-  // on a 41k-image gallery (which kills iOS Safari and stresses Chrome).
+  // On-demand per-sprite loading avoids whole-atlas decode spikes that crash
+  // iOS Safari on large galleries.
   var spritePromises = {};
 
   function loadSpriteAt(atlasH, spriteIdx) {
@@ -505,18 +502,14 @@
       .then(function (b) { return createImageBitmap(b); })
       .then(function (bm) {
         atlasBitmapsSync[key][spriteIdx] = bm;
-        var ws = spriteBitmapWaiters[key];
-        if (ws) for (var w = 0; w < ws.length; w++) {
-          try { ws[w](bm, spriteIdx); } catch (_) {}
-        }
+        gridRenderer.uploadSprite(key + ':' + spriteIdx, bm);
         return bm;
       });
     return spritePromises[key][spriteIdx];
   }
 
-  // Backwards-compat: load every sprite for an atlas height. Used by the few
-  // callers that genuinely need everything (currently none after the per-sprite
-  // refactor below; kept as a safety helper).
+  // Bulk-load every sprite for an atlas height. Safety helper; most callers
+  // use loadSpriteAt for the specific sprite they need.
   function loadSpriteBitmapsForAtlas(atlasH) {
     var key = String(atlasH);
     if (spriteBitmapsByHeight[key]) return spriteBitmapsByHeight[key];
@@ -529,74 +522,120 @@
     return spriteBitmapsByHeight[key];
   }
 
-  // Atlas pick: smallest atlas height >= target. Returns null if target exceeds the
-  // largest atlas (caller should switch to per-image rendering).
+  // Atlas tier closest to targetH in log scale. The previous "smallest ≥
+  // target" rule forced h50 at #fit (target ~14 device px), and on a 100k-
+  // image gallery the buffer at #fit covers EVERY tile — meaning every
+  // sprite of the chosen tier has to be loaded. h50 atlas at openimages-val
+  // scale = ~30 sprites × 50 MB = 1.5 GB just to render thumbnails at ~14
+  // device px. Log-distance picks h10 instead (1.4x upsample, imperceptible
+  // at #fit's tile size; ~70 MB total). null → caller falls back to per-
+  // image AVIF (target above the largest available atlas tier).
   function pickAtlasHeight(targetH) {
     if (!window.spriteMeta || !spriteMeta.atlases) return null;
     var heights = Object.keys(spriteMeta.atlases).map(Number).sort(function (a, b) { return a - b; });
-    for (var i = 0; i < heights.length; i++) {
-      if (heights[i] >= targetH) return heights[i];
+    if (!heights.length) return null;
+    if (targetH > heights[heights.length - 1]) return null;
+    var best = heights[0], bestDist = Math.abs(Math.log(heights[0] / targetH));
+    for (var i = 1; i < heights.length; i++) {
+      var d = Math.abs(Math.log(heights[i] / targetH));
+      if (d < bestDist) { bestDist = d; best = heights[i]; }
     }
-    return null;  // target is larger than any atlas — caller uses per-image AVIF
+    return best;
   }
 
-  // Per-image LoD: pick the smallest available tier height >= target. Tier 0 is a
-  // sentinel meaning "the original file" — used when the canvas needs more pixels than
-  // h1600 provides (4K display + retina). Available pre-built tiers match
-  // the server's LOD_TIERS list.
-  var PER_IMAGE_TIERS = [100, 200, 400, 800, 1600];
+  // Smallest per-image tier ≥ target, clamped to the top of the ladder.
+  // h1600 is the ceiling — extra-large canvases get h1600 upscaled rather
+  // than the (potentially huge) original. h100 lives in the sprite atlas
+  // (ATLAS_TIERS on the server) so per-image tiers start at 200; while a
+  // gallery is still building its atlas, size3 falls back to h200.avif.
+  var PER_IMAGE_TIERS = [200, 400, 800, 1600];
   function pickPerImageTier(targetH) {
     for (var i = 0; i < PER_IMAGE_TIERS.length; i++) {
       if (PER_IMAGE_TIERS[i] >= targetH) return PER_IMAGE_TIERS[i];
     }
-    return 0;  // request the original
+    return PER_IMAGE_TIERS[PER_IMAGE_TIERS.length - 1];
   }
 
-  // Concurrency limiter for per-image loads. Without this, scrolling through a
-  // large gallery at Small/Medium queues hundreds of concurrent fetches and
-  // Chrome aborts them with ERR_INSUFFICIENT_RESOURCES (no fd / connection
-  // budget left). 8 in flight at a time matches HTTP/2 stream concurrency
-  // sweet-spot and finishes fast enough to never block the visible viewport.
-  var PER_IMAGE_MAX_INFLIGHT = 8;
+  // Per-image AVIF loader. Capped in-flight + pending queue so a size3 grid
+  // load (hundreds of tiles kicked off in one frame) doesn't trip Chrome's
+  // ERR_INSUFFICIENT_RESOURCES at the renderer-level fetch cap. HTTP/2
+  // multiplexes well — 64 concurrent streams is fast but stays clear of the
+  // ~256-per-renderer ceiling. Each fetch has its own AbortController so a
+  // scroll that moves past the target cancels the in-flight download AND
+  // discards still-queued requests for it.
+  var PER_IMAGE_MAX_INFLIGHT = 64;
   var perImageInflight = 0;
-  var perImageQueue = [];
-  // Drop everything not yet in flight. Resolve their promises with null and
-  // un-cache the keys so a future loadPerImageBitmap() re-queues them. In-flight
-  // requests are NOT aborted — their completions are cheap and the renderFrame
-  // guard in drawCanvasForScroll discards their paints if no longer visible.
-  function clearPendingPerImageLoads() {
-    while (perImageQueue.length) {
-      var job = perImageQueue.shift();
-      job.resolve(null);
-      perImageBitmaps.delete(job.key);
-    }
-  }
+  var perImageQueue = [];               // [{key, url, ctrl, resolve}]
+  var activeAborts = new Map();         // key -> AbortController (queued OR in-flight)
   function _runPerImageJob(job) {
+    if (job.ctrl && job.ctrl.signal.aborted) {
+      // Got cancelled while waiting in the queue — nothing to fetch.
+      activeAborts.delete(job.key);
+      perImageBitmaps.delete(job.key);
+      job.resolve(null);
+      return;
+    }
     perImageInflight++;
-    fetch(job.url, { credentials: 'same-origin' })
+    fetch(job.url, { credentials: 'same-origin', signal: job.ctrl ? job.ctrl.signal : undefined })
       .then(function (r) { return r.blob(); })
       .then(function (b) { return createImageBitmap(b); })
       .catch(function () { return null; })
       .then(function (bm) {
         perImageInflight--;
-        job.resolve(bm);
-        if (bm) perImageBitmapsSync.set(job.key, bm);
-        // Drain queue.
-        if (perImageQueue.length && perImageInflight < PER_IMAGE_MAX_INFLIGHT) {
-          _runPerImageJob(perImageQueue.shift());
+        activeAborts.delete(job.key);
+        var name = job.key.slice(0, job.key.lastIndexOf('|'));
+        if (bm && !warmPerImageNames.has(name)) {
+          // User scrolled past during the load — drop right here so the bitmap
+          // does not sit in perImageBitmapsSync until eviction runs.
+          try { bm.close && bm.close(); } catch (_) {}
+          perImageBitmaps.delete(job.key);
+          bm = null;
+        } else if (!bm) {
+          // Aborted or failed — drop cached promise so a future call retries.
+          perImageBitmaps.delete(job.key);
         }
+        job.resolve(bm);
+        if (bm) {
+          perImageBitmapsSync.set(job.key, bm);
+          gridRenderer.uploadSprite('img:' + job.key, bm);
+        }
+        _pumpPerImageQueue();
       });
+  }
+  function _pumpPerImageQueue() {
+    while (perImageInflight < PER_IMAGE_MAX_INFLIGHT && perImageQueue.length) {
+      _runPerImageJob(perImageQueue.shift());
+    }
+  }
+  // Cancel both pending (queued) AND in-flight loads whose key isn't in
+  // keepKeys. Walks the queue once so aborted entries don't sit consuming
+  // capacity later.
+  function cancelPerImageLoadsExcept(keepKeys) {
+    var kept = [];
+    for (var i = 0; i < perImageQueue.length; i++) {
+      var job = perImageQueue[i];
+      if (keepKeys.has(job.key)) { kept.push(job); continue; }
+      if (job.ctrl) try { job.ctrl.abort(); } catch (_) {}
+      activeAborts.delete(job.key);
+      perImageBitmaps.delete(job.key);
+      job.resolve(null);
+    }
+    perImageQueue = kept;
+    activeAborts.forEach(function (ctrl, key) {
+      if (!keepKeys.has(key)) try { ctrl.abort(); } catch (_) {}
+    });
+    _pumpPerImageQueue();
   }
   function loadPerImageBitmap(name, tierH) {
     var key = name + '|' + tierH;
     if (perImageBitmaps.has(key)) return perImageBitmaps.get(key);
-    var url = tierH === 0
-      ? folderURL + encodeURIComponent(name)
-      : folderURL + GG_DIR + '/' + encodeURIComponent(name) + '.h' + tierH + '.avif';
+    var url = folderURL + GG_DIR + '/' + encodeURIComponent(name) + '.h' + tierH + '.avif';
     var resolveFn;
     var prom = new Promise(function (res) { resolveFn = res; });
     perImageBitmaps.set(key, prom);
-    var job = { key: key, url: url, resolve: resolveFn };
+    var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    if (ctrl) activeAborts.set(key, ctrl);
+    var job = { key: key, url: url, ctrl: ctrl, resolve: resolveFn };
     if (perImageInflight < PER_IMAGE_MAX_INFLIGHT) _runPerImageJob(job);
     else perImageQueue.push(job);
     return prom;
@@ -605,14 +644,294 @@
     return perImageBitmapsSync.get(name + '|' + tierH) || null;
   }
 
-  // Returns the best per-image bitmap that's already in the sync cache, preferring
-  // the requested tier, then any smaller cached tier. Returns null if nothing is
-  // cached — caller should fall back to the atlas. This is what stops the canvas
-  // from going black during a zoom slide: we paint whatever resolution we already
-  // have, then upgrade in-place when the target tier finishes loading.
+  // Close + drop per-image bitmaps whose image name isn't in warmNames.
+  // ImageBitmap pixel data lives in GPU/native memory; without close() it stays
+  // pinned even after the JS Map entry is gone. Never close the bitmap that
+  // mainDrawSrc currently references — paintMain can fire after eviction and
+  // would crash with "image source is detached" on the closed handle.
+  function evictPerImageBitmaps(warmNames) {
+    var pinned = (mainDrawSrc && mainDrawSrc.bitmap) || null;
+    var dead = [];
+    perImageBitmapsSync.forEach(function (bm, key) {
+      var name = key.slice(0, key.lastIndexOf('|'));
+      if (warmNames.has(name)) return;
+      if (pinned && bm === pinned) return;
+      dead.push({ key: key, bm: bm });
+    });
+    for (var i = 0; i < dead.length; i++) {
+      var k = dead[i].key, bm = dead[i].bm;
+      try { if (bm && typeof bm.close === 'function') bm.close(); } catch (_) {}
+      perImageBitmapsSync.delete(k);
+      perImageBitmaps.delete(k);
+      gridRenderer.deleteTexture('img:' + k);
+    }
+  }
+
+  // ---- grid renderer (WebGL2) -----------------------------------------
+  // Draws all visible thumbnail tiles as instanced textured quads. One
+  // drawArraysInstanced call per loaded sprite; replaces ~N drawImage calls
+  // (N=visible tiles) with ~S draw calls (S=visible sprite count). At #fit
+  // on 100k images that turns 100k calls into <30.
+  //
+  // Public surface (used by drawCanvasForScroll and loadSpriteAt):
+  //   gridRenderer.available()           — true if WebGL2 was acquired ok
+  //   gridRenderer.attach(canvas)        — bind to (possibly new) canvas
+  //   gridRenderer.uploadSprite(key, bm) — upload an ImageBitmap to a texture
+  //   gridRenderer.releaseAll()          — drop all textures (mode swap, etc.)
+  //   gridRenderer.render(opts)          — draw one frame
+  //
+  // The renderer is purely a draw layer; visibility, atlas selection, and
+  // sprite-load orchestration stay in drawCanvasForScroll.
+  var gridRenderer = (function () {
+    var gl = null;
+    var program = null;
+    var quadVBO = null;
+    var dynInstVBO = null;
+    var locDstRect, locSrcRect, locQuadPos, locViewportPx, locTopOffset, locAtlasSampler;
+    var attachedCanvas = null;
+    var textures = new Map();        // textureKey -> { tex, w, h }
+    var staticBuffers = new Map();   // instanceKey -> { buf, count }
+    var failed = false;
+
+    // aDstRect.y is the tile's WORLD y (layout coord). uTopOffset is the
+    // world y of the canvas top; the shader subtracts to get canvas-local
+    // pixels. This lets atlas mode pre-upload a single static instance
+    // buffer per (atlasH, sprite) and re-draw with just one uniform update.
+    var VS = '#version 300 es\n' +
+      'in vec2 aQuadPos;\n' +
+      'in vec4 aDstRect;\n' +
+      'in vec4 aSrcRect;\n' +
+      'uniform vec2 uViewportPx;\n' +
+      'uniform float uTopOffset;\n' +
+      'out vec2 vUV;\n' +
+      'void main() {\n' +
+      '  vec2 worldPos = aDstRect.xy + aQuadPos * aDstRect.zw;\n' +
+      '  vec2 css = vec2(worldPos.x, worldPos.y - uTopOffset);\n' +
+      '  vec2 ndc = (css / uViewportPx) * 2.0 - 1.0;\n' +
+      '  ndc.y = -ndc.y;\n' +
+      '  gl_Position = vec4(ndc, 0.0, 1.0);\n' +
+      '  vUV = aSrcRect.xy + aQuadPos * aSrcRect.zw;\n' +
+      '}\n';
+    var FS = '#version 300 es\n' +
+      'precision mediump float;\n' +
+      'in vec2 vUV;\n' +
+      'uniform sampler2D uAtlas;\n' +
+      'out vec4 fragColor;\n' +
+      'void main() { fragColor = texture(uAtlas, vUV); }\n';
+
+    function compile(type, src) {
+      var s = gl.createShader(type);
+      gl.shaderSource(s, src);
+      gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+        var log = gl.getShaderInfoLog(s);
+        gl.deleteShader(s);
+        throw new Error('shader compile: ' + log);
+      }
+      return s;
+    }
+    function link(vs, fs) {
+      var p = gl.createProgram();
+      gl.attachShader(p, vs);
+      gl.attachShader(p, fs);
+      gl.linkProgram(p);
+      if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+        var log = gl.getProgramInfoLog(p);
+        gl.deleteProgram(p);
+        throw new Error('program link: ' + log);
+      }
+      return p;
+    }
+
+    function init(canvas) {
+      if (failed) return false;
+      try {
+        gl = canvas.getContext('webgl2', { alpha: false, premultipliedAlpha: true, antialias: false, preserveDrawingBuffer: true });
+        if (!gl) { console.warn('[gridRenderer] WebGL2 unavailable'); failed = true; return false; }
+        var vs = compile(gl.VERTEX_SHADER, VS);
+        var fs = compile(gl.FRAGMENT_SHADER, FS);
+        program = link(vs, fs);
+        gl.deleteShader(vs); gl.deleteShader(fs);
+
+        locQuadPos = gl.getAttribLocation(program, 'aQuadPos');
+        locDstRect = gl.getAttribLocation(program, 'aDstRect');
+        locSrcRect = gl.getAttribLocation(program, 'aSrcRect');
+        locViewportPx = gl.getUniformLocation(program, 'uViewportPx');
+        locTopOffset = gl.getUniformLocation(program, 'uTopOffset');
+        locAtlasSampler = gl.getUniformLocation(program, 'uAtlas');
+
+        quadVBO = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0,0, 1,0, 0,1, 1,1]), gl.STATIC_DRAW);
+
+        dynInstVBO = gl.createBuffer();
+
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+
+        attachedCanvas = canvas;
+        return true;
+      } catch (e) {
+        console.warn('[gridRenderer] init failed:', e.message);
+        failed = true;
+        return false;
+      }
+    }
+
+    function attach(canvas) {
+      if (failed) return false;
+      if (gl && attachedCanvas === canvas) return true;
+      releaseAll();
+      releaseAllStatic();
+      gl = null; program = null; quadVBO = null; dynInstVBO = null;
+      attachedCanvas = null;
+      return init(canvas);
+    }
+
+    function available() { return !failed && gl !== null; }
+
+    function uploadSprite(key, bitmap) {
+      if (!available() || !bitmap) return;
+      var existing = textures.get(key);
+      if (existing) return;
+      window.__textureKeys = window.__textureKeys || new Set();
+      window.__textureKeys.add(key);
+      var tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+      textures.set(key, { tex: tex, w: bitmap.width, h: bitmap.height });
+    }
+
+    function releaseAll() {
+      if (!gl) { textures.clear(); return; }
+      textures.forEach(function (t) { gl.deleteTexture(t.tex); });
+      textures.clear();
+    }
+    function deleteTexture(key) {
+      if (!gl) return;
+      var t = textures.get(key);
+      if (!t) return;
+      gl.deleteTexture(t.tex);
+      textures.delete(key);
+    }
+
+    function uploadStatic(key, float32Array) {
+      if (!available()) return;
+      var existing = staticBuffers.get(key);
+      if (existing) gl.deleteBuffer(existing.buf);
+      var buf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      gl.bufferData(gl.ARRAY_BUFFER, float32Array, gl.STATIC_DRAW);
+      staticBuffers.set(key, { buf: buf, count: (float32Array.length / 8) | 0 });
+    }
+    function dropStatic(key) {
+      if (!gl) return;
+      var s = staticBuffers.get(key);
+      if (!s) return;
+      gl.deleteBuffer(s.buf);
+      staticBuffers.delete(key);
+    }
+    function releaseAllStatic() {
+      if (!gl) { staticBuffers.clear(); return; }
+      staticBuffers.forEach(function (s) { gl.deleteBuffer(s.buf); });
+      staticBuffers.clear();
+    }
+    function hasStatic(key) { return staticBuffers.has(key); }
+
+    function bindCommonState(viewportW, viewportH, dpr, topOffset) {
+      // Chrome caps the drawing buffer when canvas dims exceed an internal GPU
+      // memory budget. canvas.width/height stay at what we requested, but the
+      // actual fb is smaller — gl.drawingBufferWidth/Height reflect reality.
+      // Always viewport to the actual fb so content lands inside it.
+      gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+      gl.clearColor(0.04, 0.04, 0.04, 1.0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.useProgram(program);
+      gl.uniform2f(locViewportPx, viewportW, viewportH);
+      gl.uniform1f(locTopOffset, topOffset);
+      gl.uniform1i(locAtlasSampler, 0);
+      gl.activeTexture(gl.TEXTURE0);
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO);
+      gl.enableVertexAttribArray(locQuadPos);
+      gl.vertexAttribPointer(locQuadPos, 2, gl.FLOAT, false, 0, 0);
+      gl.vertexAttribDivisor(locQuadPos, 0);
+
+      gl.enableVertexAttribArray(locDstRect);
+      gl.enableVertexAttribArray(locSrcRect);
+      gl.vertexAttribDivisor(locDstRect, 1);
+      gl.vertexAttribDivisor(locSrcRect, 1);
+    }
+
+    // Dynamic batches: { textureKey, instances: Float32Array }. Used by
+    // per-image mode where the per-tile texture varies and instances must
+    // be rebuilt when the buffer window moves.
+    function render(viewportW, viewportH, dpr, topOffset, batches) {
+      if (!available()) return;
+      window.__lastDrawTopOffset = topOffset;
+      window.__lastDrawAt = performance.now();
+      window.__lastBatches = batches.map(function (b) {
+        return { textureKey: b.textureKey, n: (b.instances ? b.instances.length / 8 : 0) | 0,
+                 first: b.instances ? Array.from(b.instances.slice(0, 8)) : null };
+      });
+      bindCommonState(viewportW, viewportH, dpr, topOffset);
+      gl.bindBuffer(gl.ARRAY_BUFFER, dynInstVBO);
+      gl.vertexAttribPointer(locDstRect, 4, gl.FLOAT, false, 32, 0);
+      gl.vertexAttribPointer(locSrcRect, 4, gl.FLOAT, false, 32, 16);
+      for (var b = 0; b < batches.length; b++) {
+        var batch = batches[b];
+        var t = textures.get(batch.textureKey);
+        if (!t || !batch.instances || batch.instances.length === 0) continue;
+        gl.bindTexture(gl.TEXTURE_2D, t.tex);
+        gl.bindBuffer(gl.ARRAY_BUFFER, dynInstVBO);
+        gl.bufferData(gl.ARRAY_BUFFER, batch.instances, gl.STREAM_DRAW);
+        gl.vertexAttribPointer(locDstRect, 4, gl.FLOAT, false, 32, 0);
+        gl.vertexAttribPointer(locSrcRect, 4, gl.FLOAT, false, 32, 16);
+        gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, (batch.instances.length / 8) | 0);
+      }
+    }
+
+    // Static batches: { textureKey, instanceKey } — both pre-uploaded.
+    // Per-frame work is one bind + one draw per batch; no JS-side per-tile
+    // work. This is the hot path for atlas mode at #size0/#fit on big sets.
+    function renderStatic(viewportW, viewportH, dpr, topOffset, batches) {
+      if (!available()) return;
+      window.__lastDrawTopOffset = topOffset;
+      window.__lastDrawAt = performance.now();
+      bindCommonState(viewportW, viewportH, dpr, topOffset);
+      for (var b = 0; b < batches.length; b++) {
+        var batch = batches[b];
+        var t = textures.get(batch.textureKey);
+        var s = staticBuffers.get(batch.instanceKey);
+        if (!t || !s || !s.count) continue;
+        gl.bindTexture(gl.TEXTURE_2D, t.tex);
+        gl.bindBuffer(gl.ARRAY_BUFFER, s.buf);
+        gl.vertexAttribPointer(locDstRect, 4, gl.FLOAT, false, 32, 0);
+        gl.vertexAttribPointer(locSrcRect, 4, gl.FLOAT, false, 32, 16);
+        gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, s.count);
+      }
+    }
+
+    function hasTexture(key) { return textures.has(key); }
+
+    return {
+      attach: attach, available: available, uploadSprite: uploadSprite,
+      releaseAll: releaseAll, deleteTexture: deleteTexture,
+      uploadStatic: uploadStatic, dropStatic: dropStatic,
+      releaseAllStatic: releaseAllStatic, hasStatic: hasStatic,
+      render: render, renderStatic: renderStatic,
+      hasTexture: hasTexture,
+    };
+  })();
+
+  // Best already-cached per-image tier for `name`. Prefers exact target,
+  // falls back to any smaller cached tier. Keeps zoom transitions from
+  // flashing black while the target tier loads.
   function bestCachedPerImage(name, targetTier) {
     if (targetTier === 0) {
-      // 'original' requested; any cached tier is acceptable as a placeholder.
       for (var i = PER_IMAGE_TIERS.length - 1; i >= 0; i--) {
         var bm = getPerImageBitmapSync(name, PER_IMAGE_TIERS[i]);
         if (bm) return bm;
@@ -629,9 +948,7 @@
     return null;
   }
 
-  // Atlas-source lookup by image name. Returns the best-loaded atlas tier (h50 if
-  // available, else h10, else h5). Used as the deepest fallback for the no-black
-  // ladder.
+  // Best already-loaded atlas source for `name` (h50 → h10 → h5).
   function bestCachedAtlasSrc(name) {
     if (!window.spriteMeta || !spriteMeta.atlases) return null;
     var loc = spriteMeta.imageMap && spriteMeta.imageMap[name];
@@ -657,81 +974,325 @@
     return null;
   }
 
+  // Overscan canvas: sized to ~3x viewport, position:absolute inside a
+  // spacer that holds the full layout height. Native scroll moves the
+  // spacer (and the canvas with it) — iOS scrubber and trackpad/wheel all
+  // behave exactly as today. We only redraw + reposition the canvas when
+  // the visible viewport approaches the canvas edge.
+  var bufferTop = -1;        // world y of canvas top (-1 = uninitialized)
+  var bufferH = 0;           // canvas CSS height
+  var totalLayoutH = 0;      // full content height (spacer height)
+  var atlasInstancesBuiltFor = null;  // String(atlasH) we built static buffers for
+  var atlasInstancesLayoutH = -1;     // currentRowHeight when built
+  var pendingReposition = false;
+  var lastScrollTime = 0;             // performance.now() of last user scroll
+  var deferredUpgradeTimer = null;
+  var BUFFER_VIEWPORTS = 5;
+  var EDGE_MARGIN_FRAC = 0.5;
+  var SCROLL_IDLE_MS = 250;           // wait this long after scroll before per-image upgrade redraw
+
+  // Schedule a redraw, but if the user is actively scrolling, defer until
+  // they pause. Edge crossings still draw immediately (handled separately).
+  // This prevents the visible per-image upgrade transition during scroll —
+  // user sees a stable canvas (atlas-fallback) while scrolling, then a
+  // one-shot upgrade after they stop.
+  function scheduleUpgradeRedraw() {
+    if (deferredUpgradeTimer) return;
+    var since = performance.now() - lastScrollTime;
+    if (since < SCROLL_IDLE_MS) {
+      deferredUpgradeTimer = setTimeout(function () {
+        deferredUpgradeTimer = null;
+        scheduleUpgradeRedraw();
+      }, SCROLL_IDLE_MS - since + 16);
+      return;
+    }
+    if (pendingReposition) return;
+    pendingReposition = true;
+    requestAnimationFrame(function () {
+      pendingReposition = false;
+      drawCanvasForScroll();
+    });
+  }
+
   function ensureCanvasAndSpacer(thumbsEl) {
-    if (canvasEl && canvasEl.parentNode === thumbsEl) return;
+    if (canvasEl && spacerEl && spacerEl.parentNode === thumbsEl && canvasEl.parentNode === spacerEl) return;
     thumbsEl.innerHTML = '';
-    canvasEl = document.createElement('canvas');
-    canvasEl.style.cursor = 'pointer';
-    canvasEl.style.display = 'block';
-    canvasEl.style.position = 'sticky';
-    canvasEl.style.top = '0';
-    canvasEl.style.zIndex = '1';
     spacerEl = document.createElement('div');
-    spacerEl.style.width = '1px';  // collapsed; height is what makes the container scrollable
-    thumbsEl.appendChild(canvasEl);
+    spacerEl.style.cssText = 'position:relative; width:100%; height:0px;';
+    canvasEl = document.createElement('canvas');
+    canvasEl.style.cssText = 'cursor:pointer; display:block; position:absolute; left:0; top:0; z-index:1;';
+    spacerEl.appendChild(canvasEl);
     thumbsEl.appendChild(spacerEl);
-    // Click listener is per-canvas: a fresh canvas (after a focus<->grid round trip)
-    // needs its own listener. The old global canvasClickAttached flag short-circuited
-    // the second attach, leaving the new canvas inert to clicks.
     canvasEl.addEventListener('click', onCanvasClick);
     if (!thumbsScrollAttached) {
       thumbsEl.addEventListener('scroll', onThumbsScroll, { passive: true });
       thumbsScrollAttached = true;
     }
+    bufferTop = -1;
+    atlasInstancesBuiltFor = null;
+    // Mode swap creates a fresh canvas → fresh GL context → re-upload textures.
+    // Cached loadPerImageBitmap promises resolve immediately and skip the
+    // upload path in _runPerImageJob, so per-image textures must be re-pushed
+    // here too. Static instance buffers are per-context too — drop them so
+    // renderGallery rebuilds for the new context.
+    if (gridRenderer.attach(canvasEl)) {
+      Object.keys(atlasBitmapsSync).forEach(function (k) {
+        var arr = atlasBitmapsSync[k];
+        for (var i = 0; i < arr.length; i++) {
+          if (arr[i]) gridRenderer.uploadSprite(k + ':' + i, arr[i]);
+        }
+      });
+      perImageBitmapsSync.forEach(function (bm, key) {
+        if (bm) gridRenderer.uploadSprite('img:' + key, bm);
+      });
+    }
   }
 
-  // Suppress anchor capture for one scroll event after we set scrollTop programmatically
-  // inside renderGallery — those are the *result* of an anchor, not a user-initiated scroll.
+  // Sized to fit content (no overscan needed) or 3 viewports tall, whichever
+  // is smaller. Called from renderGallery once layout is known.
+  function applyGridLayout(thumbsEl, W, viewportH, totalH) {
+    totalLayoutH = totalH;
+    spacerEl.style.height = Math.max(1, Math.ceil(totalH)) + 'px';
+    bufferH = Math.min(Math.ceil(totalH), Math.ceil(viewportH * BUFFER_VIEWPORTS));
+    if (bufferH < viewportH) bufferH = viewportH;  // never smaller than viewport
+    var dpr = devicePixelRatio();
+    canvasEl.width = Math.round(W * dpr);
+    canvasEl.height = Math.round(bufferH * dpr);
+    canvasEl.style.width = W + 'px';
+    canvasEl.style.height = bufferH + 'px';
+    bufferTop = -1;  // force reposition on next draw
+  }
+
+  // Skip anchor capture once after a programmatic scrollTop set — the resulting
+  // scroll event is a side effect of the anchor, not a fresh user input.
   var suppressNextAnchorCapture = false;
   function onThumbsScroll() {
-    // In filmstrip focus mode #thumbs has overflow:hidden — this won't fire. Grid only.
     if (focusedIdx > 0) return;
     if (suppressNextAnchorCapture) { suppressNextAnchorCapture = false; }
-    else { captureAnchorFromScroll(); }
-    if (pendingScrollDraw) return;
-    pendingScrollDraw = true;
+    else { captureAnchorFromScroll(); hideControls(); }
+    lastScrollTime = performance.now();
+    var thumbsEl = $('thumbs');
+    if (!thumbsEl || !canvasEl) return;
+    var scrollY = thumbsEl.scrollTop;
+    var viewportH = thumbsEl.clientHeight;
+    if (!bufferNeedsReposition(scrollY, viewportH)) return;
+    if (pendingReposition) return;
+    pendingReposition = true;
     requestAnimationFrame(function () {
-      pendingScrollDraw = false;
+      pendingReposition = false;
       drawCanvasForScroll();
     });
   }
 
+  // True if current scrollY is within EDGE_MARGIN_FRAC viewports of either
+  // buffer edge (and there's content on the other side of that edge).
+  function bufferNeedsReposition(scrollY, viewportH) {
+    if (bufferTop < 0) return true;
+    var topSlack = scrollY - bufferTop;
+    var botSlack = (bufferTop + bufferH) - (scrollY + viewportH);
+    var marginPx = viewportH * EDGE_MARGIN_FRAC;
+    if (topSlack < marginPx && bufferTop > 0) return true;
+    if (botSlack < marginPx && bufferTop + bufferH < totalLayoutH) return true;
+    return false;
+  }
+
+  function recenterBuffer(scrollY, viewportH) {
+    var maxBufferTop = Math.max(0, Math.ceil(totalLayoutH) - bufferH);
+    bufferTop = Math.max(0, Math.min(maxBufferTop,
+      Math.floor(scrollY - (bufferH - viewportH) / 2)));
+    canvasEl.style.top = bufferTop + 'px';
+    window.__bufferTop = bufferTop;
+  }
+
   function onCanvasClick(e) {
-    var rect = canvasEl.getBoundingClientRect();
     var thumbsEl = $('thumbs');
-    var cx = e.clientX - rect.left;
-    var cy = e.clientY - rect.top + (thumbsEl ? thumbsEl.scrollTop : 0);  // canvas y -> layout y
-    for (var i = 0; i < lastTileRects.length; i++) {
+    if (!thumbsEl) return;
+    var trect = thumbsEl.getBoundingClientRect();
+    var cx = e.clientX - trect.left;
+    var cy = e.clientY - trect.top + thumbsEl.scrollTop;
+    // Binary search by y (rows are emitted top-down, so lastTileRects is
+    // sorted by y). For 100k tiles this drops a click from ~5ms to <0.1ms.
+    var n = lastTileRects.length;
+    if (!n) return;
+    var lo = 0, hi = n - 1, anchor = 0;
+    while (lo <= hi) {
+      var mid = (lo + hi) >> 1;
+      if (lastTileRects[mid].y > cy) hi = mid - 1;
+      else { anchor = mid; lo = mid + 1; }
+    }
+    // Walk back from anchor while still in the same row (y range overlaps cy).
+    var i = anchor;
+    while (i > 0 && lastTileRects[i - 1].y === lastTileRects[anchor].y) i--;
+    var rowY = lastTileRects[i].y;
+    while (i < n && lastTileRects[i].y === rowY) {
       var t = lastTileRects[i];
       if (cx >= t.x && cx < t.x + t.w && cy >= t.y && cy < t.y + t.h) {
         location.hash = encodeURIComponent(t.name);
         return;
       }
+      i++;
     }
   }
 
-  // Anchor state for zoom: captured on user scroll, NOT on re-layout. Each renderGallery
-  // (e.g. during a zoom-slider drag) reuses this anchor unchanged so the row at the top
-  // of the viewport stays at the top of the viewport across zoom changes. Re-capturing
-  // on every render would drift, because the first-column image of the visible top row
-  // changes when the column count changes with zoom.
+  // Captured on user scroll. Used by re-layout (zoom change) to keep the
+  // top-row image pinned, and persisted to sessionStorage so a page reload
+  // (F5) restores the same scroll position. sessionStorage is keyed by
+  // folderURL so each gallery has its own remembered position; lost on tab
+  // close, which matches what people expect from refresh-vs-new-session.
   var cachedAnchorName = null;
+  function scrollKey() { return 'gg.scroll.' + (window.folderURL || '/'); }
   function captureAnchorFromScroll() {
     var thumbsEl = document.getElementById('thumbs');
-    if (!thumbsEl || !lastTileRects.length) { cachedAnchorName = null; return; }
+    if (!thumbsEl || !lastTileRects.length) { cachedAnchorName = null; persistAnchor(); return; }
     var scrollY = thumbsEl.scrollTop;
-    if (scrollY <= 0) { cachedAnchorName = null; return; }
-    // The tile array is built row-major, so the first tile whose y-range spans scrollY
-    // is the leftmost (x=0) image of the topmost visible row — i.e. the row anchor.
+    if (scrollY <= 0) { cachedAnchorName = null; persistAnchor(); return; }
+    // Row-major tile order → first tile whose y-range spans scrollY is the
+    // leftmost image of the topmost visible row.
     for (var i = 0; i < lastTileRects.length; i++) {
       var t = lastTileRects[i];
-      if (t.y <= scrollY && scrollY < t.y + t.h) { cachedAnchorName = t.name; return; }
+      if (t.y <= scrollY && scrollY < t.y + t.h) { cachedAnchorName = t.name; persistAnchor(); return; }
     }
-    // Fell into a gap below all rows; use the last row's leftmost tile.
+    // Past the last row → use the last row's leftmost tile.
     for (var j = lastTileRects.length - 1; j >= 0; j--) {
-      if (lastTileRects[j].x === 0) { cachedAnchorName = lastTileRects[j].name; return; }
+      if (lastTileRects[j].x === 0) { cachedAnchorName = lastTileRects[j].name; persistAnchor(); return; }
     }
-    cachedAnchorName = null;
+    cachedAnchorName = null; persistAnchor();
+  }
+  function persistAnchor() {
+    try {
+      if (cachedAnchorName) sessionStorage.setItem(scrollKey(), cachedAnchorName);
+      else sessionStorage.removeItem(scrollKey());
+    } catch (_) {}  // private mode / quota — silently no-op
+  }
+
+  // Atlas-mode static buffers: one Float32Array per (atlasH, spriteIdx)
+  // holding all tile instances using that sprite. Built once per layout,
+  // resident on the GPU. Per-frame work is a single uniform + drawArraysInstanced
+  // per batch — no JS-side per-tile work.
+  function buildStaticAtlasBuffers(atlasH) {
+    var key = String(atlasH);
+    var atlas = spriteMeta && spriteMeta.atlases && spriteMeta.atlases[key];
+    if (!atlas) return;
+    var nSprites = atlas.sprites.length;
+    var aPerSprite = atlas.cellsPerSprite;
+    var aAcross = atlas.across;
+    var cellW = atlas.cellW, cellH = atlas.cellH;
+    // Per-sprite instance arrays. Array growth is amortized; we know
+    // approximate counts per sprite (cellsPerSprite-ish).
+    var perSprite = new Array(nSprites);
+    for (var s = 0; s < nSprites; s++) perSprite[s] = [];
+    for (var i = 0; i < lastTileRects.length; i++) {
+      var t = lastTileRects[i];
+      var loc = spriteMeta.imageMap[t.name];
+      if (!loc) continue;
+      var spIdx = Math.floor(loc.idx / aPerSprite);
+      var posInSprite = loc.idx % aPerSprite;
+      var row = Math.floor(posInSprite / aAcross);
+      var col = posInSprite % aAcross;
+      // src in cell pixels; texture dims unknown until upload, so store
+      // pixel coords here and convert to UV at draw time? No — the sprite
+      // image dim is deterministic from atlas metadata (across*cellW × ceil(count/across)*cellH).
+      // We use that.
+      var spriteCells = atlas.sprites[spIdx].count;
+      var spriteRows = Math.ceil(spriteCells / aAcross);
+      var spriteW = aAcross * cellW;
+      var spriteH = spriteRows * cellH;
+      // The atlas cell stores the tile fit-within (cellW, cellH) preserving
+      // aspect (top-left, leftover area is zero). MUST match the server
+      // formula in sprite_worker.js fitInCell() exactly — UV sampling reads
+      // the stored bytes, mismatch = neighbor-cell bleed for wide tiles or
+      // black-padding bleed for tiny tiles.
+      var aspect = loc.w / 200;  // canonical aspect from imagemap
+      var naturalW = aspect * cellH;
+      var storedW, storedH;
+      if (naturalW > cellW) {
+        storedW = cellW;
+        storedH = Math.max(1, Math.round(cellW / aspect));
+      } else {
+        storedW = Math.max(1, Math.round(naturalW));
+        storedH = cellH;
+      }
+      var sx = col * cellW;
+      var sy = row * cellH;
+      var u0 = sx / spriteW, v0 = sy / spriteH;
+      var du = storedW / spriteW, dv = storedH / spriteH;
+      var arr = perSprite[spIdx];
+      arr.push(t.x, t.y, t.w, t.h, u0, v0, du, dv);
+    }
+    // Drop any prior buffers for this atlas, then upload fresh.
+    for (var s2 = 0; s2 < nSprites; s2++) {
+      var ikey = key + ':' + s2;
+      var arr2 = perSprite[s2];
+      if (arr2.length === 0) {
+        gridRenderer.dropStatic(ikey);
+        continue;
+      }
+      gridRenderer.uploadStatic(ikey, new Float32Array(arr2));
+    }
+    atlasInstancesBuiltFor = key;
+    atlasInstancesLayoutH = currentRowHeight;
+  }
+
+  // Drop a static buffer for an atlas sprite that's no longer needed (the
+  // sprite texture itself is dropped separately by evictAtlasBitmaps).
+  function dropStaticAtlasBuffer(atlasH, spriteIdx) {
+    gridRenderer.dropStatic(String(atlasH) + ':' + spriteIdx);
+  }
+
+  // Indices of sprites that have at least one tile in the buffer y-range.
+  function spritesNeededForBuffer(atlasH) {
+    var key = String(atlasH);
+    var atlas = spriteMeta && spriteMeta.atlases && spriteMeta.atlases[key];
+    if (!atlas) return new Set();
+    var aPerSprite = atlas.cellsPerSprite;
+    var top = bufferTop, bot = bufferTop + bufferH;
+    var needed = new Set();
+    // Binary-search to first tile whose y ≥ top.
+    var n = lastTileRects.length, lo = 0, hi = n - 1, start = 0;
+    while (lo <= hi) {
+      var mid = (lo + hi) >> 1;
+      if (lastTileRects[mid].y < top) { start = mid + 1; lo = mid + 1; }
+      else { hi = mid - 1; }
+    }
+    // Step back one if start is past a tile that overlaps top.
+    if (start > 0 && lastTileRects[start - 1].y + lastTileRects[start - 1].h > top) start--;
+    for (var i = start; i < n; i++) {
+      var t = lastTileRects[i];
+      if (t.y > bot) break;
+      var loc = spriteMeta.imageMap[t.name];
+      if (loc) needed.add(Math.floor(loc.idx / aPerSprite));
+    }
+    return needed;
+  }
+
+  // Drop atlas sprites (texture + ImageBitmap + cached promise) that are
+  // outside the buffer window. Bounded memory regardless of how far the user scrolls.
+  function evictAtlasBitmaps(atlasH, neededIdxs) {
+    var key = String(atlasH);
+    var arr = atlasBitmapsSync[key];
+    if (!arr) return;
+    var promCache = spritePromises[key];
+    for (var i = 0; i < arr.length; i++) {
+      if (neededIdxs.has(i)) continue;
+      var bm = arr[i];
+      if (bm) {
+        try { bm.close && bm.close(); } catch (_) {}
+        arr[i] = null;
+      }
+      gridRenderer.deleteTexture(key + ':' + i);
+      if (promCache) delete promCache[i];
+    }
+  }
+  // Drop ALL bitmaps + textures from atlas tiers not in keepTiers. Switching
+  // zoom level (e.g. size2 → size3) leaves the previous tier's sprites in
+  // atlasBitmapsSync forever otherwise — evictAtlasBitmaps only runs for
+  // the currently-active tier. Cycling through fit/size0..size6 with a buffer
+  // covering many tiles otherwise accumulates GBs across tiers.
+  function evictAtlasTiersOtherThan(keepTiers) {
+    Object.keys(atlasBitmapsSync).forEach(function (key) {
+      if (keepTiers.has(key)) return;
+      evictAtlasBitmaps(parseInt(key, 10), new Set());
+    });
   }
 
   function drawCanvasForScroll() {
@@ -740,152 +1301,204 @@
     if (!thumbsEl) return;
     var scrollY = thumbsEl.scrollTop;
     var dpr = devicePixelRatio();
-    var viewportH = canvasEl.height / dpr;
-    var viewportW = canvasEl.width / dpr;
+    var W = canvasEl.width / dpr;
+    var viewportH = thumbsEl.clientHeight || (canvasEl.height / dpr);
     if (!viewportH) return;
-    var ctx = canvasEl.getContext('2d', { alpha: false });
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.fillStyle = '#0a0a0a';
-    ctx.fillRect(0, 0, viewportW, viewportH);
+    var atlasH = pickAtlasHeight(currentRowHeight * dpr);
 
-    // Find visible tiles
-    var top = scrollY, bot = scrollY + viewportH;
-    var visible = [];
-    for (var k = 0; k < lastTileRects.length; k++) {
-      var t = lastTileRects[k];
-      if (t.y + t.h < top) continue;
-      if (t.y > bot) break;
-      visible.push(t);
+    if (bufferTop < 0 || bufferNeedsReposition(scrollY, viewportH)) {
+      recenterBuffer(scrollY, viewportH);
     }
 
-    // Frame counter: every drawCanvasForScroll bumps it. Async .then() callbacks check
-    // it before drawing so stale draws (from a previous mode/zoom) don't paint on top of
-    // the current canvas state. Without this guard, transitioning from atlas to per-image
-    // mode leaves old atlas content showing in the gaps between per-image tiles.
+    var bufTop = bufferTop, bufBot = bufferTop + bufferH;
     var myFrame = ++renderFrame;
-    var atlasH = pickAtlasHeight(currentRowHeight);
 
     if (atlasH != null) {
-      // ATLAS PATH: target row height is small enough that a sprite atlas at H<=50
-      // covers it. One atlas image, many tiles drawn from offsets within it.
-      var atlas = spriteMeta.atlases[String(atlasH)];
-      // Paint each visible tile from the BEST currently-cached atlas tier.
-      // bestCachedAtlasSrc walks h50 -> h10 -> h5 and returns whichever is
-      // loaded for this image. So if the user just dragged the slider into
-      // h50 territory but h50 isn't loaded yet, tiles render from h10 or h5
-      // (blurrier, scaled up) instead of leaving the dark canvas background
-      // visible. The picked atlas's per-sprite-arrival callback then upgrades
-      // each tile in place when the higher-res sprite lands.
-      var aCellW = atlas.cellW, aCellH = atlas.cellH;
-      var aPerSprite = atlas.cellsPerSprite, aAcross = atlas.across;
-      var canonicalH = 200;
-      function paintTileFromBitmap(t, bitmap, atlasMeta) {
-        var loc = spriteMeta.imageMap[t.name];
-        if (!loc) return;
-        var idx = loc.idx;
-        var spriteIdx = Math.floor(idx / atlasMeta.cellsPerSprite);
-        var posInSprite = idx % atlasMeta.cellsPerSprite;
-        var row = Math.floor(posInSprite / atlasMeta.across);
-        var col = posInSprite % atlasMeta.across;
-        var srcW = Math.round(loc.w * (atlasMeta.cellH / canonicalH));
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        ctx.drawImage(bitmap, col * atlasMeta.cellW, row * atlasMeta.cellH, srcW, atlasMeta.cellH, t.x, t.y - scrollY, t.w, t.h);
-      }
-      // First pass: paint each tile from the best cached atlas (any height).
-      // bestCachedAtlasSrc returns { bitmap, sx, sy, sw, sh } so we can blit
-      // directly without recomputing per-atlas geometry.
-      for (var k = 0; k < visible.length; k++) {
-        var t = visible[k];
-        var as = bestCachedAtlasSrc(t.name);
-        if (as) {
-          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-          ctx.drawImage(as.bitmap, as.sx, as.sy, as.sw, as.sh, t.x, t.y - scrollY, t.w, t.h);
-        }
-      }
-      // Load ONLY sprites that contain visible tiles. This is the key change for
-      // iOS memory: prevents 30-sprite parallel decode spike on focus entry.
-      var visibleSnapshot = visible;
-      var neededIdxs = {};
-      for (var nk = 0; nk < visible.length; nk++) {
-        var nloc = spriteMeta.imageMap[visible[nk].name];
-        if (nloc) neededIdxs[Math.floor(nloc.idx / aPerSprite)] = true;
-      }
-      onSpriteBitmapReady(atlasH, function (bm, spriteIdx) {
-        if (!canvasEl || renderFrame !== myFrame) return;
-        for (var k = 0; k < visibleSnapshot.length; k++) {
-          var t = visibleSnapshot[k];
-          var loc = spriteMeta.imageMap[t.name];
-          if (!loc) continue;
-          if (Math.floor(loc.idx / aPerSprite) === spriteIdx) {
-            paintTileFromBitmap(t, bm, atlas);
+      var aKey = String(atlasH);
+      // Rebuild static instance buffers if layout/atlas changed.
+      if (atlasInstancesBuiltFor !== aKey || atlasInstancesLayoutH !== currentRowHeight) {
+        // Drop any stale buffers for the previous atlas.
+        if (atlasInstancesBuiltFor && atlasInstancesBuiltFor !== aKey) {
+          var oldAtlas = spriteMeta.atlases[atlasInstancesBuiltFor];
+          if (oldAtlas) for (var oi = 0; oi < oldAtlas.sprites.length; oi++) {
+            gridRenderer.dropStatic(atlasInstancesBuiltFor + ':' + oi);
           }
         }
-      });
-      var needList = Object.keys(neededIdxs);
-      for (var ni = 0; ni < needList.length; ni++) loadSpriteAt(atlasH, parseInt(needList[ni], 10));
-    } else {
-      // PER-IMAGE PATH: target row height too big for the atlas. Each tile fetches its
-      // own AVIF at the appropriate LoD tier. Decodes happen in parallel and the canvas
-      // fills in progressively as bitmaps resolve.
-      var tierH = pickPerImageTier(currentRowHeight);
-      // Each render frame replaces the pending-load queue with only what's
-      // currently visible + prefetched. Without this, fast scrolls accumulate
-      // hundreds of stale jobs that load images the user is no longer looking at.
-      clearPendingPerImageLoads();
-      visible.forEach(function (t) {
-        // Paint whatever's already in cache so the tile never goes black during a
-        // zoom slide. Prefer the picked tier; fall back to any smaller cached tier;
-        // ultimately fall back to the atlas. Then upgrade asynchronously.
-        var cached = bestCachedPerImage(t.name, tierH);
-        if (cached) {
-          ctx.drawImage(cached, 0, 0, cached.width, cached.height, t.x, t.y - scrollY, t.w, t.h);
-        } else {
-          var as = bestCachedAtlasSrc(t.name);
-          if (as) ctx.drawImage(as.bitmap, as.sx, as.sy, as.sw, as.sh, t.x, t.y - scrollY, t.w, t.h);
-        }
-        loadPerImageBitmap(t.name, tierH).then(function (bitmap) {
-          if (!canvasEl || !bitmap || renderFrame !== myFrame) return;
-          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-          ctx.drawImage(bitmap, 0, 0, bitmap.width, bitmap.height, t.x, t.y - scrollY, t.w, t.h);
-        });
+        buildStaticAtlasBuffers(atlasH);
+      }
+
+      // Free any prior atlas tier's sprites (zoom-tier transition).
+      evictAtlasTiersOtherThan(new Set([aKey]));
+      // Lazy-load only sprites the buffer needs; evict the rest within this tier.
+      var needed = spritesNeededForBuffer(atlasH);
+      evictAtlasBitmaps(atlasH, needed);
+      var atlas = spriteMeta.atlases[aKey];
+      needed.forEach(function (spIdx) {
+        var tk = aKey + ':' + spIdx;
+        // Already on GPU? Nothing to wait on, nothing to redraw for.
+        if (gridRenderer.hasTexture(tk)) return;
+        loadSpriteAt(atlasH, spIdx).then(function () {
+          if (!canvasEl) return;
+          // Atlas arrival is FIRST content for those tiles — redraw immediately.
+          if (!pendingReposition) {
+            pendingReposition = true;
+            requestAnimationFrame(function () {
+              pendingReposition = false;
+              drawCanvasForScroll();
+            });
+          }
+        }, function () {});
       });
 
-      // Prefetch one viewport ABOVE and one BELOW the current visible window so that
-      // scrolling into them feels instant. fire-and-forget: loadPerImageBitmap caches by
-      // (name, tier), so subsequent demand-loads find a resolved bitmap immediately.
-      var prefetchTop = top - viewportH;
-      var prefetchBot = bot + viewportH;
-      for (var k = 0; k < lastTileRects.length; k++) {
-        var t = lastTileRects[k];
-        if (t.y > prefetchBot) break;
-        if (t.y + t.h < prefetchTop) continue;
-        // Skip already-visible tiles — they're being fetched in the .forEach above.
-        if (t.y + t.h >= top && t.y <= bot) continue;
-        loadPerImageBitmap(t.name, tierH);
+      // Build batch list: one per sprite. renderStatic skips sprites
+      // whose texture isn't loaded yet.
+      var batches = [];
+      for (var b = 0; b < atlas.sprites.length; b++) {
+        var bk = aKey + ':' + b;
+        if (!gridRenderer.hasStatic(bk)) continue;
+        batches.push({ textureKey: bk, instanceKey: bk });
+      }
+      gridRenderer.renderStatic(W, bufferH, dpr, bufferTop, batches);
+      // Atlas mode doesn't use per-image bitmaps — release any leftovers.
+      warmPerImageNames = new Set();
+      evictPerImageBitmaps(new Set());
+      return;
+    }
+
+    // Per-image path: dynamic batches scoped to the buffer region. Rebuilt
+    // only on edge crossings or sprite arrivals (not per scroll event).
+    var tierH = pickPerImageTier(currentRowHeight * dpr);
+    var tiers = [tierH].concat(PER_IMAGE_TIERS.filter(function (h) { return h < tierH; }).reverse());
+
+    // Visible-in-buffer tiles via binary search.
+    var n = lastTileRects.length, lo = 0, hi = n - 1, start = 0;
+    while (lo <= hi) {
+      var mid = (lo + hi) >> 1;
+      if (lastTileRects[mid].y < bufTop) { start = mid + 1; lo = mid + 1; }
+      else { hi = mid - 1; }
+    }
+    if (start > 0 && lastTileRects[start - 1].y + lastTileRects[start - 1].h > bufTop) start--;
+
+    var batchAccum = new Map();
+    function pushBatch(key, x, y, w, h, u0, v0, du, dv) {
+      var arr = batchAccum.get(key);
+      if (!arr) { arr = []; batchAccum.set(key, arr); }
+      arr.push(x, y, w, h, u0, v0, du, dv);
+    }
+    function pushAtlasFallback(t) {
+      var src = bestCachedAtlasSrc(t.name);
+      if (!src) return false;
+      var loc = spriteMeta.imageMap[t.name];
+      if (!loc) return false;
+      var heights = ['50', '10', '5'];
+      for (var hi2 = 0; hi2 < heights.length; hi2++) {
+        var hKey = heights[hi2];
+        var atlasMeta = spriteMeta.atlases[hKey];
+        if (!atlasMeta) continue;
+        var arr = atlasBitmapsSync[hKey];
+        if (!arr) continue;
+        var spIdx = Math.floor(loc.idx / atlasMeta.cellsPerSprite);
+        if (arr[spIdx] !== src.bitmap) continue;
+        var bk = hKey + ':' + spIdx;
+        if (!gridRenderer.hasTexture(bk)) return false;
+        var w = arr[spIdx].width, h = arr[spIdx].height;
+        pushBatch(bk, t.x, t.y, t.w, t.h, src.sx / w, src.sy / h, src.sw / w, src.sh / h);
+        return true;
+      }
+      return false;
+    }
+
+    // Build keepKeys for queue trimming: every tile in the buffer at the
+    // ideal tier is fair game to keep. Anything queued for a tile outside
+    // this set is stale (user scrolled past it) and gets dropped.
+    var keepKeys = new Set();
+    var fallbackSpriteIdxs = new Set();
+    var fallbackAtlas = spriteMeta.atlases['50'] || spriteMeta.atlases['10'] || spriteMeta.atlases['5'];
+    var fallbackKey = fallbackAtlas ? (spriteMeta.atlases['50'] ? '50' : (spriteMeta.atlases['10'] ? '10' : '5')) : null;
+    for (var ki = start; ki < n; ki++) {
+      if (lastTileRects[ki].y > bufBot) break;
+      keepKeys.add(lastTileRects[ki].name + '|' + tierH);
+      if (fallbackAtlas) {
+        var floc = spriteMeta.imageMap[lastTileRects[ki].name];
+        if (floc) fallbackSpriteIdxs.add(Math.floor(floc.idx / fallbackAtlas.cellsPerSprite));
       }
     }
-  }
+    cancelPerImageLoadsExcept(keepKeys);
 
-  // ============================================================================
-  // FOCUS MODE — main image + filmstrip (iCloud Photos style)
-  // ============================================================================
-  // Layout in focus mode:
-  //   #thumbs (overflow: hidden, full viewport)
-  //     #focus-main   — main image canvas, fills (viewport - filmstrip)
-  //     #focus-strip  — native horizontal-scroll container at the bottom
-  //       <canvas (sticky left:0)>
-  //       <div spacer (absolute, width = total filmstrip length + edge padding)>
-  //
-  // The filmstrip is the only scroll surface. Each tile is rendered from the h50
-  // atlas at its natural-aspect width (loc.w * 50 / CANONICAL_H). As the
-  // filmstrip scrolls, the centered tile becomes the focused image; the main
-  // canvas is repainted with that image's bitmap. During scrubbing we paint the
-  // main image from the same h50 atlas (instant, low-res); on idle Stage 2 will
-  // upgrade to the highest available LoD.
-  // Filmstrip thumbs are drawn from the h50 atlas but displayed at 60% size (30 CSS px).
-  // Browser downscales 50→30 cleanly; no separate atlas tier needed. Total filmstrip
-  // strip height = display size + 4px top/bottom padding so the white "centered" outline
-  // doesn't clip against the viewport edge.
+    // Kick off atlas-fallback sprites for everything in the buffer. h50 (or
+    // smaller) gives every tile a placeholder while per-image loads in. Big
+    // sprite, single fetch, much faster than waiting on hundreds of per-image
+    // bitmaps. evictAtlasBitmaps trims sprites that fall out of the buffer.
+    if (fallbackKey) {
+      var fbAtlasH = parseInt(fallbackKey, 10);
+      fallbackSpriteIdxs.forEach(function (spIdx) {
+        var tk = fallbackKey + ':' + spIdx;
+        if (gridRenderer.hasTexture(tk)) return;
+        loadSpriteAt(fbAtlasH, spIdx).then(function (bm) {
+          if (!bm || !canvasEl) return;
+          if (!pendingReposition) {
+            pendingReposition = true;
+            requestAnimationFrame(function () {
+              pendingReposition = false;
+              drawCanvasForScroll();
+            });
+          }
+        }, function () {});
+      });
+      // Evict atlas sprites that aren't needed for the current buffer.
+      evictAtlasBitmaps(fbAtlasH, fallbackSpriteIdxs);
+      // And free every OTHER atlas tier's sprites — we're in per-image mode,
+      // only the fallback tier is in use.
+      evictAtlasTiersOtherThan(new Set([fallbackKey]));
+    } else {
+      // No fallback atlas at all (shouldn't happen for built galleries) —
+      // free every atlas tier.
+      evictAtlasTiersOtherThan(new Set());
+    }
+
+    var warmNames = new Set();
+    for (var i = start; i < n; i++) {
+      var t = lastTileRects[i];
+      if (t.y > bufBot) break;
+      warmNames.add(t.name);
+      var keyFound = null;
+      for (var ti = 0; ti < tiers.length; ti++) {
+        var probe = 'img:' + t.name + '|' + tiers[ti];
+        if (gridRenderer.hasTexture(probe)) { keyFound = probe; break; }
+      }
+      if (keyFound) pushBatch(keyFound, t.x, t.y, t.w, t.h, 0, 0, 1, 1);
+      else pushAtlasFallback(t);
+      // Only chain a redraw if the IDEAL tier isn't already on GPU. Without
+      // this, every redraw re-chains and an already-cached promise triggers
+      // another redraw — infinite loop.
+      var idealKey = 'img:' + t.name + '|' + tierH;
+      if (!gridRenderer.hasTexture(idealKey)) {
+        loadPerImageBitmap(t.name, tierH).then(function (bm) {
+          // bm===null means the load was canceled — no new content arrived,
+          // so don't trigger a redraw (would just rebuild for nothing).
+          if (!bm || !canvasEl) return;
+          // Per-image arrival is an UPGRADE (atlas-fallback already shows
+          // content). Defer until scroll idles so the user doesn't see
+          // tiles refreshing as they scroll.
+          scheduleUpgradeRedraw();
+        }, function () {});
+      }
+    }
+    warmPerImageNames = warmNames;
+    evictPerImageBitmaps(warmNames);
+
+    var batches2 = [];
+    batchAccum.forEach(function (arr, key) {
+      batches2.push({ textureKey: key, instances: new Float32Array(arr) });
+    });
+    gridRenderer.render(W, bufferH, dpr, bufferTop, batches2);
+  }
+  // ---- focus mode: main image + filmstrip ------------------------------
+  // Layout: #thumbs (overflow:hidden, full viewport) holds #focus-main on top
+  // and #focus-strip (the only scroll surface) below. Filmstrip tiles are
+  // drawn from the h50 atlas at natural aspect; the centered tile drives
+  // the main canvas, which is repainted from h50 first, then upgraded to the
+  // best available per-image LoD asynchronously.
   var FILM_TILE_H = 30;
   var FILM_H = FILM_TILE_H + 8;
   var FILM_GAP = 3;
@@ -893,28 +1506,20 @@
   var filmstripEl = null; // filmstrip scroll container
   var filmCanvasEl = null;// canvas inside filmstrip
   var filmSpacerEl = null;
-  // (Image-pinch and pan removed — pinch is left to the browser's native page-zoom.)
-  // Drag state for iCloud-style swipe: while dragging, the focused image translates
-  // by dragDX and prev/next images are painted at offset ±viewportW from center, so
-  // they peek in from the side as the finger moves. On release we either commit
-  // (snap to ±W and shift focus) or revert (snap back to 0).
+  // Swipe drag state. Focused image translates by dragDX; neighbors are painted
+  // at ±viewportW. Release commits (snap to ±W + shift focus) or reverts.
   var dragActive = false;
   var dragDX = 0;
   var dragRaf = null;     // animation id for commit/revert
-  // The source we should draw into the main canvas: bitmap + sub-rect. Updated by
-  // drawMainImage (atlas low-res) and upgradeMainImage (high-LoD). Held synchronously
-  // so pinch can redraw without the microtask gap that was causing a black flicker
-  // between canvas-clear and the async drawImage on the atlas-load promise.
-  var mainDrawSrc = null;  // { bitmap, sx, sy, sw, sh, forIdx } | null
-  // touchOnMain is set while a touch is active on the main canvas, so the document-
-  // level pinch handler can skip those events (we want pinch on the main image to
-  // zoom the image, not the slider).
+  // Sync source for the main canvas: { bitmap, sx, sy, sw, sh, forIdx } | null.
+  // Updated by drawMainImage (atlas) then upgradeMainImage (high-LoD).
+  var mainDrawSrc = null;
   var touchOnMain = false;
-  // Cached layout metrics (recomputed when filmstrip is built / on resize)
-  var filmTilePos = null; // Float64Array of cumulative x positions, length = lastimagevalue
-  var filmTileW   = null; // Float64Array of widths
+  // Filmstrip layout (rebuilt on filmstrip setup / resize).
+  var filmTilePos = null;
+  var filmTileW   = null;
   var filmTotalW  = 0;
-  var filmPadL    = 0;    // leading/trailing padding so the first/last tile can sit at center
+  var filmPadL    = 0;    // pads so the first/last tile can sit at center
   var filmPadR    = 0;
   var filmScrollPending = false;
   var focusInProgrammaticScroll = false;
@@ -927,8 +1532,7 @@
     for (var i = 0; i < n; i++) {
       var name = images[i + 1];
       var loc = name && spriteMeta && spriteMeta.imageMap && spriteMeta.imageMap[name];
-      // Display width = aspect-preserving width at FILM_TILE_H. Floor at 6px so
-      // ultra-narrow images are still tappable.
+      // Aspect-preserving width at FILM_TILE_H, floored at 6px for tappability.
       var w = loc ? Math.max(6, Math.round(loc.w * FILM_TILE_H / CANONICAL_H)) : FILM_TILE_H;
       filmTilePos[i] = x;
       filmTileW[i] = w;
@@ -940,16 +1544,23 @@
   function filmCenteredIdx1(scrollLeft, viewportW) {
     if (!filmTilePos || !filmTilePos.length) return focusedIdx;
     var center = scrollLeft + viewportW / 2 - filmPadL;
+    // Tile whose center is closest to the scroll center. Center-of-tile beats
+    // end-of-tile because fractional scrollLeft at non-100% zoom would otherwise
+    // skip narrow tiles to their wide neighbors.
     var lo = 0, hi = filmTilePos.length - 1;
     while (lo < hi) {
       var mid = (lo + hi) >> 1;
-      var midEnd = filmTilePos[mid] + filmTileW[mid];
-      if (midEnd <= center) lo = mid + 1;
+      if (filmTilePos[mid] + filmTileW[mid] / 2 < center) lo = mid + 1;
       else hi = mid;
     }
-    if (lo < 0) lo = 0;
-    if (lo >= filmTilePos.length) lo = filmTilePos.length - 1;
-    return lo + 1;
+    var best = lo, bestDist = Infinity;
+    for (var k = -1; k <= 1; k++) {
+      var i = lo + k;
+      if (i < 0 || i >= filmTilePos.length) continue;
+      var d = Math.abs((filmTilePos[i] + filmTileW[i] / 2) - center);
+      if (d < bestDist) { bestDist = d; best = i; }
+    }
+    return best + 1;
   }
 
   function filmScrollForIdx1(idx1, viewportW) {
@@ -960,10 +1571,8 @@
     return Math.max(0, tileCenter - viewportW / 2);
   }
 
-  // Continuous rAF chase toward filmScrollForIdx1(commandedIdx). Each tick reads
-  // commandedIdx live, so additional shiftFocus calls (more arrow presses) bump
-  // the target ahead and the chase keeps running toward the new target. Step is
-  // proportional to remaining distance, so the strip naturally accelerates.
+  // rAF chase toward filmScrollForIdx1(commandedIdx). Reads commandedIdx live,
+  // so successive shifts bump the target without restarting the chase.
   var focusChaseRaf = null;
   function startFocusChase() {
     focusInProgrammaticScroll = true;
@@ -980,14 +1589,23 @@
     var target = filmScrollForIdx1(commandedIdx, W);
     var cur = filmstripEl.scrollLeft;
     var diff = target - cur;
-    if (Math.abs(diff) < 0.5) {
+    // Exit when we are within a pixel. The prior threshold of 0.5 combined
+    // with a min-step clamp of 1 ping-ponged forever on platforms where the
+    // browser rounds scrollLeft to an integer: target=X.5, cur=X → step
+    // clamped to +1 → cur=X+1 → step clamped to -1 → cur=X → ….
+    if (Math.abs(diff) < 1) {
       filmstripEl.scrollLeft = target;
+      // Authoritative settle: the commanded tile is the focus. drawFilmstrip
+      // re-derives focusedIdx from scrollLeft, and a browser-rounded
+      // scrollLeft + wide neighbor can flip it to the wrong tile; force the
+      // right value here before that runs.
+      focusedIdx = commandedIdx;
       focusInProgrammaticScroll = false;
       return;
     }
-    var step = diff * 0.25;
-    if (Math.abs(step) < 1) step = (diff > 0 ? 1 : -1);
-    filmstripEl.scrollLeft = cur + step;
+    // No step-magnitude clamp — modern browsers handle fractional scrollLeft,
+    // and the 0.25*diff geometric progression converges fast enough on its own.
+    filmstripEl.scrollLeft = cur + diff * 0.25;
     focusChaseRaf = requestAnimationFrame(focusChaseTick);
   }
 
@@ -999,7 +1617,6 @@
     thumbsEl.style.height = H + 'px';
     thumbsEl.style.overflow = 'hidden';
     thumbsEl.innerHTML = '';
-    // Reset grid-mode references so they don't leak across mode switches.
     canvasEl = null; spacerEl = null;
 
     mainEl = document.createElement('canvas');
@@ -1036,17 +1653,14 @@
 
     filmstripEl.addEventListener('scroll', onFilmstripScroll, { passive: true });
     filmCanvasEl.addEventListener('click', onFilmstripClick);
-    // User gesture on the filmstrip cancels any in-flight chase animation. Without
-    // this, click-then-scroll fights the chase: the user scrolls, the chase keeps
-    // pulling back toward the click target, and the strip rubber-bands. Touchstart
-    // catches both desktop+mobile mouse-drags (browsers fire touch events on touch
-    // surfaces); wheel covers desktop trackpad/mousewheel.
+    // Manual gesture cancels the chase, otherwise scroll + chase fight and
+    // the strip rubber-bands.
     function cancelChaseFromUser() {
       if (focusChaseRaf) {
         cancelAnimationFrame(focusChaseRaf);
         focusChaseRaf = null;
         focusInProgrammaticScroll = false;
-        commandedIdx = focusedIdx;  // resync so next shiftFocus reads from focusedIdx
+        commandedIdx = focusedIdx;
       }
     }
     filmstripEl.addEventListener('wheel', cancelChaseFromUser, { passive: true });
@@ -1070,6 +1684,19 @@
   }
 
   function onFilmstripScroll() {
+    if (filmScrollPending) return;
+    filmScrollPending = true;
+    requestAnimationFrame(function () {
+      filmScrollPending = false;
+      drawFilmstrip();
+      drawMainImage();
+    });
+  }
+
+  // Used by sprite-arrival promise chains to redraw the filmstrip with the
+  // CURRENT scroll position (not whatever was captured when the load was
+  // queued). rAF-coalesced via the same flag as onFilmstripScroll.
+  function scheduleFilmstripRedraw() {
     if (filmScrollPending) return;
     filmScrollPending = true;
     requestAnimationFrame(function () {
@@ -1105,8 +1732,7 @@
     var atlasH = 50;
     var atlas = spriteMeta.atlases && spriteMeta.atlases[String(atlasH)];
     if (!atlas) return;
-    // Load only sprites that cover the visible filmstrip range. Avoids the
-    // ~1.7 GB decode burst from loading all 30 OI h50 sprites on focus entry.
+    // Load only sprites covering visible tiles — bounds focus-entry memory.
     (function () {
       if (!filmTilePos || filmTilePos.length === 0) return;
       var atlasMeta = spriteMeta && spriteMeta.atlases && spriteMeta.atlases[String(atlasH)];
@@ -1127,12 +1753,31 @@
       }
       var firstSp = Math.floor(ffirst / atlasMeta.cellsPerSprite);
       var lastSp = Math.floor(flast / atlasMeta.cellsPerSprite);
-      for (var fs = firstSp; fs <= lastSp; fs++) loadSpriteAt(atlasH, fs);
+      // Mirror the grid path: load only sprites covering the visible range
+      // (with a 1-sprite cushion so a small scrub doesn't thrash) and evict
+      // the rest. Without this, a fast filmstrip scrub through a 100k gallery
+      // accumulates every h50 sprite (~38 MB ImageBitmap each) because each
+      // becomes warm in atlasBitmapsSync and nothing ever frees it.
+      var BUF_SP = 1;
+      var keepLo = Math.max(0, firstSp - BUF_SP);
+      var keepHi = Math.min(atlasMeta.sprites.length - 1, lastSp + BUF_SP);
+      // Also keep the sprite for the centered focus image — drawMainImage uses
+      // the same h50 atlas as a fallback while per-image AVIF is still loading.
+      var keep = new Set();
+      for (var ks = keepLo; ks <= keepHi; ks++) keep.add(ks);
+      if (focusedIdx > 0) {
+        keep.add(Math.floor((focusedIdx - 1) / atlasMeta.cellsPerSprite));
+      }
+      evictAtlasBitmaps(atlasH, keep);
+      var bitmapsArr = atlasBitmapsSync[String(atlasH)] || [];
+      for (var fs = firstSp; fs <= lastSp; fs++) {
+        // Skip already-loaded sprites; chaining .then on a resolved promise
+        // would loop (resolves on microtask -> drawFilmstrip -> chain again).
+        if (bitmapsArr[fs]) continue;
+        loadSpriteAt(atlasH, fs).then(scheduleFilmstripRedraw, function () {});
+      }
     })();
-    // Paint synchronously from atlasBitmapsSync — sprites populate the sparse
-    // mirror as they decode. Tiles whose sprite isn't yet loaded skip; the
-    // onSpriteBitmapReady waiter below re-runs the paint when each sprite
-    // arrives so the strip fills in incrementally.
+    // Paint sync from atlasBitmapsSync; the arrival waiter repaints incrementally.
     if (!filmCanvasEl) return;
     var paintFilmstripTiles = function () {
       if (!filmCanvasEl) return;
@@ -1170,28 +1815,40 @@
         }
       }
     };
-    onSpriteBitmapReady(atlasH, function () { paintFilmstripTiles(); });
 
     var scrollLeft = filmstripEl.scrollLeft;
     var leftEdge = scrollLeft - filmPadL;
     var rightEdge = leftEdge + W;
     var yPad = Math.round((FILM_H - FILM_TILE_H) / 2);
 
-    var newCenterIdx = filmCenteredIdx1(scrollLeft, W);
+    // When the scroll position has settled at the commanded tile's exact
+    // target (within ~1px), trust commandedIdx. filmCenteredIdx1 picks the
+    // tile whose center is closest to viewport center, which with a wide
+    // neighbor + browser-rounded scrollLeft can deterministically pick the
+    // wrong tile by a few pixels — causing focusedIdx to flicker and the
+    // main-image stable-focus timer to never fire.
+    var newCenterIdx;
+    if (commandedIdx > 0) {
+      var commandedTarget = filmScrollForIdx1(commandedIdx, W);
+      if (Math.abs(scrollLeft - commandedTarget) < 1.5) {
+        newCenterIdx = commandedIdx;
+      } else {
+        newCenterIdx = filmCenteredIdx1(scrollLeft, W);
+      }
+    } else {
+      newCenterIdx = filmCenteredIdx1(scrollLeft, W);
+    }
     if (newCenterIdx !== focusedIdx) {
       focusedIdx = newCenterIdx;
-      // Don't null mainDrawSrc — keep it as a placeholder so the next paintMain
-      // shows SOMETHING (last good frame) instead of black. drawMainImage will be
-      // called next from onFilmstripScroll and will install a fresh source
-      // immediately (atlas h50 falls out of getBestSrcForFocus).
-      try { history.replaceState(null, '', '#' + encodeURIComponent(images[focusedIdx])); } catch (_) {}
+      // Keep mainDrawSrc; drawMainImage installs the fresh source next.
+      scheduleHashUpdate('#' + encodeURIComponent(images[focusedIdx]));
+      hideControls();
     }
 
     paintFilmstripTiles();
   }
 
-  // Geometry helper: where + how big to draw the main image. Shared by drawMainImage
-  // (low-res preview) and upgradeMainImage (high-LoD overlay).
+  // Where + how big to draw the main image.
   function mainImageGeom() {
     if (focusedIdx <= 0 || focusedIdx > lastimagevalue) return null;
     var name = images[focusedIdx];
@@ -1211,11 +1868,7 @@
     };
   }
 
-  // Low-res paint from the h50 atlas. Always instant (atlas is in memory for
-  // the filmstrip), so the main image follows scrubbing without ever blanking.
-  // Synchronously paint the main canvas: clear + apply transform + drawImage from
-  // mainDrawSrc. Used by pinch redraws (no async, no flicker) and by the load-resolved
-  // callbacks below (after they update mainDrawSrc).
+  // Paint mainDrawSrc onto the main canvas, synchronously.
   function paintMain() {
     if (!mainEl) return;
     var g = mainImageGeom();
@@ -1227,11 +1880,16 @@
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, g.W, g.mainH);
     if (mainDrawSrc && mainDrawSrc.bitmap) {
-      ctx.drawImage(
-        mainDrawSrc.bitmap,
-        mainDrawSrc.sx, mainDrawSrc.sy, mainDrawSrc.sw, mainDrawSrc.sh,
-        g.dx, g.dy, g.dw, g.dh
-      );
+      try {
+        ctx.drawImage(
+          mainDrawSrc.bitmap,
+          mainDrawSrc.sx, mainDrawSrc.sy, mainDrawSrc.sw, mainDrawSrc.sh,
+          g.dx, g.dy, g.dw, g.dh
+        );
+      } catch (_) {
+        // Bitmap was closed (eviction race). Drop and let the next paint install fresh.
+        mainDrawSrc = null;
+      }
     }
   }
 
@@ -1240,31 +1898,25 @@
     var g = mainImageGeom();
     if (!g) return;
 
-    var targetH = g.dh;  // displayed pixel height of the focused image
+    var targetH = g.dh * devicePixelRatio();
     var tier = pickPerImageTier(targetH);
 
-    // Pick the best already-resolved source NOW (target tier > any cached lower
-    // tier > atlas). Set it into mainDrawSrc and paint synchronously.
+    // Best already-resolved source (target tier → smaller cached tier → atlas).
     var src = getBestSrcForFocus(focusedIdx, targetH);
     if (src) {
       mainDrawSrc = { bitmap: src.bitmap, sx: src.sx, sy: src.sy, sw: src.sw, sh: src.sh, forIdx: focusedIdx };
+    } else if (mainDrawSrc && mainDrawSrc.forIdx !== focusedIdx) {
+      // No source ready for the new image AND the placeholder is for a
+      // different image. Drop it so paintMain shows black instead of the
+      // previous focused image briefly. Preserves placeholder reuse for
+      // same-image LoD upgrades (atlas → h800), where forIdx matches.
+      mainDrawSrc = null;
     }
-    // If src is null (atlas not loaded yet), keep the previous mainDrawSrc so
-    // paintMain still shows the last good frame instead of a black flash.
     paintMain();
 
-    // Kick off the target-tier load if not already in flight; when it resolves we
-    // upgrade mainDrawSrc and repaint. No debounce — we want the highest-res tier
-    // as soon as it's available, including DURING scrubbing.
+    // Per-image upgrade (the actual fetch + repaint on resolve) is initiated
+    // by prefetchFilmstripVisible's stable-focus timer; nothing to do here.
     var capturedIdx = focusedIdx;
-    var name = images[capturedIdx];
-    if (name) {
-      loadPerImageBitmap(name, tier).then(function (bm) {
-        if (!mainEl || !bm || focusedIdx !== capturedIdx) return;
-        mainDrawSrc = { bitmap: bm, sx: 0, sy: 0, sw: bm.width, sh: bm.height, forIdx: capturedIdx };
-        paintMain();
-      });
-    }
 
     // If we didn't have any bitmap at all yet, kick off atlas load AND register
     // a per-sprite waiter so we paint the instant OUR sprite arrives — rather than
@@ -1275,9 +1927,7 @@
       var atlas = spriteMeta.atlases && spriteMeta.atlases[String(atlasH)];
       if (atlas) {
         var neededSpriteIdx = Math.floor((capturedIdx - 1) / atlas.cellsPerSprite);
-        loadSpriteAt(atlasH, neededSpriteIdx);
-        onSpriteBitmapReady(atlasH, function (bm, spriteIdx) {
-          if (spriteIdx !== neededSpriteIdx) return;
+        loadSpriteAt(atlasH, neededSpriteIdx).then(function () {
           if (!mainEl || focusedIdx !== capturedIdx) return;
           var atlasSrc = getAtlasSrcSync(capturedIdx);
           if (!atlasSrc) return;
@@ -1285,58 +1935,79 @@
             mainDrawSrc = { bitmap: atlasSrc.bitmap, sx: atlasSrc.sx, sy: atlasSrc.sy, sw: atlasSrc.sw, sh: atlasSrc.sh, forIdx: capturedIdx };
             paintMain();
           }
-        });
+        }, function () {});
       }
     }
 
-    // Prefetch all images currently visible in the filmstrip at the same target tier.
     prefetchFilmstripVisible(tier);
   }
 
-  // Walks the filmstrip's currently-visible range (plus a small look-ahead) and fires
-  // loadPerImageBitmap at the requested tier. Caches dedupe so this is cheap on a
-  // continuous scrub — just a Map.has() per tile.
+  // Keep per-image bitmaps for focusedIdx ± FOCUS_PREFETCH at `tier`; evict the rest.
+  // Bounds bitmap memory in focus mode regardless of how far the user has scrubbed.
+  // Stable-focus debounce. During a fast scrub focusedIdx changes every frame;
+  // we hold off starting any per-image fetch until focusedIdx has been still
+  // for FOCUS_STABLE_MS. When the timer fires, fetch the centered image first;
+  // once it resolves, fan out to the +-FOCUS_PREFETCH neighbors.
+  var FOCUS_STABLE_MS = 50;
+  var focusStableTimer = null;
   function prefetchFilmstripVisible(tier) {
-    if (!filmstripEl || !filmTilePos) return;
-    var W = layoutWidth();
-    var leftEdge = filmstripEl.scrollLeft - filmPadL;
-    var rightEdge = leftEdge + W;
-    // Look ~half a viewport ahead in either direction so a fast scrub stays warm.
-    var lookahead = W * 0.5;
-    var lo = leftEdge - lookahead;
-    var hi = rightEdge + lookahead;
-    var n = filmTilePos.length;
-    // Binary-search start
-    var i = 0, j = n - 1;
-    while (i < j) {
-      var mid = (i + j) >> 1;
-      if (filmTilePos[mid] + filmTileW[mid] <= lo) i = mid + 1;
-      else j = mid;
+    if (focusedIdx <= 0) return;
+    // Build the keep set + warm names from the current ±FOCUS_PREFETCH window.
+    var warmNames = new Set();
+    var keepKeys = new Set();
+    var R = FOCUS_PREFETCH;
+    for (var k = -R; k <= R; k++) {
+      var idx1 = focusedIdx + k;
+      if (idx1 < 1 || idx1 > lastimagevalue) continue;
+      var name = images[idx1];
+      if (!name) continue;
+      warmNames.add(name);
+      keepKeys.add(name + '|' + tier);
     }
-    for (; i < n; i++) {
-      if (filmTilePos[i] > hi) break;
-      var name = images[i + 1];
-      if (name) loadPerImageBitmap(name, tier);
-    }
+    // Abort any in-flight load that's no longer in the keep window — frees
+    // sockets/decoder immediately for whatever's about to be requested next.
+    cancelPerImageLoadsExcept(keepKeys);
+    warmPerImageNames = warmNames;
+    evictPerImageBitmaps(warmNames);
+
+    // Restart the stable-focus timer. While the user is actively scrubbing,
+    // each focusedIdx change resets this; nothing is fetched. When the user
+    // settles for FOCUS_STABLE_MS, we fetch the center first, then neighbors.
+    if (focusStableTimer) clearTimeout(focusStableTimer);
+    var capturedIdx = focusedIdx;
+    focusStableTimer = setTimeout(function () {
+      focusStableTimer = null;
+      if (focusedIdx !== capturedIdx) return;
+      var centerName = images[capturedIdx];
+      if (!centerName) return;
+      loadPerImageBitmap(centerName, tier).then(function (bm) {
+        if (focusedIdx !== capturedIdx) return;
+        if (bm && mainEl) {
+          mainDrawSrc = { bitmap: bm, sx: 0, sy: 0, sw: bm.width, sh: bm.height, forIdx: capturedIdx };
+          paintMain();
+        }
+        // Fan out to neighbors only after center has resolved. They're fire-
+        // and-forget; cancellation handles them if focusedIdx moves again.
+        for (var dk = 1; dk <= R; dk++) {
+          var prev = capturedIdx - dk;
+          var next = capturedIdx + dk;
+          if (prev >= 1 && images[prev]) loadPerImageBitmap(images[prev], tier);
+          if (next <= lastimagevalue && images[next]) loadPerImageBitmap(images[next], tier);
+        }
+      });
+    }, FOCUS_STABLE_MS);
   }
 
-  // Legacy timer slot — drawMainImage now upgrades synchronously and prefetches
-  // the filmstrip-visible window, so this is a no-op kept only to satisfy the
-  // mainUpgradeTimer references that were left in for safety.
   var mainUpgradeTimer = null;
   function upgradeMainImage() { mainUpgradeTimer = null; }
 
-  // Sync source-rect lookup for an arbitrary image index out of the h50 atlas.
-  // Returns null if the atlas isn't loaded yet (caller should fall back to skipping
-  // that side of the drag rather than blocking).
-  // Try tiers in descending order until one is cached. If none, fall back to the
-  // atlas (always-fastest). Returns { bitmap, sx, sy, sw, sh } or null.
+  // Best already-cached source for `idx1` at `targetH`: walk per-image tiers
+  // (target then smaller), then fall back to atlas h50.
   function getBestSrcForFocus(idx1, targetH) {
     if (idx1 < 1 || idx1 > lastimagevalue) return null;
     var name = images[idx1];
     if (!name) return null;
     var tier = pickPerImageTier(targetH);
-    // Try the picked tier and any smaller pre-built tier we already have cached.
     var ladder = [tier].concat(PER_IMAGE_TIERS.filter(function (h) { return h < tier || tier === 0; }).reverse());
     for (var i = 0; i < ladder.length; i++) {
       var t = ladder[i];
@@ -1374,9 +2045,7 @@
     return { dw: dw, dh: dh, dx: Math.round((areaW - dw) / 2), dy: Math.round((areaH - dh) / 2) };
   }
 
-  // Paint the main canvas during a drag: clear, then draw current at offset dragDX,
-  // prev at dragDX-W, next at dragDX+W. Uses mainDrawSrc (high-LoD if available) for
-  // the centered image and atlas-sync sources for the neighbors.
+  // Drag paint: current at dragDX, prev/next at dragDX∓W.
   function paintMainDragged(dx) {
     if (!mainEl) return;
     var W = layoutWidth(), H = layoutHeight();
@@ -1394,14 +2063,12 @@
       var loc = name && spriteMeta && spriteMeta.imageMap && spriteMeta.imageMap[name];
       if (!loc) return;
       var dest = destRectForLoc(loc.w, CANONICAL_H, W, mainH);
-      // For the centered image the live mainDrawSrc is already the best choice.
-      // For the neighbors that peek in during a swipe, ask getBestSrcForFocus so
-      // we use any cached high-res tier we have for them too, falling back to atlas.
+      // Center: live mainDrawSrc. Neighbors: best cached tier, atlas fallback.
       var src;
       if (idx1 === focusedIdx && mainDrawSrc && mainDrawSrc.forIdx === idx1) {
         src = mainDrawSrc;
       } else {
-        src = getBestSrcForFocus(idx1, dest.dh);
+        src = getBestSrcForFocus(idx1, dest.dh * devicePixelRatio());
       }
       if (!src) return;
       ctx.drawImage(src.bitmap, src.sx, src.sy, src.sw, src.sh, dest.dx + offsetX, dest.dy, dest.dw, dest.dh);
@@ -1411,8 +2078,7 @@
     paintAt(focusedIdx + 1, dx + W);
   }
 
-  // Animate dragDX toward targetDX via the same proportional-step chase we use
-  // elsewhere, then run done(). Each step paints the 3-image drag layout.
+  // Proportional-step chase from dragDX → targetDX, painting each step.
   function animateDragTo(targetDX, done) {
     if (dragRaf) cancelAnimationFrame(dragRaf);
     function tick() {
@@ -1433,31 +2099,27 @@
     dragRaf = requestAnimationFrame(tick);
   }
 
-  // Commit a drag: animate to ±W then shift focus + reset state.
-  // direction: -1 = went to previous (user dragged right), +1 = went to next (dragged left).
+  // direction: -1 = went to previous, +1 = went to next.
   function commitDrag(direction) {
     var W = layoutWidth();
-    var targetDx = -direction * W;  // dragDX ended at +W means current image fully right; prev is centered
+    var targetDx = -direction * W;
     animateDragTo(targetDx, function () {
       var newIdx = focusedIdx + direction;
       while (newIdx < 1) newIdx += lastimagevalue;
       while (newIdx > lastimagevalue) newIdx -= lastimagevalue;
-      // Pre-populate the new mainDrawSrc from the atlas if available, so the next paint
-      // doesn't black-flicker while the atlas .then() resolves on a microtask.
-      // Pre-populate with best cached source for the new image. If nothing's
-      // cached, keep the previous mainDrawSrc as a placeholder so paintMain doesn't
-      // black-flash; drawMainImage's load callback will overwrite when ready.
-      var newSrc = getBestSrcForFocus(newIdx, mainImageGeom() && mainImageGeom().dh);
+      // Pre-populate mainDrawSrc with best cached source so the next paint
+      // doesn't black-flash while drawMainImage resolves.
+      var newSrc = getBestSrcForFocus(newIdx, mainImageGeom() && mainImageGeom().dh * devicePixelRatio());
       if (newSrc) {
         mainDrawSrc = { bitmap: newSrc.bitmap, sx: newSrc.sx, sy: newSrc.sy, sw: newSrc.sw, sh: newSrc.sh, forIdx: newIdx };
       }
       focusedIdx = newIdx;
       dragDX = 0;
       dragActive = false;
-      // Sync the filmstrip to the new image (no chase animation needed — visual
-      // commit already happened via the drag).
+      hideControls();
+      // Sync filmstrip without chase — visual commit already happened.
       if (filmstripEl) filmstripEl.scrollLeft = filmScrollForIdx1(focusedIdx, W);
-      try { history.replaceState(null, '', '#' + encodeURIComponent(images[focusedIdx])); } catch (_) {}
+      scheduleHashUpdate('#' + encodeURIComponent(images[focusedIdx]));
       paintMain();
       if (mainUpgradeTimer) clearTimeout(mainUpgradeTimer);
       mainUpgradeTimer = setTimeout(upgradeMainImage, 150);
@@ -1471,49 +2133,115 @@
     });
   }
 
-  // Touch gestures on the main image: 1-finger horizontal swipe → prev/next via
-  // shiftFocus (which animates through the chase loop). 2-finger pinch → scale the
-  // current image around its center; release back to ≈1 snaps to identity.
-  // touchOnMain is set so the document-level pinch handler (which drives the slider)
-  // skips events that started here.
+  // 1-finger horizontal drag on the main image becomes a filmstrip scrub: we
+  // adjust filmstripEl.scrollLeft directly, and the existing scroll handler
+  // updates focusedIdx + repaints. On touchend we run a manual momentum decay
+  // (programmatic scrollLeft doesn't get native scroll inertia). 2-finger
+  // gestures are left alone so native pinch-zoom keeps working.
+  // A tap (no/tiny movement, short duration) navigates to the original file.
   function setupMainImageGestures() {
     if (!mainEl) return;
-    var swipeStart = null;
+    var startX = 0, startY = 0, startT = 0, startScrollLeft = 0;
+    var dragging = false, multiTouch = false, decayRaf = null;
+    var lastX = 0, lastT = 0, velX = 0;  // px/ms
+    var lastDragEndAt = 0;
+
+    function stopDecay() {
+      if (decayRaf) { cancelAnimationFrame(decayRaf); decayRaf = null; }
+    }
+    function startDecay() {
+      stopDecay();
+      var v = velX;  // px/ms (negative means content moves left -> scrollLeft increases)
+      var prevT = performance.now();
+      function step(now) {
+        var dt = Math.max(1, now - prevT);
+        prevT = now;
+        if (!filmstripEl) { decayRaf = null; return; }
+        // Decay rate ~exp(-dt/180ms). Stop when below ~0.04 px/ms (~24 px/s).
+        var decay = Math.exp(-dt / 180);
+        v *= decay;
+        if (Math.abs(v) < 0.04) { decayRaf = null; return; }
+        filmstripEl.scrollLeft -= v * dt;
+        decayRaf = requestAnimationFrame(step);
+      }
+      decayRaf = requestAnimationFrame(step);
+    }
+
     mainEl.addEventListener('touchstart', function (e) {
       touchOnMain = true;
-      if (e.touches.length === 1) {
-        swipeStart = { x: e.touches[0].clientX, y: e.touches[0].clientY, t: Date.now() };
-      }
+      stopDecay();
+      multiTouch = e.touches.length > 1;
+      if (multiTouch) { dragging = false; return; }
+      var t = e.touches[0];
+      startX = lastX = t.clientX;
+      startY = t.clientY;
+      startT = lastT = performance.now();
+      startScrollLeft = filmstripEl ? filmstripEl.scrollLeft : 0;
+      dragging = false;
+      velX = 0;
     }, { passive: true });
+
     mainEl.addEventListener('touchmove', function (e) {
-      if (!swipeStart || e.touches.length !== 1) return;
-      // iCloud-style horizontal commit/revert swipe between images.
-      var dx = e.touches[0].clientX - swipeStart.x;
-      var dy = e.touches[0].clientY - swipeStart.y;
-      if (!dragActive && Math.abs(dy) > Math.abs(dx) && Math.abs(dy) > 8) return;
-      if (dragActive || Math.abs(dx) > 6) {
-        e.preventDefault();
-        dragActive = true;
-        dragDX = dx;
-        paintMainDragged(dragDX);
+      if (multiTouch || e.touches.length > 1) { dragging = false; return; }
+      if (!filmstripEl) return;
+      var t = e.touches[0];
+      var dx = t.clientX - startX;
+      var dy = t.clientY - startY;
+      if (!dragging) {
+        // Lock into horizontal drag once we've moved enough horizontally and
+        // it dominates vertical movement.
+        if (Math.abs(dx) > 6 && Math.abs(dx) > Math.abs(dy)) {
+          dragging = true;
+        } else if (Math.abs(dy) > 8 && Math.abs(dy) > Math.abs(dx)) {
+          // Vertical-dominant: bail out, let it be a no-op (no page to scroll
+          // in focus mode).
+          return;
+        } else {
+          return;
+        }
       }
+      e.preventDefault();
+      filmstripEl.scrollLeft = startScrollLeft - dx;
+      var now = performance.now();
+      var dt = Math.max(1, now - lastT);
+      // EMA-style velocity: blend instantaneous with previous.
+      velX = velX * 0.4 + ((t.clientX - lastX) / dt) * 0.6;
+      lastX = t.clientX; lastT = now;
     }, { passive: false });
-    mainEl.addEventListener('touchend', function () {
-      if (dragActive) {
-        var W = layoutWidth();
-        var dt = Math.max(1, Date.now() - (swipeStart ? swipeStart.t : Date.now()));
-        var velocity = dragDX / dt;
-        var commit = (Math.abs(dragDX) > W * 0.30) || (Math.abs(velocity) > 0.5 && Math.abs(dragDX) > 30);
-        if (commit) commitDrag(dragDX > 0 ? -1 : +1);
-        else revertDrag();
+
+    mainEl.addEventListener('touchend', function (e) {
+      touchOnMain = false;
+      if (multiTouch) { multiTouch = e.touches.length > 0; return; }
+      if (dragging) {
+        startDecay();
+        dragging = false;
+        lastDragEndAt = performance.now();
+        return;
       }
-      swipeStart = null;
-      touchOnMain = false;
+      // Tap: no/tiny drag, short duration -> open original file.
+      var dt = performance.now() - startT;
+      if (dt < 350) {
+        var name = images && images[focusedIdx];
+        if (name) {
+          var url = folderURL + encodeURIComponent(name);
+          window.location.href = url;
+        }
+      }
     });
+
     mainEl.addEventListener('touchcancel', function () {
-      swipeStart = null;
       touchOnMain = false;
-      if (dragActive) revertDrag();
+      dragging = false;
+      multiTouch = false;
+    });
+
+    // Desktop click (and synthesized click after a short tap on mobile).
+    // Drag-end sets lastDragEndAt to suppress the synthetic click that some
+    // browsers fire after a touchend even when movement was non-trivial.
+    mainEl.addEventListener('click', function () {
+      if (performance.now() - lastDragEndAt < 400) return;
+      var name = images && images[focusedIdx];
+      if (name) window.location.href = folderURL + encodeURIComponent(name);
     });
   }
 
@@ -1542,50 +2270,45 @@
     var W = layoutWidth();
     var viewportH = layoutHeight();
 
-    // ===== FOCUS MODE: main image + filmstrip =====
+    // ===== FOCUS MODE =====
     if (focusedIdx > 0) {
       setupFilmstripFocus(thumbsEl);
       return;
     }
 
-    // ===== GRID MODE: justified rows + virtual scroll =====
-    // Use the row-stable anchor captured on the last user scroll (see captureAnchorFromScroll).
-    // We do NOT re-capture here, because mid-zoom-drag the column count is changing and the
-    // "image at viewport top" identity flickers — re-capturing would drift the gallery.
+    // ===== GRID MODE =====
+    // Re-using the captured anchor (not re-capturing) keeps zoom-drag stable —
+    // mid-drag column counts shift, which would drift "image at viewport top".
+    // On a fresh page load (F5) cachedAnchorName is null; fall back to the
+    // sessionStorage-persisted anchor so refresh stays at the same scroll.
     var anchorName = cachedAnchorName;
+    if (!anchorName) {
+      try { anchorName = sessionStorage.getItem(scrollKey()) || null; } catch (_) {}
+      if (anchorName) cachedAnchorName = anchorName;  // seed in-memory so subsequent zoom-changes pin to it too
+    }
 
-    // Compute layout
-    var H = targetRowHeight(getZoom());
-    currentRowHeight = H;  // drawCanvasForScroll uses this to pick the atlas
+    var H = targetRowHeight();
+    currentRowHeight = H;
     var rows = layoutRows(H);
     var totalH = 0;
     var GAP = rowGap(H);
     for (var i = 0; i < rows.length; i++) totalH += rows[i].height + GAP;
-    lastTotalH = totalH;
 
-    // Configure #thumbs as the scroll container
     thumbsEl.style.position = 'relative';
     thumbsEl.style.overflowY = 'auto';
-    thumbsEl.style.height = viewportH + 'px';
-
-    // Canvas + spacer. Backing store at device-pixel density (dpr×); CSS size at
-    // logical (W). drawCanvasForScroll() applies setTransform(dpr) so all drawImage
-    // calls keep using CSS coordinates.
-    ensureCanvasAndSpacer(thumbsEl);
-    var dpr = devicePixelRatio();
-    var canvasH = Math.min(viewportH, Math.ceil(totalH));
-    canvasEl.width = Math.round(W * dpr);
-    canvasEl.height = Math.round(canvasH * dpr);
-    canvasEl.style.width = W + 'px';
-    canvasEl.style.height = canvasH + 'px';
-    // Reset spacer to in-flow block (focus mode flips it to absolute).
-    spacerEl.style.position = 'static';
-    spacerEl.style.width = '1px';
-    spacerEl.style.height = Math.max(0, Math.ceil(totalH) - canvasH) + 'px';
-    // Reset thumbs to vertical-only scroll.
     thumbsEl.style.overflowX = 'hidden';
+    thumbsEl.style.height = viewportH + 'px';
+    // Chrome's scroll anchoring auto-adjusts scrollTop to keep visible content
+    // stable when the layout changes. Our layout changes a lot (spacer height,
+    // canvas reposition), and Chrome ends up shifting scrollTop away from 0,
+    // so the top row appears cut off and unreachable. Safari doesn't do this.
+    thumbsEl.style.overflowAnchor = 'none';
 
-    // Compute tile rects in LAYOUT coords (independent of scroll)
+    ensureCanvasAndSpacer(thumbsEl);
+    applyGridLayout(thumbsEl, W, viewportH, totalH);
+    // Atlas instance buffers depend on tile rects; force rebuild on next draw.
+    atlasInstancesBuiltFor = null;
+
     lastTileRects = [];
     var y = 0;
     for (var r = 0; r < rows.length; r++) {
@@ -1598,8 +2321,7 @@
       y += rows[r].height + GAP;
     }
 
-    // Restore scroll position: anchor on the previously-top-left image so zoom doesn't
-    // yank the user back to the top of the gallery.
+    // Pin the previous top-left image so zoom doesn't snap back to the top.
     var maxScroll = Math.max(0, totalH - viewportH);
     if (anchorName) {
       for (var ki = 0; ki < lastTileRects.length; ki++) {
@@ -1617,20 +2339,15 @@
     }
 
     window.__lastTileRects = lastTileRects;
-    // Trigger initial paint. drawCanvasForScroll picks the right atlas + lazy-loads it.
     drawCanvasForScroll();
   }
-
-  function buildthumbpages() { /* legacy stub — layout is now incremental via renderGallery */ }
 
   function displaythumbs() {
     showAdminBar();
     focusedIdx = 0;
     hashmirror = '';
     setText('counter', '');
-    // Apply the current grid level so the render matches the displayed label.
-    // Without this, an empty-hash initial load would show "Small" in the toolbar
-    // but render at fit-all (because levelTargetH was never set).
+    // Apply current grid level so the render matches the toolbar label.
     var levels = availableLevels();
     var idx = lastGridLevelIdx;
     if (idx > levels.length - 1) idx = levels.length - 1;
@@ -1647,16 +2364,17 @@
   function refreshfromhash() {
     hashmirror = location.hash.slice(1);
     var raw = decodeURIComponent(hashmirror || '');
-    // #sizeN = grid view at zoom level N (per the discrete level system).
-    var sizeMatch = raw.match(/^size(\d+)$/);
-    if (sizeMatch) {
-      var idx = parseInt(sizeMatch[1], 10);
-      var levels = availableLevels();
-      if (idx > levels.length - 1) idx = levels.length - 1;
-      currentLevelIdx = idx;
-      lastGridLevelIdx = idx;
-      var lv = levels[idx];
-      if (lv.h !== 'focus') levelTargetH = lv.h;
+    // #fit and #sizeN → ZOOM_LEVELS entries; bare names → focus.
+    var levels = availableLevels();
+    var matchedIdx = -1;
+    for (var li = 0; li < levels.length; li++) {
+      if (levels[li].hash && levels[li].hash === raw) { matchedIdx = li; break; }
+    }
+    if (matchedIdx >= 0) {
+      currentLevelIdx = matchedIdx;
+      lastGridLevelIdx = matchedIdx;
+      var lv0 = levels[matchedIdx];
+      if (lv0.h !== 'focus') levelTargetH = lv0.h;
       focusedIdx = 0;
       document.body.classList.add('thumb-view');
       document.body.classList.remove('image-view');
@@ -1665,21 +2383,18 @@
       return;
     }
     if (!raw || raw.charAt(0) === ':') {
-      // Empty hash (or legacy ':N') = grid view at the default level. Don't
-      // touch the URL — it stays clean even though we render at level idx.
-      var idx = defaultLevelIdx();
-      var levels = availableLevels();
-      currentLevelIdx = idx;
-      lastGridLevelIdx = idx;
-      var lv = levels[idx];
-      if (lv.h !== 'focus') levelTargetH = lv.h;
+      var didx = defaultLevelIdx();
+      currentLevelIdx = didx;
+      lastGridLevelIdx = didx;
+      var dlv = levels[didx];
+      if (dlv.h !== 'focus') levelTargetH = dlv.h;
       focusedIdx = 0;
       document.body.classList.add('thumb-view');
       document.body.classList.remove('image-view');
       renderGallery();
       renderZoomControl();
     } else {
-      // #filename = focus on that image. Find by canonical name lookup.
+      // #filename → focus on that image.
       for (var i = 1; i <= lastimagevalue; i++) {
         if (raw === images[i]) {
           focusedIdx = i;
@@ -1691,7 +2406,7 @@
           return;
         }
       }
-      // Unknown name — fall through to grid
+      // Unknown name — fall through to grid.
       focusedIdx = 0;
       renderGallery();
       renderZoomControl();
@@ -1712,9 +2427,9 @@
   }
   function clearAdminBar() { var b = $('adminnotify'); if (b) b.classList.remove('on'); }
 
-  // ---------- admin actions (delegated to globals) ----------
+  // ---------- admin actions ----------
   function ggMoveToTrash() {
-    // No confirm — trash is reversible (see Explore Trash). Show a quick note for feedback.
+    // No confirm — trash is reversible via Explore Trash.
     note('Moving ' + images[inum] + ' to trash…');
     gghttp('POST', 'movetotrash=' + encodeURIComponent(images[inum]), function (t) {
       note(t || 'moved to trash');
@@ -1761,13 +2476,7 @@
   function ggRestoreAll()   { trashApi('restoreAll').then(ggExploreTrash); }
   function ggEmptyTrash()   { if (!confirm('Permanently delete ALL trashed files?')) return; trashApi('empty').then(ggExploreTrash); }
 
-  // ---------- touch swipe ----------
-  function setupZoomSlider() { renderZoomControl(); }
-
-
-
-  // Picks the image whose tile center is closest to viewport center. Used when the
-  // slider is dragged to 100% in grid mode to choose what image to focus on.
+  // Image whose tile-center is closest to the viewport center.
   function findCenteredImageName() {
     var thumbsEl = $('thumbs');
     if (!thumbsEl || !lastTileRects.length) return null;
@@ -1785,19 +2494,14 @@
     return best ? best.name : null;
   }
 
-  // No custom wheel/touch handlers in focus mode any more — the strip is a real
-  // native-scroll surface, so the browser drives prev/next via inertial scroll and
-  // the filmstrip is the scroll surface and free-scrolls (no snap).
-  // In landscape we redirect vertical wheel to horizontal scroll so trackpad/mousewheel
-  // users without a horizontal axis can still navigate. Touch on iOS already gives both
-  // axes natively, so no touch handler is needed.
+  // Focus mode: redirect vertical wheel → horizontal filmstrip scroll for
+  // trackpad/mousewheel users without a horizontal axis.
   function setupTouch() {
     var thumbsEl = $('thumbs');
     if (!thumbsEl) return;
     thumbsEl.addEventListener('wheel', function (e) {
       if (focusedIdx <= 0) return;
       if (!filmstripEl) return;
-      // In focus mode, vertical wheel scrubs the filmstrip horizontally.
       if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
         e.preventDefault();
         filmstripEl.scrollLeft += e.deltaY;
@@ -1806,41 +2510,22 @@
 
   }
 
-  // ---------- thumb click delegation ----------
-  function setupThumbClicks() {
-    document.addEventListener('click', function (e) {
-      var a = e.target.closest && e.target.closest('#thumbs a[data-i]');
-      if (!a) return;
-      e.preventDefault();
-      preview(parseInt(a.getAttribute('data-i'), 10));
-    });
-  }
-
   // ---------- start ----------
   function startjs() {
-    // session check: if we have a stored token, the page already rendered with isadmin=0,
-    // so probe and reload if a session is valid (cheap one-time check).
     maybePromoteAdmin();
 
     setupTouch();
-    setupThumbClicks();
-    setupZoomSlider();
+    renderZoomControl();
 
     window.addEventListener('resize', scheduleRender);
 
-    // Show a loading placeholder while the binary imagemap is in flight, then run the
-    // initial route once we have data. If there's no imagemap to load (e.g. sprite not
-    // built yet) we still want to render — fall through to renderGallery which has its
-    // own "Building LoD cache…" placeholder for the spriteMeta=null case.
+    // Initial route after the binary imagemap loads (or fails — renderGallery
+    // has its own placeholder for spriteMeta=null).
     function runInitialRoute() {
       var raw = decodeURIComponent(location.hash.slice(1) || '');
-      if (raw && raw.match(/^size\d+$/)) {
-        // #sizeN deep link: route through refreshfromhash which already parses it.
+      if (raw && (raw === 'fit' || raw.match(/^size\d+$/))) {
         refreshfromhash();
       } else if (!raw || raw.charAt(0) === ':') {
-        // Empty hash on first load: route through refreshfromhash so the
-        // default-level logic applies (displaythumbs alone reads the initial
-        // lastGridLevelIdx=0 and renders at All).
         refreshfromhash();
       } else if (lastimagevalue > 0) {
         var found = 0;
@@ -1849,12 +2534,7 @@
       } else {
         displaythumbs();
       }
-      // layoutHeight() depends on #thumbs's getBoundingClientRect().top, which on
-      // first paint may not reflect the final position of the chrome above it
-      // (slider, breadcrumbs, etc). Re-render after the next two animation frames
-      // so the second pass measures correctly. Without this the filmstrip on
-      // a deep-link load can sit below the bottom of the viewport until the
-      // first window resize.
+      // Re-render after two rAFs so layoutHeight measures with chrome settled.
       requestAnimationFrame(function () {
         requestAnimationFrame(function () { scheduleRender(); });
       });
@@ -1867,32 +2547,31 @@
         runInitialRoute();
       }).catch(function (e) {
         console.warn('[imagemap] load failed:', e);
-        runInitialRoute();  // attempt render anyway; may show "Generating…" or No images
+        runInitialRoute();
       });
     } else {
       runInitialRoute();
     }
 
     window.addEventListener('hashchange', refreshfromhash);
-    // Key handlers attached programmatically (inline onkey* attributes on body fire
-    // before this IIFE's window.* exports exist — Safari hits the race).
+    // Programmatic key handlers; inline onkey* attributes hit a race with the
+    // IIFE's window.* exports on Safari.
     window.addEventListener('keydown', keycheck);
     window.addEventListener('keyup', unlockkeys);
     pollBuildStatus();
   }
 
-  // Probe the admin cookie. If valid, flip the in-page admin UI on; otherwise no-op.
-  // Cookie is HttpOnly so we can't read it from JS — the probe is the only way to know.
+  // Cookie is HttpOnly; the probe is the only way to detect a valid session.
   function maybePromoteAdmin() {
     if (window.isadmin) return;
     fetch('/api/admin/probe', { credentials: 'same-origin' })
       .then(function (r) {
         if (r.ok) { window.isadmin = 1; showAdminBar(); }
       })
-      .catch(function () { /* offline — silently no-op */ });
+      .catch(function () {});
   }
 
-  // expose for inline handlers / other scripts
+  // Expose for inline handlers.
   window.startjs = startjs;
   window.keycheck = keycheck;
   window.unlockkeys = unlockkeys;
@@ -1907,7 +2586,96 @@
   window.ggRestoreAll = ggRestoreAll;
   window.ggEmptyTrash = ggEmptyTrash;
 
-  // start when DOM is ready
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', startjs);
   else startjs();
+  // Replaced by setupAutoHide() once it initializes. Callable from anywhere
+  // in the module — e.g., onThumbsScroll or focus-flip sites — to dismiss the
+  // top controls the moment the user shows intent to engage with content.
+  var hideControls = function () {};
+
+  // ------------------------------------------------------------------------
+  // Top controls drawer. Closed on load (for galleries with images); locked
+  // open on empty galleries. Unified pill: tap/click toggles on both desktop
+  // and touch. Desktop fades the pill in only when the cursor is within
+  // REVEAL_RADIUS of the pill center. No timer-based auto-hide on either
+  // platform. Module-level hideControls is still wired to intent signals
+  // (grid scroll, focus change, filmstrip swipe) so the drawer gets out of
+  // the way when the user starts interacting with content.
+  // ------------------------------------------------------------------------
+  (function setupAutoHide() {
+    function init() {
+      var wrap = document.getElementById('topcontrols');
+      var pill = document.getElementById('topreveal');
+      if (!wrap) return;
+
+      // Measure native scrollbar width — keeps the scroll gutter reachable
+      // when the drawer slides in. Mac overlay scrollbars measure 0 here.
+      (function () {
+        var probe = document.createElement('div');
+        probe.style.cssText = 'overflow:scroll; width:100px; height:100px; position:absolute; visibility:hidden; top:-200px;';
+        document.body.appendChild(probe);
+        var w = probe.offsetWidth - probe.clientWidth;
+        document.body.removeChild(probe);
+        document.documentElement.style.setProperty('--scrollbar-w', w + 'px');
+      })();
+
+      var REVEAL_RADIUS = 150;
+      var isTouchOnly = window.matchMedia('(hover: none)').matches;
+      var isEmpty = !window.lastimagevalue;
+
+      function show() { document.body.classList.add('controls-revealed'); }
+      function hide() {
+        // Empty galleries: drawer is locked open. Pill is hidden via CSS so
+        // users can't accidentally collapse it, and intent-based
+        // hideControls() calls become no-ops.
+        if (isEmpty) return;
+        document.body.classList.remove('controls-revealed');
+      }
+      function toggle() {
+        if (document.body.classList.contains('controls-revealed')) hide();
+        else show();
+      }
+      hideControls = hide;
+
+      if (isEmpty) {
+        document.body.classList.add('gallery-empty');
+        show();
+        return;
+      }
+
+      // Desktop: reveal the pill when the cursor enters a 150px radius
+      // around its center. Pill rect is fixed at top-center; rect read on
+      // every mousemove is cheap and avoids stale coords on viewport resize.
+      if (!isTouchOnly && pill) {
+        document.addEventListener('mousemove', function (e) {
+          var r = pill.getBoundingClientRect();
+          var cx = r.left + r.width / 2;
+          var cy = r.top + r.height / 2;
+          var d = Math.hypot(e.clientX - cx, e.clientY - cy);
+          if (d < REVEAL_RADIUS) document.body.classList.add('pill-near');
+          else document.body.classList.remove('pill-near');
+        });
+      }
+
+      // Pill toggles drawer on tap/click — unified across desktop and touch.
+      // Touch uses pointerdown for snap; suppress the synthetic click that
+      // would otherwise toggle a second time.
+      if (pill) {
+        if (isTouchOnly) {
+          pill.addEventListener('pointerdown', function (e) {
+            e.preventDefault();
+            toggle();
+          });
+        } else {
+          pill.addEventListener('click', toggle);
+        }
+      }
+    }
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', init);
+    } else {
+      init();
+    }
+  })();
+
 })();
