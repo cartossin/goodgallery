@@ -1,0 +1,10 @@
+<svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+  <rect width="200" height="200" fill="#1a1a1a"/>
+  <rect x="3" y="3" width="194" height="194" fill="none" stroke="#4a1818" stroke-width="2"/>
+  <g stroke="#d33333" stroke-width="20" stroke-linecap="round" fill="none">
+    <line x1="55" y1="55" x2="145" y2="145"/>
+    <line x1="145" y1="55" x2="55" y2="145"/>
+  </g>
+  <text x="100" y="178" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#cccccc" letter-spacing="0.5">BROKEN IMAGE</text>
+  <text x="100" y="192" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" fill="#888888">vips parse error</text>
+</svg>
