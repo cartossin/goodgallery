@@ -1,15 +1,13 @@
-// Goodgallery 2.0 — Node.js rewrite of the 2014 PHP build.
-// Zero runtime npm dependencies. Image resizing via vipsthumbnail (libvips).
+// Goodgallery 2.0 — Node.js. Zero runtime npm deps. libvips for image work.
 //
-// Preserves the 2014 URL/data layout:
-//   GALLERIES_ROOT/<path...>/<image>            originals
+// On-disk layout:
+//   GALLERIES_ROOT/<path...>/<image>                    originals
 //   GALLERIES_ROOT/<path...>/gg/<image>.h<H>.<format>   per-image LoDs (avif/v)
 //   GALLERIES_ROOT/<path...>/gg/sprite-h<H>-<N>.avif    sprite atlases
 //   GALLERIES_ROOT/<path...>/gg/_manifest.json          per-gallery manifest
 //   STATE_DIR/trash/<rel-path>/<image>                  soft-deleted (global)
 //
-// New: folder hierarchy. Each folder is its own gallery; subfolders appear
-// as cards in the parent. Folder URL = the path itself, ending with `/`.
+// Each folder is its own gallery; subfolders appear as cards in the parent.
 
 import http from 'http';
 import https from 'https';
@@ -18,6 +16,7 @@ import fsp from 'fs/promises';
 import path from 'path';
 import crypto from 'crypto';
 import { spawn } from 'child_process';
+import { Worker } from 'worker_threads';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -32,14 +31,13 @@ const PUBLIC_DIR       = path.join(__dirname, 'public');
 const PASSKEY_FILE     = path.join(STATE_DIR, 'passkey.json');
 const SITE_TITLE       = process.env.SITE_TITLE || 'Goodgallery';
 const THUMBS_PER_PAGE  = parseInt(process.env.THUMBS_PER_PAGE || '50', 10);
-// LoD ladder: every image is cached at multiple heights. Small tiers are lossless `.v`
-// (raw bytes, fast to read); large tiers are AVIF Q=80 (very compressed). The H=200
-// AVIF is the input to the sprite atlas.
+// Small tiers are lossless `.v` (raw, fast to decode for atlas packing);
+// large tiers are AVIF Q=80.
 const LOD_TIERS = [
   { h: 5,   format: 'v',    quality: null },
   { h: 10,  format: 'v',    quality: null },
   { h: 50,  format: 'v',    quality: null },
-  { h: 100, format: 'avif', quality: 80 },
+  { h: 100, format: 'v',    quality: null },
   { h: 200, format: 'avif', quality: 80 },
   { h: 400, format: 'avif', quality: 80 },
   { h: 800,  format: 'avif', quality: 80 },
@@ -49,50 +47,30 @@ function lodPath(thumbDir, filename, height, format) {
   return path.join(thumbDir, filename + '.h' + height + '.' + format);
 }
 
-// Heights at which we build sprite atlases. Drives the staged build order: each
-// stage drains all images for one h, then bakes that single atlas, so the gallery
-// becomes usable after just the smallest tier — not after every tier.
-const ATLAS_TIERS = [5, 10, 50];
+// Atlas tiers are built smallest-first so the gallery is usable as soon as h5 lands.
+const ATLAS_TIERS = [5, 10, 50, 100];
 const THUMB_CELL       = parseInt(process.env.THUMB_CELL || '200', 10);
 const THUMB_DIM        = THUMB_CELL;  // alias for clarity in build path
 const SPRITE_ACROSS      = parseInt(process.env.SPRITE_ACROSS || '20', 10);   // cells per row (target)
-// Cap each sprite atlas by **target file size**, not cell count or pixel area. With
-// variable-width cells the cell-count axis is meaningless, and pixel area is too far from
-// the user's mental model ("I want sprites under 4MB so a tab loading the gallery is
-// snappy"). We translate target bytes -> pixel cap with an empirical bytes/pixel constant
-// measured at our JPEG quality on typical photo content. Tweak BYTES_PER_PIXEL_Q92 if
-// your galleries are mostly flat-color (lower) or extreme detail (higher).
+// Sprite size is capped by target file bytes. Translate bytes → pixel budget via
+// an empirical bytes/pixel constant; tune BYTES_PER_PIXEL_Q92 lower for flat-color
+// content, higher for extreme detail.
 const MAX_SPRITE_BYTES   = parseInt(process.env.MAX_SPRITE_BYTES || String(4 * 1024 * 1024), 10);
 const BYTES_PER_PIXEL_Q92 = parseFloat(process.env.BYTES_PER_PIXEL_Q92 || '0.30');
 const MAX_SPRITE_PIXELS   = Math.max(1, Math.floor(MAX_SPRITE_BYTES / BYTES_PER_PIXEL_Q92));
-// Linux ARG_MAX is ~2 MB total argv; `vips arrayjoin` is invoked with one giant
-// space-separated arg of input paths, so each ~90-char path costs that much. Cap
-// hard at 2000 tiles per sprite so we never trip E2BIG. With 21 sprites per h-tier
-// at the 41k OI scale this is fine — client loads sprites lazily anyway.
-// Per-arrayjoin-call cap (Linux MAX_ARG_STRLEN is 128 KB per argv arg, ~85-char
-// paths → ~1500 paths max). Sprites larger than this are built via chunked
-// arrayjoin: row-strip sub-atlases, then vertical arrayjoin. Sprite SIZE is
-// still capped purely by pixel budget (MAX_SPRITE_PIXELS), not tile count.
-const ARRAYJOIN_TILES_PER_CALL = parseInt(process.env.ARRAYJOIN_TILES_PER_CALL || '1000', 10);
 
 const THUMB_QUALITY    = parseInt(process.env.THUMB_QUALITY || '82', 10);
-// Originals smaller than this skip preview generation — the client uses the original directly.
-// Browsers scale well now; the only point of a "preview" is to shrink huge files.
 const SESSION_DURATION = 24 * 60 * 60 * 1000;
+const LOGIN_LINK_TTL   = 10 * 60 * 1000;
 const RP_NAME          = SITE_TITLE;
 
-// reserved on-disk names that are NOT user content
-// Each gallery folder owns a single child dir named GG_DIR for all of its derived
-// state (manifest, per-image LoDs, atlases, etc). Legacy names stay in RESERVED so any
-// pre-migration dirs remain hidden from listings forever — harmless, never recursed into.
+// Each gallery folder owns a child dir named GG_DIR holding all derived state
+// (manifest, per-image LoDs, atlases). RESERVED names are excluded from listings.
 const GG_DIR = 'gg';
-const RESERVED = new Set([GG_DIR, 'thumbcache', 'previewcache', 'ggTrash']);
+const RESERVED = new Set([GG_DIR, 'thumbcache', 'previewcache']);
 
-// Cache-busting query string for the two static client assets. Read mtime per
-// pageview (one fs.statSync per file, microseconds) so post-deploy edits get
-// picked up immediately without a server restart. Stable URL for an unchanged
-// file → browsers cache normally; URL changes the moment the file changes →
-// fresh fetch on next pageview.
+// Cache-bust static assets by mtime so edits land without a restart while
+// unchanged files stay browser-cached.
 function _assetVer(name) {
   try { return String(Math.floor(fs.statSync(path.join(PUBLIC_DIR, name)).mtimeMs)); }
   catch { return Date.now().toString(); }
@@ -102,155 +80,97 @@ const SUPPORTED_EXT = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.avif'
 // ---------- bootstrap ----------
 fs.mkdirSync(GALLERIES_ROOT, { recursive: true });
 fs.mkdirSync(STATE_DIR, { recursive: true });
-const TRASH_DIR = path.join(STATE_DIR, 'trash');
-fs.mkdirSync(TRASH_DIR, { recursive: true });
-
-// Map a gallery file path to its location inside the global trash root.
-//   /var/lib/goodgallery/galleries/wallpapers/sunset.jpg
-//      -> STATE_DIR/trash/wallpapers/sunset.jpg
-function trashSliceDir(galleryAbs) {
-  return path.join(TRASH_DIR, path.relative(GALLERIES_ROOT, galleryAbs));
+// Per-folder trash: each folder owns its own bin at <folder>/gg/trash/.
+function trashDirFor(folderAbs) {
+  return path.join(folderAbs, GG_DIR, 'trash');
 }
-function trashPathFor(galleryAbs, filename) {
-  return path.join(trashSliceDir(galleryAbs), filename);
+function isValidTrashName(name) {
+  if (!name || typeof name !== 'string') return false;
+  if (name.includes('\0') || name.includes('/') || name.includes('\\')) return false;
+  if (name === '.' || name === '..' || name.startsWith('.')) return false;
+  return true;
 }
 
-// Walk the global trash and return [{name, relPath, size, trashedAt}, ...] for every file.
-async function listAllTrash() {
-  const out = [];
-  async function walk(absDir, relPrefix) {
-    let entries;
-    try { entries = await fsp.readdir(absDir, { withFileTypes: true }); }
-    catch { return; }
-    for (const e of entries) {
-      const full = path.join(absDir, e.name);
-      const rel = relPrefix ? relPrefix + '/' + e.name : e.name;
-      if (e.isDirectory()) await walk(full, rel);
-      else if (e.isFile()) {
-        let st; try { st = await fsp.stat(full); } catch { continue; }
-        out.push({ name: e.name, relPath: rel, size: st.size, trashedAt: st.mtimeMs });
+// ---------- broken-image placeholder ----------
+// Files that vips can't parse are tracked per-folder in manifest.unbuildableImages.
+// Their tier requests are served from pre-rendered placeholder tiles so the gallery
+// shows a visible "broken image" tile instead of going dark or stalling the sprite.
+const BROKEN_SVG = path.join(PUBLIC_DIR, 'broken.svg');
+const BROKEN_DIR = path.join(STATE_DIR, '_broken');
+function brokenTilePath(height, format) {
+  return path.join(BROKEN_DIR, 'broken.h' + height + '.' + format);
+}
+let _brokenTilesP = null;
+function brokenTilesReady() {
+  if (!_brokenTilesP) _brokenTilesP = _ensureBrokenTiles().catch(e => { console.warn('[broken] generation failed:', e.message); _brokenTilesP = null; });
+  return _brokenTilesP;
+}
+async function _ensureBrokenTiles() {
+  let svgStat;
+  try { svgStat = await fsp.stat(BROKEN_SVG); }
+  catch { console.warn('[broken] missing public/broken.svg — placeholder substitution disabled'); return; }
+  await fsp.mkdir(BROKEN_DIR, { recursive: true });
+  for (const tier of LOD_TIERS) {
+    const out = brokenTilePath(tier.h, tier.format);
+    let outMtime = 0;
+    try { outMtime = (await fsp.stat(out)).mtimeMs; } catch {}
+    if (outMtime >= svgStat.mtimeMs) continue;
+    const tmp = out + '.__tmp.' + tier.format;
+    if (tier.format === 'v') {
+      const t1 = out + '.__tmp.step1.v', t2 = out + '.__tmp.step2.v';
+      await runStep('vips', ['thumbnail', BROKEN_SVG, t1, '99999', '--height', String(tier.h), '--size', 'both'], t1);
+      await runStep('vips', ['colourspace', t1, t2, 'srgb'], t2);
+      await runStep('vips', ['extract_band', t2, tmp, '0', '--n', '3'], tmp);
+      await fsp.unlink(t1).catch(()=>{});
+      await fsp.unlink(t2).catch(()=>{});
+    } else {
+      await runStep('vips', ['thumbnail', BROKEN_SVG, tmp + '[Q=' + tier.quality + ']', '99999', '--height', String(tier.h), '--size', 'both'], tmp);
+    }
+    await fsp.rename(tmp, out);
+    console.log('[broken] generated', path.basename(out));
+  }
+}
+
+async function listFolderTrash(folderAbs) {
+  // Lazy GC of any .trash-emptying-* parks left over from a prior crash.
+  const ggDir = path.join(folderAbs, GG_DIR);
+  try {
+    const sibs = await fsp.readdir(ggDir);
+    for (const s of sibs) {
+      if (s.startsWith('.trash-emptying-')) {
+        fsp.rm(path.join(ggDir, s), { recursive: true, force: true }).catch(()=>{});
       }
     }
+  } catch {}
+  const tdir = trashDirFor(folderAbs);
+  let entries;
+  try { entries = await fsp.readdir(tdir, { withFileTypes: true }); }
+  catch { return []; }
+  const out = [];
+  for (const e of entries) {
+    if (e.name.startsWith('.')) continue;
+    const full = path.join(tdir, e.name);
+    let st; try { st = await fsp.stat(full); } catch { continue; }
+    out.push({
+      name: e.name,
+      isFolder: e.isDirectory(),
+      size: e.isFile() ? st.size : null,
+      trashedAt: st.mtimeMs,
+    });
   }
-  await walk(TRASH_DIR, '');
   out.sort((a, b) => b.trashedAt - a.trashedAt);
   return out;
 }
 
-// Validate a relPath is safe (no '..', no leading '/', etc.) and resolves under TRASH_DIR.
-function safeTrashPath(relPath) {
-  if (!relPath || typeof relPath !== 'string') return null;
-  if (relPath.includes('\0')) return null;
-  const segs = relPath.split('/').filter(Boolean);
-  if (segs.some(s => s === '..' || s === '.' || s.startsWith('.'))) return null;
-  const abs = path.resolve(TRASH_DIR, ...segs);
-  if (!abs.startsWith(TRASH_DIR + path.sep) && abs !== TRASH_DIR) return null;
-  return abs;
-}
-
-// Migrate any legacy <gallery>/ggTrash/<file> contents into the global trash on startup.
-async function migrateLegacyTrash() {
-  let migrated = 0;
-  async function walk(dir) {
-    let entries;
-    try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { return; }
-    for (const e of entries) {
-      if (e.name.startsWith('.')) continue;
-      const full = path.join(dir, e.name);
-      if (e.isDirectory()) {
-        if (e.name === 'ggTrash') {
-          const galleryAbs = dir;
-          const newDir = trashSliceDir(galleryAbs);
-          await fsp.mkdir(newDir, { recursive: true });
-          for (const f of await fsp.readdir(full)) {
-            try {
-              await fsp.rename(path.join(full, f), path.join(newDir, f));
-              migrated++;
-            } catch {}
-          }
-          try { await fsp.rmdir(full); } catch {}
-        } else if (e.name !== 'thumbcache' && e.name !== 'previewcache' && e.name !== '_sprite_staging') {
-          await walk(full);
-        }
-      }
-    }
-  }
-  await walk(GALLERIES_ROOT);
-  if (migrated) console.log(`Migrated ${migrated} legacy ggTrash file(s) to global trash.`);
-}
-
-// Idempotent: rename every gallery's legacy `thumbcache/` to `gg/`. Run at startup so
-// deployment is "just restart"; safe to re-run because it only renames when `thumbcache/`
-// exists AND `gg/` does not. Walks every nested gallery folder. Skips reserved names so
-// it doesn't descend into existing gg/, the legacy thumbcache itself, etc.
-async function migrateLegacyThumbcache() {
-  let migrated = 0;
-  async function checkAndRecurse(galleryAbs) {
-    const legacy = path.join(galleryAbs, 'thumbcache');
-    const target = path.join(galleryAbs, GG_DIR);
-    if (fs.existsSync(legacy) && !fs.existsSync(target)) {
-      try { await fsp.rename(legacy, target); migrated++; }
-      catch (e) { console.warn('[migrate-gg]', legacy, e.message); }
-    }
-    let entries;
-    try { entries = await fsp.readdir(galleryAbs, { withFileTypes: true }); } catch { return; }
-    for (const e of entries) {
-      if (!e.isDirectory()) continue;
-      if (e.name.startsWith('.')) continue;
-      if (RESERVED.has(e.name)) continue;
-      await checkAndRecurse(path.join(galleryAbs, e.name));
-    }
-  }
-  await checkAndRecurse(GALLERIES_ROOT);
-  if (migrated) console.log(`Migrated ${migrated} thumbcache->${GG_DIR} dir(s).`);
-}
-
-
-// Recognize tmp files left behind by killed write paths. Sweep these on startup and on
-// maintenance ops. Keep this function in one place so every writer pays the same tax.
+// Tmp suffixes left by killed atomic-writes; sweepFolderTmps cleans them up.
 function isOrphanTmp(name) {
-  // Any '.__tmp.<format>' (jpg, v, etc.) or legacy '.tmp' are sweep-eligible orphans.
   return /\.__tmp\.[^/]+$/.test(name) || name.endsWith('.tmp');
 }
 
-async function sweepOrphanTmps(rootDir) {
-  let removed = 0;
-  async function walk(dir) {
-    let entries;
-    try { entries = await fsp.readdir(dir, { withFileTypes: true }); }
-    catch { return; }
-    for (const e of entries) {
-      if (e.name.startsWith('.')) continue;
-      const full = path.join(dir, e.name);
-      if (e.isDirectory()) { await walk(full); continue; }
-      if (e.isFile() && isOrphanTmp(e.name)) {
-        try { await fsp.unlink(full); removed++; } catch {}
-      }
-    }
-  }
-  await walk(rootDir);
-  // Also sweep stale state-dir tmps (passkey.json.tmp etc.)
-  try {
-    for (const e of await fsp.readdir(STATE_DIR)) {
-      if (isOrphanTmp(e)) { try { await fsp.unlink(path.join(STATE_DIR, e)); removed++; } catch {} }
-    }
-  } catch {}
-  return removed;
-}
-
-
 // ---------- build queue ----------
-// Server-side build orchestration. Replaces the 2014 PHP-era pattern where the browser
-// looped against ?buildall=1 to babysit a per-request executor. Node is a long-running
-// process: it can own the queue, watch the filesystem, and just *do* the work.
-//
-// Design rules:
-//   - Concurrency = number of CPUs (overridable via BUILD_CONCURRENCY env). vips itself is single-threaded per process, so saturating cores with N parallel children is the right move on a build-dedicated box.
-//   - Per (folder,file) dedupe — repeated triggers for the same file collapse into one job.
-//   - Idempotent — if the thumb already exists ensureBuilt is a no-op.
-//   - Crash-safe — atomicity is enforced inside ensureBuilt; the queue itself is in-memory
-//     and is rebuilt from disk state on the next startup scan, so a process kill loses
-//     only the in-memory progress counters, never on-disk integrity.
+// Concurrency = N CPUs (vips is single-threaded per process). Per-(folder,file)
+// dedupe collapses repeated triggers. ensureBuilt is idempotent + atomic, so a
+// process kill loses only in-memory progress counters, never on-disk integrity.
 import os from 'os';
 const BUILD_CONCURRENCY = parseInt(process.env.BUILD_CONCURRENCY || '0', 10) || os.cpus().length;
 
@@ -281,15 +201,18 @@ class BuildQueue {
   async enqueueFolder(galleryAbs, opts) {
     const phase = (opts && opts.phase) || 'all';
     const { images } = await listFolder(galleryAbs);
+    const m = await loadManifest(galleryAbs).catch(() => ({}));
+    const unbuildable = new Set(Array.isArray(m.unbuildableImages) ? m.unbuildableImages : []);
     let n = 0;
     for (const f of images) {
+      if (unbuildable.has(f)) continue;
       if (!needsBuildForPhase(galleryAbs, f, phase)) continue;
       if (this.enqueue(galleryAbs, f, opts)) n++;
     }
+    if (n > 0) markFolderDirty(galleryAbs).catch(()=>{});
     return n;
   }
-  // Resolves once the queue is fully drained (no pending, no in-flight workers).
-  // Useful between phases of the startup scan.
+  // Resolves once the queue is fully drained.
   drainPromise() {
     return new Promise((resolve) => {
       const tick = () => {
@@ -321,18 +244,43 @@ class BuildQueue {
         } catch (e) {
           this._bumpProgress(galleryAbs, p => { p.lastError = filename + ': ' + e.message; });
           console.warn('[build]', filename, 'in', galleryAbs, '-', e.message);
+          // Permanently bad source: mark unbuildable so sprite build skips it
+          // and serving substitutes the placeholder. Full Rescan resets the list.
+          manifestAddUnbuildable(galleryAbs, filename).catch(()=>{});
         } finally {
           this._bumpProgress(galleryAbs, p => { p.inProgress--; });
           this.inFlight.delete(k);
-          // When the folder's queue drains, schedule (debounced) a sprite rebuild.
-          // Multiple drains in quick succession collapse into one rebuild after quiet.
+          // Debounced sprite rebuild on folder drain.
           const after = this.progress.get(galleryAbs);
           if (after && after.pending === 0 && after.inProgress === 0 && after.total > 0) {
             scheduleSpriteBuild(galleryAbs);
           }
+          markFolderCleanIfIdle(galleryAbs).catch(()=>{});
         }
       }
     } finally { this.workers--; }
+  }
+  // Drop all queued (not-yet-started) work and clear inFlight markers for
+  // them so a later enqueue can re-add. Workers currently inside _runOne keep
+  // running — interrupting a half-written tile would orphan a .__tmp file.
+  // Returns the count of queued items dropped.
+  clear() {
+    const dropped = this.queue.length;
+    // Remove inFlight markers for items still in the queue (not yet picked up).
+    for (const job of this.queue) {
+      const k = this._key(job.galleryAbs, job.filename, job.phase);
+      this.inFlight.delete(k);
+    }
+    // Bulk-decrement pending counts per gallery.
+    const perGallery = new Map();
+    for (const job of this.queue) {
+      perGallery.set(job.galleryAbs, (perGallery.get(job.galleryAbs) || 0) + 1);
+    }
+    for (const [g, n] of perGallery) {
+      this._bumpProgress(g, p => { p.pending -= n; p.total -= n; if (p.pending < 0) p.pending = 0; if (p.total < 0) p.total = 0; });
+    }
+    this.queue.length = 0;
+    return dropped;
   }
   progressFor(galleryAbs) {
     const p = this.progress.get(galleryAbs);
@@ -355,24 +303,60 @@ class BuildQueue {
   }
 }
 
-const buildQueue = new BuildQueue(BUILD_CONCURRENCY);
+// ---------- crash-recovery: per-folder dirty flag ----------
+// Each manifest carries a 'building' flag set at start-of-build and cleared
+// when the folder is fully idle. On read, building=true + not-currently-busy
+// means a previous process died mid-build: sweep .__tmp files and re-enqueue.
 
-// ---------- no filesystem watcher ----------
-// fs.watch(root, { recursive: true }) on Linux re-walks the tree on every event to
-// keep its inotify watch set in sync. With a 100k-entry thumbcache and constant
-// vips writes, that meant ~90% of one Node core was spent in libuv getdents64 — and
-// the event loop was starved enough that a pageview to '/' could take 16 seconds.
-// (Measured 2026-05-01.) Killing the watcher dropped Node CPU 109%->16% and 30x'd
-// vips throughput. The uploader writes files we already know about; rsync drops are
-// rare and pick up via the admin "Full rescan" button instead.
+async function sweepFolderTmps(thumbDir) {
+  let entries;
+  try { entries = await fsp.readdir(thumbDir); } catch { return 0; }
+  let removed = 0;
+  for (const e of entries) {
+    if (isOrphanTmp(e)) {
+      try { await fsp.unlink(path.join(thumbDir, e)); removed++; } catch {}
+    }
+  }
+  return removed;
+}
+
+function isFolderBusy(galleryAbs) {
+  const p = buildQueue ? buildQueue.progressFor(galleryAbs) : null;
+  if (p && (p.pending > 0 || p.inProgress > 0)) return true;
+  if (spriteInFlight && spriteInFlight.has(galleryAbs)) return true;
+  if (spriteDebounceTimers && spriteDebounceTimers.has(galleryAbs)) return true;
+  return false;
+}
+
+async function markFolderDirty(galleryAbs) {
+  const m = await loadManifest(galleryAbs);
+  if (m.building) return;
+  m.building = true;
+  try { await writeManifest(galleryAbs, m); } catch (e) { console.warn('[markDirty]', galleryAbs, e.message); }
+}
+
+async function markFolderCleanIfIdle(galleryAbs) {
+  if (isFolderBusy(galleryAbs)) return;
+  const m = manifestCache.get(galleryAbs);
+  if (!m || !m.building) return;
+  m.building = false;
+  try { await writeManifest(galleryAbs, m); } catch (e) { console.warn('[markClean]', galleryAbs, e.message); }
+}
+
+const buildQueue = new BuildQueue(BUILD_CONCURRENCY);
+let fullrescanInProgress = false;
+
+// No filesystem watcher: recursive fs.watch re-walks the tree on every event,
+// which costs an entire core's worth of getdents64 once thumbcaches get large.
+// The uploader writes files we already know about; rsync drops are picked up
+// via the admin "Full rescan" button.
 
 // ---------- in-memory state ----------
 const sessions         = new Map();  // token -> { createdAt }
 const pendingChallenges = new Map(); // chalId -> { challenge, timestamp }
+const loginLinks       = new Map(); // token -> { createdAt } — single-use, 10min TTL
 
-// Persist sessions across server restarts. Without this, every restart silently
-// invalidates every admin's localStorage token, leaving the UI in a confused state
-// where the client believes it's logged in but every admin call returns 401.
+// Persist sessions so a restart doesn't 401 everyone whose cookie is still valid.
 const SESSIONS_FILE = path.join(STATE_DIR, 'sessions.json');
 function loadSessions() {
   try {
@@ -380,7 +364,10 @@ function loadSessions() {
     const obj = JSON.parse(raw);
     const now = Date.now();
     for (const [tok, data] of Object.entries(obj)) {
-      if (now - data.createdAt < SESSION_DURATION) sessions.set(tok, data);
+      if (now - data.createdAt < SESSION_DURATION) {
+        if (!data.origin) data.origin = 'passkey';
+        sessions.set(tok, data);
+      }
     }
     if (sessions.size) console.log(`Restored ${sessions.size} admin session(s) from disk.`);
   } catch {}
@@ -399,6 +386,7 @@ setInterval(() => {
   const now = Date.now();
   for (const [k, v] of pendingChallenges) if (now - v.timestamp > 5 * 60 * 1000) pendingChallenges.delete(k);
   for (const [k, v] of sessions)         if (now - v.createdAt  > SESSION_DURATION) sessions.delete(k);
+  for (const [k, v] of loginLinks)       if (now - v.createdAt  > LOGIN_LINK_TTL)   loginLinks.delete(k);
 }, 60 * 1000);
 
 // ---------- helpers ----------
@@ -406,7 +394,6 @@ function hxEscape(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 function jsString(s) {
-  // safe to drop into a JS double-quoted string literal
   return JSON.stringify(String(s));
 }
 function parseCookies(h) {
@@ -415,7 +402,14 @@ function parseCookies(h) {
   for (const part of h.split(';')) {
     const i = part.indexOf('=');
     if (i < 0) continue;
-    out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+    const k = part.slice(0, i).trim();
+    const raw = part.slice(i + 1).trim();
+    // decodeURIComponent throws URIError on malformed %-escapes (e.g.
+    // `Cookie: x=%`), which would otherwise crash the request handler and
+    // hand an anonymous DoS to any client. Fall back to the raw value —
+    // our own cookies (ggSession base64url) contain no percent-escapes.
+    try { out[k] = decodeURIComponent(raw); }
+    catch { out[k] = raw; }
   }
   return out;
 }
@@ -432,8 +426,8 @@ function sendText(res, code, text, type = 'text/plain; charset=utf-8') {
 function notFound(res, msg = 'not found') { sendText(res, 404, msg); }
 function badRequest(res, msg = 'bad request') { sendText(res, 400, msg); }
 
-// safely resolve a URL path (already URL-decoded segments) to an absolute path under GALLERIES_ROOT.
-// returns null if the path escapes the root or contains reserved/hidden segments.
+// Resolve URL segments to an absolute path under GALLERIES_ROOT.
+// Returns null on traversal, dotfiles, control chars, or reserved names.
 function resolveGallery(segments, { allowReserved = false } = {}) {
   for (const s of segments) {
     if (!s) continue;
@@ -489,11 +483,10 @@ async function listFolder(absDir) {
 }
 
 // ---------- per-gallery manifest cache ----------
-// Pageviews must NEVER do `readdir` on the gallery dir. Instead they read a tiny
-// JSON file whose contents we keep mirrored in RAM. The manifest is mutated
-// incrementally by every code path that already knows what changed (uploader,
-// trash, restore, mkdir). Full rescan is the only thing that ever readdir's a
-// gallery during normal operation; it's behind an admin button.
+// Pageviews read a tiny JSON manifest mirrored in RAM, never readdir on the
+// gallery dir. Mutations (upload/trash/restore/mkdir) update the manifest
+// in-place. Full Rescan (admin button) is the only path that readdir's during
+// normal operation.
 const MANIFEST_VERSION = 1;
 const manifestCache = new Map(); // galleryAbs -> { version, builtAt, folders, images }
 const _natCmp = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' }).compare;
@@ -502,12 +495,13 @@ function manifestPathFor(galleryAbs) {
   return path.join(galleryAbs, GG_DIR, '_manifest.json');
 }
 
-// Always-allowed: this readdir runs cold (full rescan / first-time index / startup
-// warm) — never on a hot pageview path. Cost is paid at most once per gallery per
-// process lifetime.
+// Cold-path only: full rescan or first-time index, never the hot pageview path.
 async function buildManifestFromDisk(galleryAbs) {
   const { folders, images } = await listFolder(galleryAbs);
-  return { version: MANIFEST_VERSION, builtAt: Date.now(), folders, images };
+  // Read hidden state from disk sentinels so a cold build (first index or
+  // post-delete recovery) picks up any pre-existing <folder>/gg/hidden files.
+  const hiddenFolders = await readHiddenSentinels(galleryAbs, folders);
+  return { version: MANIFEST_VERSION, builtAt: Date.now(), folders, images, hiddenFolders };
 }
 
 async function writeManifest(galleryAbs, m) {
@@ -521,7 +515,6 @@ async function writeManifest(galleryAbs, m) {
 async function loadManifest(galleryAbs) {
   const cached = manifestCache.get(galleryAbs);
   if (cached) return cached;
-  // Try disk — one tiny readFile is allowed on cold-cache pageview.
   try {
     const raw = await fsp.readFile(manifestPathFor(galleryAbs), 'utf8');
     const m = JSON.parse(raw);
@@ -530,14 +523,13 @@ async function loadManifest(galleryAbs) {
       return m;
     }
   } catch {}
-  // Last resort: this gallery was never indexed. Build, persist, cache. The readdir
-  // cost is paid exactly once for this gallery's lifetime in this process.
+  // Cold gallery: readdir once, persist, cache.
   const m = await buildManifestFromDisk(galleryAbs);
   await writeManifest(galleryAbs, m);
   return m;
 }
 
-// Insort into a natural-numeric-sorted array. Returns true if inserted, false if dup.
+// Insort into a natural-numeric-sorted array; returns false on dup.
 function insortUnique(arr, name) {
   let lo = 0, hi = arr.length;
   while (lo < hi) {
@@ -557,14 +549,23 @@ function spliceName(arr, name) {
   return true;
 }
 
-// Mutation helpers. Best-effort: log + swallow errors so a manifest write failure
-// never breaks the user-visible operation. Drift gets fixed by the admin Full
-// rescan button.
+// Best-effort mutations: log + swallow on write failure. Drift is corrected
+// by Full Rescan.
 async function manifestAddImage(galleryAbs, name) {
   try {
     const m = await loadManifest(galleryAbs);
-    if (insortUnique(m.images, name)) { m.builtAt = Date.now(); await writeManifest(galleryAbs, m); }
+    let dirty = insortUnique(m.images, name);
+    // Re-uploading a previously-broken file should let it retry.
+    if (Array.isArray(m.unbuildableImages) && spliceName(m.unbuildableImages, name)) dirty = true;
+    if (dirty) { m.builtAt = Date.now(); await writeManifest(galleryAbs, m); }
   } catch (e) { console.warn('[manifest:addImage]', galleryAbs, name, e.message); }
+}
+async function manifestAddUnbuildable(galleryAbs, name) {
+  try {
+    const m = await loadManifest(galleryAbs);
+    if (!Array.isArray(m.unbuildableImages)) m.unbuildableImages = [];
+    if (insortUnique(m.unbuildableImages, name)) { m.builtAt = Date.now(); await writeManifest(galleryAbs, m); }
+  } catch (e) { console.warn('[manifest:addUnbuildable]', galleryAbs, name, e.message); }
 }
 async function manifestRemoveImage(galleryAbs, name) {
   try {
@@ -585,75 +586,96 @@ async function manifestRemoveFolder(galleryAbs, name) {
   } catch (e) { console.warn('[manifest:removeFolder]', galleryAbs, name, e.message); }
 }
 
+// Hidden state is canonical on disk as <folder>/gg/hidden (empty sentinel
+// file). Manifest still caches hiddenFolders for O(1) pageview reads, but a
+// full rebuild can derive it fresh from disk without merging old state in.
+async function readHiddenSentinels(galleryAbs, folderNames) {
+  const hidden = [];
+  for (const name of folderNames) {
+    try {
+      await fsp.access(path.join(galleryAbs, name, GG_DIR, 'hidden'));
+      hidden.push(name);
+    } catch {}
+  }
+  hidden.sort();
+  return hidden;
+}
+
+// Hidden folders are filtered from the public folder grid but stay reachable
+// by direct URL. Source of truth is the disk sentinel; this updates that
+// sentinel first, then mirrors the change into the cached hiddenFolders array.
+async function manifestSetHidden(galleryAbs, name, hide) {
+  const ggDir = path.join(galleryAbs, name, GG_DIR);
+  const sentinel = path.join(ggDir, 'hidden');
+  try {
+    if (hide) {
+      await fsp.mkdir(ggDir, { recursive: true });
+      await fsp.writeFile(sentinel, '');
+    } else {
+      await fsp.unlink(sentinel).catch(() => {});
+    }
+  } catch (e) {
+    console.warn('[manifest:setHidden:sentinel]', galleryAbs, name, e.message);
+    return;
+  }
+  try {
+    const m = await loadManifest(galleryAbs);
+    if (!Array.isArray(m.hiddenFolders)) m.hiddenFolders = [];
+    const idx = m.hiddenFolders.indexOf(name);
+    if (hide && idx < 0) { m.hiddenFolders.push(name); m.hiddenFolders.sort(); }
+    else if (!hide && idx >= 0) { m.hiddenFolders.splice(idx, 1); }
+    else return; // no change
+    m.builtAt = Date.now();
+    await writeManifest(galleryAbs, m);
+  } catch (e) { console.warn('[manifest:setHidden]', galleryAbs, name, e.message); }
+}
+
 // Rebuild from disk (drift correction). Used by Full Rescan.
 async function rebuildManifest(galleryAbs) {
+  // Preserve admin-set fields that aren't derivable from listFolder().
+  const existing = await loadManifest(galleryAbs).catch(() => ({}));
   const m = await buildManifestFromDisk(galleryAbs);
+  // Migration: any legacy hiddenFolders entry that still refers to a real
+  // subfolder gets its sentinel stamped now. Stale names (folders that no
+  // longer exist on disk) are dropped silently — don't materialize garbage
+  // dirs for them. Run after buildManifestFromDisk so we know the live set.
+  if (Array.isArray(existing.hiddenFolders) && existing.hiddenFolders.length > 0) {
+    const live = new Set(m.folders);
+    for (const name of existing.hiddenFolders) {
+      if (!live.has(name)) continue;
+      try {
+        const ggDir = path.join(galleryAbs, name, GG_DIR);
+        await fsp.mkdir(ggDir, { recursive: true });
+        const sentinel = path.join(ggDir, 'hidden');
+        try { await fsp.access(sentinel); }
+        catch { await fsp.writeFile(sentinel, ''); }
+      } catch (e) {
+        console.warn('[manifest:rebuild:hidden-migrate]', galleryAbs, name, e.message);
+      }
+    }
+  }
+  m.hiddenFolders = await readHiddenSentinels(galleryAbs, m.folders);
+  if (existing.building) m.building = existing.building;
   await writeManifest(galleryAbs, m);
   return m;
 }
 
-// Warm pass at startup: walk the tree once and ensure every gallery folder has a
-// manifest on disk. Skips folders that already have one (trust it; rescan fixes drift).
-// Reuses listFolder for the walk — paid once at startup.
-async function warmManifests(rootAbs) {
-  let built = 0;
-  async function walk(dir) {
-    let entries;
-    try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { return; }
-    const subdirs = [];
-    let hasContent = false;
-    for (const e of entries) {
-      if (e.name.startsWith('.')) continue;
-      if (e.isDirectory()) {
-        if (!RESERVED.has(e.name)) { subdirs.push(e.name); hasContent = true; }
-      } else if (e.isFile() && isImage(e.name)) {
-        hasContent = true;
-      }
-    }
-    if (hasContent && !fs.existsSync(manifestPathFor(dir))) {
-      try { await rebuildManifest(dir); built++; }
-      catch (e) { console.warn('[warmManifests]', dir, e.message); }
-    }
-    for (const sub of subdirs) await walk(path.join(dir, sub));
-  }
-  // Root itself counts as a gallery.
-  if (!fs.existsSync(manifestPathFor(rootAbs))) {
-    try { await rebuildManifest(rootAbs); built++; }
-    catch (e) { console.warn('[warmManifests:root]', e.message); }
-  }
-  await walk(rootAbs);
-  if (built) console.log(`Built ${built} initial manifest(s).`);
-}
 
-// ---------- image build via vipsthumbnail ----------
-// vipsthumbnail handles sizing + orientation + JPEG output. Atomic via .tmp rename.
-// Preserve-aspect thumb (used for previews of large originals).
-function vipsThumb(srcAbs, dstAbs, dim, quality) {
-  return new Promise((resolve, reject) => {
-    const tmp = dstAbs + '.__tmp.jpg';
-    const args = [
-      srcAbs,
-      '--size', `${dim}x${dim}>`,
-      '--output', `${tmp}[Q=${quality},strip,optimize_coding,interlace]`,
-    ];
-    runVips('vipsthumbnail', args, tmp, dstAbs).then(resolve, reject);
-  });
-}
-
-// Fixed-height, variable-width thumb (preserve aspect ratio). Matches the user's
-// preferred 2014/testgallery look — rows of thumbs at uniform height, no cropping.
-// Sprite atlas was tried but disabled because uniform-cell tiling required cover-cropping
-// every thumb to a square, which loses information at the edges of every image.
-// HTTP/2 multiplexing + 50/page pagination makes per-thumb requests fast enough.
-// Lossless .v intermediate (libvips raw native format, gd2 analog). Resizing is the
-// expensive operation — we want each per-image resize to be its own atomic, idempotent,
-// LOSSLESS unit. Sprite assembly memmaps these with ~zero decode cost. Note: the
-// op-style 'vips thumbnail' is reliable; 'vipsthumbnail --output X.v' silently no-ops.
+// ---------- image build via libvips ----------
+// Per-image LoDs written via tmp+rename for atomicity. AVIF for displayable
+// tiers; lossless .v for atlas-input tiers so packing is decode-free.
+// libheif enforces a per-axis cap on AVIF saves (16384 on this build; HEIF
+// spec ceiling). Passing this as the vips thumbnail max-width means extreme-
+// wide panoramas land slightly under the nominal tier height — e.g. an
+// h1600 of a 46592×3720 image becomes 1308×16384 instead of failing
+// outright. The tier filename still says "h1600"; the renderer uses that as
+// an identifier, not a literal dimension promise.
+const AVIF_MAX_DIM = parseInt(process.env.AVIF_MAX_DIM || '16384', 10);
 function vipsHeightThumbAVIF(srcAbs, dstAbs, height, quality) {
   return new Promise((resolve, reject) => {
     const tmp = dstAbs + '.__tmp.avif';
     const args = [
-      'thumbnail', srcAbs, tmp + '[Q=' + quality + ']', '99999',
+      'thumbnail', srcAbs, tmp + '[Q=' + quality + ']', String(AVIF_MAX_DIM),
       '--height', String(height),
       '--size', 'down',
     ];
@@ -663,34 +685,35 @@ function vipsHeightThumbAVIF(srcAbs, dstAbs, height, quality) {
   });
 }
 
-// Build a height-targeted .v thumbnail and force the output to exactly 3 bands
-// (sRGB, no alpha). vips arrayjoin requires uniform band count across all
-// inputs and explodes with 'not one band or 4 bands' on a mixed set
-// (e.g. RGB JPGs + RGBA PNGs). Pipeline:
-//   thumbnail → colourspace srgb (gray→RGB, RGB→RGB, RGBA→RGBA)
-//             → extract_band 0 n=3 (drops alpha if present, keeps RGB)
+// Build a .v thumb in a single vipsthumbnail call. Three wins over the prior
+// three-spawn (thumbnail → colourspace srgb → extract_band) pipeline:
+//   1. One process spawn instead of three. vips startup is ~65 ms; saving two
+//      spawns is ~130 ms per build at the cheapest tiers (h5..h100).
+//   2. vipsthumbnail uses libjpeg shrink-on-load, decoding JPEGs at 1/2, 1/4,
+//      or 1/8 native resolution without fully decompressing. h100 from a 5000-
+//      wide JPEG decodes ~8x faster.
+//   3. No intermediate .v files on disk between steps. Less ZFS write traffic.
+//
+// Band normalization (forcing exactly 3 bands) used to be done via extract_band.
+// We drop that step entirely: the sprite atlas packer (`packAtlasBuffer` in
+// sprite_worker.js) already handles 1, 3, and 4-band raw .v inputs and copies
+// them into a 3-band RGB atlas on the fly. The on-disk .v can be whatever vips
+// produced; the consumer normalizes at pack time.
 function vipsHeightThumbV(srcAbs, dstAbs, height) {
   return new Promise((resolve, reject) => {
-    const t1 = dstAbs + '.__tmp.step1.v';
-    const t2 = dstAbs + '.__tmp.step2.v';
-    const tFinal = dstAbs + '.__tmp.v';
-    runStep('vips', [
-      'thumbnail', srcAbs, t1, '99999',
-      '--height', String(height),
-      '--size', 'down',
-    ], t1).then(() =>
-      runStep('vips', ['colourspace', t1, t2, 'srgb'], t2)
-    ).then(() =>
-      runStep('vips', ['extract_band', t2, tFinal, '0', '--n', '3'], tFinal)
-    ).then(() => {
-      fs.promises.unlink(t1).catch(()=>{});
-      fs.promises.unlink(t2).catch(()=>{});
-      return fs.promises.rename(tFinal, dstAbs);
-    }).then(resolve, reject);
+    const tmp = dstAbs + '.__tmp.v';
+    runStep('vipsthumbnail', [
+      srcAbs,
+      '--size', '99999x' + height,
+      '--export-profile', 'srgb',
+      '-o', tmp,
+    ], tmp).then(() =>
+      fs.promises.rename(tmp, dstAbs).then(resolve, reject)
+    ).catch(reject);
   });
 }
 
-// Run a vips subcommand; verify the named output file exists; bubble useful diagnostics.
+// Run a vips subcommand and verify expectedOutput exists.
 function runStep(cmd, args, expectedOutput) {
   return new Promise((resolve, reject) => {
     const proc = spawn(cmd, args);
@@ -709,28 +732,11 @@ function runStep(cmd, args, expectedOutput) {
   });
 }
 
-function runVips(cmd, args, tmp, finalPath) {
-  return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args);
-    let err = '';
-    p.stderr.on('data', d => { err += d; });
-    p.on('error', reject);
-    p.on('close', code => {
-      if (code !== 0) { fs.promises.unlink(tmp).catch(()=>{}); reject(new Error(`${cmd} failed: ` + err.trim())); return; }
-      fs.promises.rename(tmp, finalPath).then(resolve, reject);
-    });
-  });
-}
-
-// True iff at least one tier for the given phase is missing on disk for this image.
-// Used by enqueueFolder to filter out images that have nothing to do for the phase,
-// so the user-facing pending count doesn't include 'fake' work that would just be a
-// no-op fs.existsSync chain.
+// Does `tier` match `phase`? phase is 'all' | 'v' | 'avif' | 'h<N>'.
 function phaseAccepts(phase, tier) {
   if (!phase || phase === 'all') return true;
   if (phase === 'v') return tier.format === 'v';
   if (phase === 'avif') return tier.format === 'avif';
-  // 'h5' / 'h10' / 'h50' / etc. — the specific atlas-input tier.
   if (phase.charCodeAt(0) === 104 /* 'h' */) {
     return tier.h === parseInt(phase.slice(1), 10);
   }
@@ -748,8 +754,6 @@ function needsBuildForPhase(folderAbs, filename, phase) {
 
 async function ensureBuilt(folderAbs, filename, opts) {
   if (!isImage(filename)) throw new Error('unsupported');
-  // phase: 'h5' / 'h10' / 'h50' (one specific atlas-input tier), 'v' (all
-  //        atlas-input .v tiers), 'avif' (per-image AVIF tiers), 'all' (everything).
   const phase = (opts && opts.phase) || 'all';
   const src = path.join(folderAbs, filename);
   let st;
@@ -775,27 +779,7 @@ async function ensureBuilt(folderAbs, filename, opts) {
 }
 
 
-
-// Parse libvips .v file header. Layout (little-endian after a 4-byte magic):
-//   offset 4: uint32 width, offset 8: uint32 height
-function readVipsHeader(absPath) {
-  let fd;
-  try {
-    fd = fs.openSync(absPath, 'r');
-    const buf = Buffer.alloc(16);
-    const n = fs.readSync(fd, buf, 0, 16, 0);
-    if (n < 16) return null;
-    const w = buf.readUInt32LE(4);
-    const h = buf.readUInt32LE(8);
-    if (w <= 0 || h <= 0 || w > 100000 || h > 100000) return null;
-    return { w, h };
-  } catch { return null; }
-  finally { if (fd !== undefined) try { fs.closeSync(fd); } catch {} }
-}
-
-// Read JPEG width/height by parsing the SOF marker. Avoids spawning a subprocess per
-// thumbnail to discover its dims (which we need at sprite-build time for variable-width
-// cell layout).
+// JPEG width/height by parsing the SOF marker — no subprocess.
 function readJpegDims(absPath) {
   let buf;
   try { buf = fs.readFileSync(absPath); } catch { return null; }
@@ -818,9 +802,7 @@ function readJpegDims(absPath) {
 }
 
 // ---------- sprite atlas ----------
-// In-memory cache: spriteMeta lives in RAM after first read. Per-page-view cost drops
-// from one syscall + JSON.parse to a Map.get(). On write we proactively update the cache
-// so the next pageview is hot. Process restart loses the cache; the first request rebuilds.
+// spriteMeta is cached in RAM after first read so pageviews skip the disk JSON.
 const spriteMetaCache = new Map(); // galleryAbs -> meta (or null if file is missing)
 
 async function readSpriteMeta(galleryAbs) {
@@ -834,333 +816,112 @@ async function readSpriteMeta(galleryAbs) {
   return meta;
 }
 
+// Strict check: sprite matches the manifest AND is the current version. Used
+// to decide whether maybeBuildSprite should re-run the worker.
 function spriteIsCurrent(meta, images, galleryAbs) {
-  if (!meta || meta.version !== 3 || !meta.atlases) return false;
+  if (!meta || meta.version !== 5 || !meta.atlases) return false;
+  if (meta.imageCount !== images.length) return false;
+  if (!fs.existsSync(path.join(galleryAbs, GG_DIR, '_imagemap.bin'))) return false;
+  return true;
+}
+// TEMPORARY (added 2026-05-12 for the v3 → v4 sprite migration when h100
+// was promoted to an atlas tier). Looser than spriteIsCurrent so we can keep
+// serving the existing v3 atlases (h5/h10/h50 only) to the client while v4
+// atlases are being built in the background. v3 atlases are coherent; the
+// client just falls back to per-image AVIFs for h100+ zooms during the gap.
+//
+// REMOVE THIS once every gallery is rebuilt to v4 (no 'v=3' rows in the
+// _sprite.json inventory). At that point, replace the pageview call site with
+// spriteIsCurrent and delete this function. See TODO.md "v3 sprite cleanup".
+function spriteIsServable(meta, images, galleryAbs) {
+  if (!meta || !meta.atlases || typeof meta.version !== 'number' || meta.version < 3) return false;
   if (meta.imageCount !== images.length) return false;
   if (!fs.existsSync(path.join(galleryAbs, GG_DIR, '_imagemap.bin'))) return false;
   return true;
 }
 
-
-async function writeBinaryImagemap(thumbDir, images, aspects) {
-  const enc = new TextEncoder();
-  const nameBytes = images.map(n => enc.encode(n));
-  const widths = images.map((_, i) => Math.min(65535, Math.round(aspects[i] * 200)));
-  const namesTotal = nameBytes.reduce((sum, b) => sum + b.length + 1, 0);
-  const buf = Buffer.alloc(12 + 2 * images.length + namesTotal);
-  buf.write('GGMP', 0, 'ascii');
-  buf.writeUInt16LE(1, 4);
-  buf.writeUInt16LE(0, 6);
-  buf.writeUInt32LE(images.length, 8);
-  for (let i = 0; i < images.length; i++) buf.writeUInt16LE(widths[i], 12 + 2 * i);
-  let pos = 12 + 2 * images.length;
-  for (let i = 0; i < images.length; i++) {
-    buf.set(nameBytes[i], pos);
-    pos += nameBytes[i].length;
-    buf[pos++] = 0;
-  }
-  const dst = path.join(thumbDir, '_imagemap.bin');
-  await fsp.writeFile(dst + '.tmp', buf);
-  await fsp.rename(dst + '.tmp', dst);
-}
-
-async function buildSpriteForFolder(galleryAbs) {
-  const m = await loadManifest(galleryAbs);
-  const images = m.images;
-  if (images.length === 0) return null;
-  const thumbDir = path.join(galleryAbs, GG_DIR);
-  // Idempotent: if a current sprite already exists, skip the rebuild. Lets us call
-  // this on every gallery at startup without paying for the (expensive) atlas
-  // operations when nothing changed.
-  const existing = await readSpriteMeta(galleryAbs);
-  if (spriteIsCurrent(existing, images, galleryAbs)) return existing;
-  const SPRITE_CELL_W_MAX = parseInt(process.env.SPRITE_CELL_W_MAX || '600', 10);
-
-  // Atlases at every LoD height we have. Small heights use lossless .v inputs
-  // (instant decode); H=200 uses the AVIF tier.
-  // Sprites only at the small heights — at higher zoom levels the canvas displays
-  // few enough images that loading them individually as AVIF is faster than packing
-  // a giant atlas.
-  const ATLAS_HEIGHTS = LOD_TIERS
-    .filter(t => [5, 10, 50].includes(t.h))
-    .map(t => ({ h: t.h, format: t.format }));
-
-  // Verify every image has every atlas-input tier on disk; bail otherwise (queue retries).
-  for (const f of images) {
-    for (const at of ATLAS_HEIGHTS) {
-      if (!fs.existsSync(lodPath(thumbDir, f, at.h, at.format))) return null;
-    }
-  }
-
-  // Read aspect ratio from the cheapest tier (h50.v has a libvips header). All other
-  // tiers preserve the same aspect, so widths at any H = aspect * H.
-  const aspects = images.map(f => {
-    const d = readVipsHeader(lodPath(thumbDir, f, 50, 'v'));
-    return d ? d.w / 50 : 1.6;
-  });
-
-  // Build each atlas height into its own set of sprite-h<H>-<N>.jpg files
-  const atlases = {};
-  for (const at of ATLAS_HEIGHTS) {
-    atlases[String(at.h)] = await buildAtlasAtHeight(thumbDir, images, aspects, at.h, at.format, SPRITE_CELL_W_MAX);
-  }
-
-  // Compact image table — name + canonical width (at H=200). Position in any atlas is
-  // derived from the index here: idx = images.indexOf(name); the row/col/sprite math
-  // uses the chosen atlas's cellsPerSprite + across.
-  await writeBinaryImagemap(thumbDir, images, aspects);
-
-  const meta = {
-    version: 3,
-    atlases,
-    imageCount: images.length,
-    builtAt: Date.now(),
-  };
-
-  const metaPath = path.join(thumbDir, '_sprite.json');
-  await fsp.writeFile(metaPath + '.tmp', JSON.stringify(meta));
-  await fsp.rename(metaPath + '.tmp', metaPath);
-  spriteMetaCache.set(galleryAbs, meta);
-
-  // GC sprite files no longer referenced (old single-atlas naming + obsolete heights)
-  const referenced = new Set();
-  for (const k in atlases) for (const sp of atlases[k].sprites) referenced.add(sp.file);
-  for (const e of await fsp.readdir(thumbDir)) {
-    if (/^sprite(-h\d+)?-\d+\.(jpg|avif)$/.test(e) && !referenced.has(e)) {
-      try { await fsp.unlink(path.join(thumbDir, e)); } catch {}
-    }
-  }
-  return meta;
-}
-
-async function buildAtlasAtHeight(thumbDir, images, aspects, height, inputFormat, cellWMax) {
-  const cellH = height;
-  const widths = aspects.map(a => Math.round(a * height));
-  const cellW = Math.min(cellWMax, Math.max(cellH, ...widths));
-  const cellArea = cellW * cellH;
-  // Pixel budget is the only cap. Image count per sprite: as many as fit in budget,
-  // also bounded by the gallery size (don't allocate space for more cells than exist).
-  const cellsPerSprite = Math.max(1, Math.min(
-    images.length,
-    Math.floor(MAX_SPRITE_PIXELS / cellArea)
-  ));
-  // Choose `across` so each sprite is roughly square: across*cellW ≈ rows*cellH.
-  // This keeps sprite dimensions sane at any cell size — a 5×9 cell atlas with 50,000
-  // tiles would otherwise be hundreds of pixels wide and tens of thousands tall.
-  const across = Math.max(1, Math.round(Math.sqrt(cellsPerSprite * cellH / cellW)));
-  const numChunks = Math.ceil(images.length / cellsPerSprite);
-  const sprites = [];
-
-  try {
-    for (let c = 0; c < numChunks; c++) {
-      const chunk = images.slice(c * cellsPerSprite, (c + 1) * cellsPerSprite);
-      const inputPaths = chunk.map(name => lodPath(thumbDir, name, height, inputFormat));
-      const spriteFile = 'sprite-h' + height + '-' + c + '.avif';
-      const spriteAbs = path.join(thumbDir, spriteFile);
-      const tmp = spriteAbs + '.__tmp.avif';
-      const vTmp = tmp + '.v';
-
-      // vips arrayjoin takes a SINGLE argv arg of space-separated paths and
-      // parses them internally, which breaks on filenames containing spaces
-      // (e.g. "2023-12-24 12.39.44.jpg" gets split into two paths). Solution:
-      // hardlink each input into a per-build staging dir under sequential safe
-      // names (0.v, 1.v, ...) — that argv string has no embedded spaces.
-      const stagingDir = path.join(STATE_DIR, '_staging', 'gg-stg-' + crypto.randomBytes(8).toString('hex') + '-h' + height);
-      await fsp.rm(stagingDir, { recursive: true, force: true }).catch(()=>{});
-      await fsp.mkdir(stagingDir, { recursive: true });
-      try {
-        async function linkBatch(paths, prefix) {
-          const links = [];
-          for (let i = 0; i < paths.length; i++) {
-            const link = path.join(stagingDir, prefix + i + '.v');
-            try { await fsp.unlink(link); } catch {}
-            await fsp.link(paths[i], link);
-            links.push(link);
-          }
-          return links;
-        }
-
-        if (inputPaths.length <= ARRAYJOIN_TILES_PER_CALL) {
-          console.log('[sprite] building ' + spriteFile + ': ' + chunk.length + ' tiles, cell ' + cellW + 'x' + cellH + ', across ' + across);
-          const links = await linkBatch(inputPaths, 't');
-          await runStep('vips', [
-            'arrayjoin', links.join(' '), vTmp,
-            '--across', String(across),
-            '--hspacing', String(cellW),
-            '--vspacing', String(cellH),
-            '--background', '0',
-          ], vTmp);
-        } else {
-          const rowsPerSub = Math.max(1, Math.floor(ARRAYJOIN_TILES_PER_CALL / across));
-          const tilesPerSub = rowsPerSub * across;
-          const numSubs = Math.ceil(inputPaths.length / tilesPerSub);
-          console.log('[sprite] building ' + spriteFile + ': ' + chunk.length + ' tiles via ' + numSubs + ' sub-atlas(es) of ' + rowsPerSub + ' rows each, cell ' + cellW + 'x' + cellH + ', across ' + across);
-          const subPaths = [];
-          for (let si = 0; si < numSubs; si++) {
-            const subStart = si * tilesPerSub;
-            const subEnd = Math.min(inputPaths.length, subStart + tilesPerSub);
-            const subTiles = inputPaths.slice(subStart, subEnd);
-            const subLinks = await linkBatch(subTiles, 'c' + c + 's' + si + '_t');
-            const subTmp = path.join(stagingDir, 'c' + c + 's' + si + '.v');
-            await runStep('vips', [
-              'arrayjoin', subLinks.join(' '), subTmp,
-              '--across', String(across),
-              '--hspacing', String(cellW),
-              '--vspacing', String(cellH),
-              '--background', '0',
-            ], subTmp);
-            subPaths.push(subTmp);
-          }
-          // Vertical-stack the row-strips.
-          await runStep('vips', [
-            'arrayjoin', subPaths.join(' '), vTmp,
-            '--across', '1',
-            '--hspacing', String(across * cellW),
-            '--vspacing', String(rowsPerSub * cellH),
-            '--background', '0',
-          ], vTmp);
-        }
-      } finally {
-        await fsp.rm(stagingDir, { recursive: true, force: true }).catch(()=>{});
-      }
-
-      await runStep('vips', ['heifsave', vTmp, tmp, '--Q', '80'], tmp);
-      await fsp.unlink(vTmp).catch(()=>{});
-      await fsp.rename(tmp, spriteAbs);
-      sprites.push({ file: spriteFile, count: chunk.length });
-    }
-  } finally {
-    // Sweep any legacy _sprite_staging_h<H>/ dirs left over from prior versions.
-    const legacyStaging = path.join(thumbDir, '_sprite_staging_h' + height);
-    await fsp.rm(legacyStaging, { recursive: true, force: true }).catch(()=>{});
-  }
-
-  return { cellW, cellH, across, cellsPerSprite, sprites };
-}
-
-// Per-folder dedupe so we don't fire two arrayjoins concurrently for the same folder.
+// Per-folder dedupe so concurrent triggers don't run two builds at once.
 const spriteInFlight = new Set();
+// Sprite atlas builds are CPU-heavy synchronous JS (pixel-copy 100k tiles at
+// 100k-image scale takes minutes). Run them in a worker thread so pageview
+// handling on the main thread stays responsive. We still gate concurrency to
+// one worker at a time globally — a single 100k atlas build holds ~1GB; running
+// several at once on a moderate-RAM host risks OOM.
+let _spriteWorkerChain = Promise.resolve();
+function _runSpriteWorker(galleryAbs) {
+  return new Promise((resolve, reject) => {
+    const w = new Worker(new URL('./sprite_worker.js', import.meta.url), {
+      workerData: {
+        galleryAbs,
+        brokenDir: BROKEN_DIR,
+        maxSpritePixels: MAX_SPRITE_PIXELS,
+        spriteCellWMax: parseInt(process.env.SPRITE_CELL_W_MAX || '600', 10),
+      },
+    });
+    let settled = false;
+    w.on('message', (msg) => {
+      if (settled) return;
+      settled = true;
+      if (msg && msg.ok) resolve(msg.meta);
+      else reject(new Error((msg && msg.error) || 'sprite worker failed'));
+    });
+    w.on('error', (e) => { if (!settled) { settled = true; reject(e); } });
+    w.on('exit', (code) => {
+      if (!settled) {
+        settled = true;
+        if (code === 0) resolve(null);
+        else reject(new Error('sprite worker exited with code ' + code));
+      }
+    });
+  });
+}
 async function maybeBuildSprite(galleryAbs) {
   if (spriteInFlight.has(galleryAbs)) return;
   spriteInFlight.add(galleryAbs);
-  try { await buildSpriteForFolder(galleryAbs); }
-  catch (e) { console.warn('[sprite]', galleryAbs, e.message); }
-  finally { spriteInFlight.delete(galleryAbs); }
-}
-
-// Build the atlas for ONE tier and merge into the existing _sprite.json. Used by
-// the staged startup build so the gallery becomes browsable as soon as the h5
-// tier is ready, instead of waiting for every tier's .v files + every atlas.
-// Idempotent: returns existing meta if this tier's atlas already covers the
-// current image count.
-async function maybeBuildSpriteAtTier(galleryAbs, tierH) {
-  if (spriteInFlight.has(galleryAbs)) return;
-  spriteInFlight.add(galleryAbs);
   try {
+    // Cheap pre-check on the main thread: don't even spawn a worker if the
+    // sprite is already current. readSpriteMeta hits the spriteMetaCache.
     const m = await loadManifest(galleryAbs);
-    const images = m.images;
-    if (images.length === 0) return null;
-    const thumbDir = path.join(galleryAbs, GG_DIR);
-    const tierDef = LOD_TIERS.find(t => t.h === tierH);
-    if (!tierDef) throw new Error('unknown atlas tier h' + tierH);
-
-    // Skip if this tier is already current.
-    let meta = await readSpriteMeta(galleryAbs);
-    if (meta && meta.version === 3 && meta.atlases && meta.atlases[String(tierH)] &&
-        meta.imageCount === images.length) {
-      return meta;
-    }
-
-    // Verify every image has this specific tier on disk.
-    for (const f of images) {
-      if (!fs.existsSync(lodPath(thumbDir, f, tierH, tierDef.format))) return null;
-    }
-
-    // Aspect ratios. Read from this tier (any tier gives the same w/h ratio).
-    const aspects = images.map(f => {
-      const d = readVipsHeader(lodPath(thumbDir, f, tierH, tierDef.format));
-      return d && d.h ? d.w / d.h : 1.6;
-    });
-
-    const SPRITE_CELL_W_MAX = parseInt(process.env.SPRITE_CELL_W_MAX || '600', 10);
-    const atlas = await buildAtlasAtHeight(thumbDir, images, aspects, tierH, tierDef.format, SPRITE_CELL_W_MAX);
-
-    // Merge into existing meta (or seed one).
-    if (!meta || meta.version !== 3 || !meta.atlases) {
-      meta = { version: 3, atlases: {}, imageCount: images.length, builtAt: Date.now() };
-    } else {
-      meta.imageCount = images.length;
-      meta.builtAt = Date.now();
-    }
-    meta.atlases[String(tierH)] = atlas;
-
-    // Imagemap is tier-independent; write once if missing.
-    const imagemapPath = path.join(thumbDir, '_imagemap.bin');
-    if (!fs.existsSync(imagemapPath)) {
-      await writeBinaryImagemap(thumbDir, images, aspects);
-    }
-
-    const metaPath = path.join(thumbDir, '_sprite.json');
-    await fsp.writeFile(metaPath + '.tmp', JSON.stringify(meta));
-    await fsp.rename(metaPath + '.tmp', metaPath);
-    spriteMetaCache.set(galleryAbs, meta);
-
-    // GC stale sprite files for THIS tier only (don't touch other tiers' sprites).
-    const referenced = new Set();
-    for (const sp of atlas.sprites) referenced.add(sp.file);
-    for (const e of await fsp.readdir(thumbDir)) {
-      const m2 = e.match(/^sprite-h(\d+)-\d+\.(jpg|avif)$/);
-      if (m2 && parseInt(m2[1], 10) === tierH && !referenced.has(e)) {
-        try { await fsp.unlink(path.join(thumbDir, e)); } catch {}
-      }
-    }
-    return meta;
-  } catch (e) {
-    console.warn('[sprite h' + tierH + ']', galleryAbs, e.message);
-  } finally {
+    const existing = await readSpriteMeta(galleryAbs);
+    if (spriteIsCurrent(existing, m.images, galleryAbs)) return;
+    // Global serial chain — at most one sprite worker runs at a time.
+    const next = _spriteWorkerChain.then(() => _runSpriteWorker(galleryAbs));
+    _spriteWorkerChain = next.catch(() => {});
+    const meta = await next;
+    if (meta) spriteMetaCache.set(galleryAbs, meta);
+    else spriteMetaCache.delete(galleryAbs);  // worker deferred (missing LoDs) — let next read pick up freshly
+  } catch (e) { console.warn('[sprite]', galleryAbs, e.message); }
+  finally {
     spriteInFlight.delete(galleryAbs);
+    markFolderCleanIfIdle(galleryAbs).catch(()=>{});
   }
 }
 
-// Debounce sprite rebuilds. Without this, dropping 1000 files into a folder triggers
-// 1000 sprite rebuilds (one per fs.watch + queue-drain). With this, we wait for the
-// dust to settle (5s of quiet) and rebuild once. Safe because the sprite is just a
-// derived cache — never being current for a few seconds isn't a correctness problem.
+// Debounce so a burst of build-completes collapses into one sprite rebuild.
 const SPRITE_DEBOUNCE_MS = parseInt(process.env.SPRITE_DEBOUNCE_MS || '1000', 10);
 const spriteDebounceTimers = new Map();
 function scheduleSpriteBuild(galleryAbs) {
   const existing = spriteDebounceTimers.get(galleryAbs);
   if (existing) clearTimeout(existing);
+  markFolderDirty(galleryAbs).catch(()=>{});
   spriteDebounceTimers.set(galleryAbs, setTimeout(() => {
     spriteDebounceTimers.delete(galleryAbs);
-    maybeBuildSprite(galleryAbs);
+    maybeBuildSprite(galleryAbs).finally(() => markFolderCleanIfIdle(galleryAbs).catch(()=>{}));
   }, SPRITE_DEBOUNCE_MS));
 }
 
-
-// ---------- chunked upload (ported from sendinator) ----------
-// Per-file flow:
-//   create  -> server allocates id + state dir, returns chunk size
-//   chunk   -> client sends each chunk with SHA-256 in x-chunk-hash; server writes via
-//              tmp+rename so a kill mid-write can never corrupt a chunk file
-//   status  -> client asks which chunk indexes are present (for resume)
-//   finalize-> server concatenates chunks into <gallery>/<filename>.__tmp.<ext>, renames
-//              atomically to final, deletes chunk dir, kicks the build queue.
-//
-// Crash-safe properties:
-//   - Each chunk is tmp+rename: only complete chunks are visible on disk.
-//   - _meta.json is tmp+rename: never partially written.
-//   - State persists across restarts: meta is reloaded from disk on boot, so an interrupted
-//     upload can resume by replaying only missing chunks.
-//   - Final file is tmp+rename: a kill mid-assemble leaves the destination unchanged.
-//   - Stale uploads (older than UPLOAD_TTL) are GC'd on startup and hourly.
+// ---------- chunked upload ----------
+// Flow: create → chunk (per-chunk SHA-256, tmp+rename per chunk) → status (for
+// resume) → finalize (concat to .__tmp.<ext>, rename, kick build queue).
+// Every write is tmp+rename; meta and final file are atomic; meta reloaded on
+// boot so interrupted uploads resume by replaying only missing chunks. Stale
+// uploads (>UPLOAD_TTL) are GC'd on startup and hourly.
 const UPLOAD_DIR = path.join(STATE_DIR, 'uploads');
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 const CHUNK_SIZE = parseInt(process.env.CHUNK_SIZE || String(16 * 1024 * 1024), 10);
 const UPLOAD_TTL = 24 * 60 * 60 * 1000;
 
-// In-memory mirror of upload state (loaded from disk at startup).
-const uploads = new Map();
+const uploads = new Map();  // in-memory mirror of on-disk upload state
 
 function saveUploadMeta(id, info) {
   const dest = path.join(UPLOAD_DIR, id, '_meta.json');
@@ -1202,6 +963,7 @@ async function handleUploadAPI(req, res, pathname, method) {
   if (!isAdmin(req)) return sendJson(res, 401, { error: 'admin only' });
 
   if (method === 'POST' && pathname === '/api/upload/create') {
+    if ((req.headers['content-type']||'').split(';')[0].trim() !== 'application/json') return sendJson(res, 415, { error: 'expected application/json' });
     let body;
     try { body = JSON.parse(await readBody(req, 1024 * 1024)); } catch { return badRequest(res); }
     const { filename, size, targetFolder } = body;
@@ -1210,12 +972,8 @@ async function handleUploadAPI(req, res, pathname, method) {
     if (baseName.startsWith('.') || RESERVED.has(baseName) || isOrphanTmp(baseName)) return sendJson(res, 400, { error: 'invalid filename' });
     if (!isImage(baseName)) return sendJson(res, 400, { error: 'unsupported file type' });
     if (typeof size !== 'number' || !Number.isInteger(size) || size <= 0) return sendJson(res, 400, { error: 'invalid size' });
-    // Server derives totalChunks from size + CHUNK_SIZE so the client doesn't need to
-    // know the chunk size up front. This avoids a config round-trip and a class of
-    // off-by-one errors when client and server disagree on the math.
     const totalChunks = Math.ceil(size / CHUNK_SIZE) || 1;
 
-    // Resolve and validate target folder
     const tfSegs = (typeof targetFolder === 'string' ? targetFolder : '/').split('/').filter(Boolean);
     const targetAbs = resolveGallery(tfSegs);
     if (!targetAbs) return sendJson(res, 400, { error: 'invalid targetFolder' });
@@ -1288,7 +1046,7 @@ async function handleUploadAPI(req, res, pathname, method) {
     return;
   }
 
-  // GET /api/upload/status/:id  — used by the client to resume (which chunks exist)
+  // GET /api/upload/status/:id  — for resume: lists which chunks are present
   const stm = pathname.match(/^\/api\/upload\/status\/([a-f0-9]+)$/);
   if (method === 'GET' && stm) {
     const info = uploads.get(stm[1]);
@@ -1332,12 +1090,10 @@ async function handleUploadAPI(req, res, pathname, method) {
       return sendJson(res, 500, { error: 'assemble failed: ' + e.message });
     }
 
-    // Cleanup the upload state dir
     try { await fsp.rm(path.join(UPLOAD_DIR, id), { recursive: true, force: true }); } catch {}
     uploads.delete(id);
 
-    // Update manifest + trigger build. Awaited so the next pageview reflects the new
-    // image even if the client races to refresh immediately.
+    // Awaited so an immediate refresh sees the new image.
     await manifestAddImage(targetAbs, info.filename);
     buildQueue.enqueue(targetAbs, info.filename);
 
@@ -1367,7 +1123,7 @@ function savePasskey(pk) {
   fs.renameSync(PASSKEY_FILE + '.tmp', PASSKEY_FILE);
 }
 
-// HttpOnly session cookie helpers. Sent automatically by the browser; not readable by JS.
+// HttpOnly session cookie: sent automatically, not readable by JS.
 const SESSION_COOKIE = 'ggSession';
 function setSessionCookie(req, res, token) {
   const isSecure = req.headers['x-forwarded-proto'] === 'https' || (req.connection && req.connection.encrypted);
@@ -1379,11 +1135,25 @@ function clearSessionCookie(res) {
   res.setHeader('Set-Cookie', `${SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`);
 }
 
-function newSession() {
+function newSession(origin) {
+  if (origin !== 'passkey' && origin !== 'link') {
+    throw new Error('newSession: origin must be "passkey" or "link"');
+  }
   const token = crypto.randomBytes(32).toString('base64url');
-  sessions.set(token, { createdAt: Date.now() });
+  sessions.set(token, { createdAt: Date.now(), origin: origin });
   saveSessions();
   return token;
+}
+// Returns 'passkey' | 'link' | null. Used by endpoints that need to make
+// origin-aware decisions (e.g. only passkey sessions can mint login links).
+function sessionOriginFor(req) {
+  const cookies = parseCookies(req.headers.cookie);
+  const tok = cookies[SESSION_COOKIE];
+  if (!tok) return null;
+  const s = sessions.get(tok);
+  if (!s) return null;
+  if (Date.now() - s.createdAt > SESSION_DURATION) return null;
+  return s.origin || 'passkey';
 }
 function isAdmin(req) {
   const cookies = parseCookies(req.headers.cookie);
@@ -1395,7 +1165,7 @@ function isAdmin(req) {
   return true;
 }
 
-// ---------- WebAuthn primitives (lifted from sendinator) ----------
+// ---------- WebAuthn primitives ----------
 function b64uToBuf(s) {
   const b64 = s.replace(/-/g, '+').replace(/_/g, '/');
   const pad = b64 + '='.repeat((4 - b64.length % 4) % 4);
@@ -1468,8 +1238,8 @@ function verifyES256Signature(publicKeyUncompressed, signature, data) {
 }
 
 // ---------- gallery HTML render ----------
-function galleryHTML({ urlPath, folders, images, spriteMeta, isAdminFlag, hasPasskey }) {
-  // urlPath has leading and trailing /, e.g. "/" or "/vacation/2024/"
+function galleryHTML({ urlPath, folders, hiddenFolders, images, spriteMeta, isAdminFlag, hasPasskey }) {
+  // urlPath has leading and trailing /, e.g. "/" or "/vacation/2024/".
   const breadcrumbs = (() => {
     const parts = urlPath.split('/').filter(Boolean);
     let acc = '/';
@@ -1481,9 +1251,15 @@ function galleryHTML({ urlPath, folders, images, spriteMeta, isAdminFlag, hasPas
     return out.join('');
   })();
 
-  const folderCards = folders.map(name => {
+  // Hidden folders: filtered out for anon, tagged for admin.
+  const hiddenSet = new Set(hiddenFolders || []);
+  const visibleFolders = isAdminFlag ? folders : folders.filter(n => !hiddenSet.has(n));
+  const folderCards = visibleFolders.map(name => {
     const href = encodeURIComponent(name) + '/';
-    return `<a class="folder" href="${hxEscape(href)}"><span class="folder-icon">📁</span><span class="folder-name">${hxEscape(name)}</span></a>`;
+    const isHidden = hiddenSet.has(name);
+    const cls = isHidden ? 'folder folder-hidden' : 'folder';
+    const tag = isHidden ? '<span class="folder-hidden-tag">(hidden)</span>' : '';
+    return `<a class="${cls}" href="${hxEscape(href)}"><span class="folder-icon">📁</span><span class="folder-name">${hxEscape(name)}</span>${tag}</a>`;
   }).join('');
 
   const lastImageValue = images.length;
@@ -1500,6 +1276,7 @@ function galleryHTML({ urlPath, folders, images, spriteMeta, isAdminFlag, hasPas
 </head>
 <body>
 
+<div id="topcontrols">
 <header id="topbar">
   <nav id="breadcrumb">${breadcrumbs}</nav>
   <a id="adminlink" href="/_admin/" title="Admin">⚙</a>
@@ -1507,7 +1284,7 @@ function galleryHTML({ urlPath, folders, images, spriteMeta, isAdminFlag, hasPas
 
 <div id="adminnotify"></div>
 
-${folders.length ? `<section id="folders">${folderCards}</section>` : ''}
+${visibleFolders.length ? `<details id="foldersWrap"${images.length ? '' : ' open'}><summary>folders (${visibleFolders.length})</summary><nav id="folders">${folderCards}</nav></details>` : ''}
 
 <div id="prevnext">
   <div id="zoomControl" class="zoom-control"></div>
@@ -1515,6 +1292,8 @@ ${folders.length ? `<section id="folders">${folderCards}</section>` : ''}
 
 <div id="counter"></div>
 <div id="realtime"></div>
+</div>
+<div id="topreveal" aria-label="Show controls"></div>
 <div id="thumbs"></div>
 
 <div id="login"></div>
@@ -1540,7 +1319,6 @@ async function handle(req, res) {
   const method = req.method;
   const pathname = decodeURIComponent(u.pathname);
 
-  // --- static files (no caching restriction during dev)
   if (pathname.startsWith('/_static/')) {
     return serveStatic(req, res, pathname.slice('/_static/'.length));
   }
@@ -1551,25 +1329,22 @@ async function handle(req, res) {
     return serveStaticFile(req, res, path.join(PUBLIC_DIR, 'admin.html'));
   }
 
-  // --- API
   if (pathname.startsWith('/api/admin/')) return handleAdminAPI(req, res, pathname, method);
   if (pathname.startsWith('/api/upload/')) return handleUploadAPI(req, res, pathname, method);
-  if (pathname.startsWith('/api/trash')) return handleTrashAPI(req, res, pathname, method);
+  if (pathname.startsWith('/api/trash')) return handleTrashAPI(req, res, pathname, method, u);
 
-  // --- gallery view (any other path is treated as a folder under GALLERIES_ROOT)
-  // Normalize: must end with /, otherwise 301-redirect (but only if it's a real directory)
+  // Gallery view: any other path is a folder under GALLERIES_ROOT, must end with /.
   const segs = pathname.split('/').filter(Boolean);
   const abs = resolveGallery(segs, { allowReserved: true });
   if (abs === null) return notFound(res, 'invalid path');
 
-  // image / cache file?
+  // File or dir-needs-redirect under a gallery folder.
   if (!pathname.endsWith('/')) {
-    // file (or dir-needs-redirect) under a gallery folder.
     const fileName  = segs[segs.length - 1];
     const dirOfFile = segs[segs.length - 2];
     const grandparent = segs.slice(0, -2);
 
-    // sprite atlas files: /<gallery>/.../gg/sprite-N.jpg
+    // gg/_imagemap.bin and gg/sprite-h<H>-<N>.{jpg,avif} and gg/<image>.h<H>.avif
     if (dirOfFile === GG_DIR && fileName === '_imagemap.bin') {
       const galleryAbs = resolveGallery(grandparent);
       if (!galleryAbs) return notFound(res);
@@ -1580,22 +1355,30 @@ async function handle(req, res) {
       if (!galleryAbs) return notFound(res);
       return serveStaticFile(req, res, path.join(galleryAbs, GG_DIR, fileName));
     }
-    // Per-image LoD tiers (h100/h200/h400/h800 AVIF) — used by the canvas when zoomed
-    // past atlas range. Pattern: <original>.h<H>.avif
     if (dirOfFile === GG_DIR && /\.h\d+\.avif$/.test(fileName)) {
       const galleryAbs = resolveGallery(grandparent);
       if (!galleryAbs) return notFound(res);
+      // Substitute the placeholder tier for unbuildable source images.
+      const m = /^(.+)\.h(\d+)\.(avif)$/.exec(fileName);
+      if (m) {
+        const srcName = m[1], tierH = parseInt(m[2], 10);
+        const mf = await loadManifest(galleryAbs).catch(() => ({}));
+        if (Array.isArray(mf.unbuildableImages) && mf.unbuildableImages.includes(srcName)) {
+          await brokenTilesReady();
+          return serveStaticFile(req, res, brokenTilePath(tierH, 'avif'));
+        }
+      }
       return serveStaticFile(req, res, path.join(galleryAbs, GG_DIR, fileName));
     }
 
-    // (The legacy /<gallery>/.../ggTrash/<file> route is gone — trash lives in
-    //  STATE_DIR/trash now and is only accessible via the /api/trash/* endpoints.)
-
-    // 3) anything else needs the parent to be a real (non-reserved) gallery folder
+    // Anything else: parent must be a real, non-reserved gallery folder.
     const parentAbs = resolveGallery(segs.slice(0, -1));
     if (parentAbs === null) return notFound(res);
 
     if (isImage(fileName)) {
+      // Direct-URL requests get the actual file bytes (even if vips can't parse
+      // it — the original is what the URL names). Tier requests substitute the
+      // placeholder above; that's what the gallery uses for rendering.
       return serveStaticFile(req, res, path.join(parentAbs, fileName));
     }
 
@@ -1606,15 +1389,11 @@ async function handle(req, res) {
     return notFound(res);
   }
 
-  // Reject gallery views into reserved/internal directories.
   if (segs.some(s => RESERVED.has(s))) return notFound(res, 'reserved');
-  // Verify gallery dir exists
   let st;
   try { st = fs.statSync(abs); } catch { return notFound(res, 'no such gallery'); }
   if (!st.isDirectory()) return notFound(res, 'not a folder');
 
-  // gallery action queries (admin-only mutations + read-only status). Per-folder
-  // build/scan was retired — admin "Full rescan" covers all real cases globally.
   const q = u.searchParams;
   if (q.has('clearcache'))  return adminAction(req, res, () => clearcache(abs));
   if (q.has('deletefolder')) return adminAction(req, res, async () => {
@@ -1623,32 +1402,32 @@ async function handle(req, res) {
     return `${path.basename(abs)} deleted (${n} image${n === 1 ? '' : 's'} moved to trash)`;
   });
   if (q.has('movetotrash')) return adminAction(req, res, () => movetotrash(abs, q.get('movetotrash')));
-  // exploretrash/restorefile/deletefile/restoreall/emptytrash are now global, served
-  // out of /api/trash/* (single trash, see below). Old per-folder query routes removed.
   if (q.has('build-status')) {
+    // Pure read: in-memory queue progress + a stat on _sprite.json. Never
+    // queues work — that's the page-render path's job (lazy-build / crash-
+    // recovery). Polling this endpoint is cheap regardless of folder size.
     const status = buildQueue.progressFor(abs);
     let spriteOk = false;
-    let imgCount = 0;
     try {
       const sMeta = await readSpriteMeta(abs);
-      const sMan = await loadManifest(abs).catch(() => ({ images: [] }));
-      imgCount = sMan.images.length;
+      const sMan = manifestCache.get(abs) || await loadManifest(abs).catch(() => ({ images: [] }));
       spriteOk = spriteIsCurrent(sMeta, sMan.images, abs);
     } catch {}
     status.spriteUpToDate = spriteOk;
-    // Self-heal: if the queue is idle for this folder AND it has images AND no
-    // current sprite, kick off a sprite build. Catches folders where the
-    // _runOne drain-finally trigger never fired (race during heavy concurrent
-    // uploads, or files that appeared on disk via scp/rsync without going
-    // through the upload pipeline at all).
-    if (!spriteOk && imgCount > 0 && status.pending === 0 && status.inProgress === 0) {
-      scheduleSpriteBuild(abs);
-    }
     return sendJson(res, 200, status);
   }
   if (q.get('api') === 'list') {
     const { folders, images } = await listFolder(abs);
-    return sendJson(res, 200, { folders, images });
+    if (isAdmin(req)) {
+      const ml = await loadManifest(abs).catch(() => ({}));
+      const hiddenFolders = Array.isArray(ml.hiddenFolders) ? ml.hiddenFolders : [];
+      return sendJson(res, 200, { folders, images, hiddenFolders });
+    }
+    // Anon: filter hidden folders out — names are sensitive (URL == name).
+    const ml = await loadManifest(abs).catch(() => ({}));
+    const hidden = new Set(Array.isArray(ml.hiddenFolders) ? ml.hiddenFolders : []);
+    const visibleFolders = folders.filter(n => !hidden.has(n));
+    return sendJson(res, 200, { folders: visibleFolders, images });
   }
   if (q.has('mkdir') && method === 'POST') {
     if (!isAdmin(req)) return sendText(res, 403, 'admin only');
@@ -1661,24 +1440,71 @@ async function handle(req, res) {
     if (made) await manifestAddFolder(abs, name);
     return sendJson(res, 200, { ok: true });
   }
+  if (q.has('sethidden') && method === 'POST') {
+    if (!isAdmin(req)) return sendText(res, 403, 'admin only');
+    const name = q.get('sethidden').trim();
+    if (!name || /[\/\\\x00]/.test(name) || name.startsWith('.') || RESERVED.has(name))
+      return badRequest(res, 'invalid name');
+    // Disk check covers folders added via rsync/scp before any manifest update.
+    let st;
+    try { st = fs.statSync(path.join(abs, name)); } catch { return badRequest(res, 'no such subfolder'); }
+    if (!st.isDirectory()) return badRequest(res, 'not a folder');
+    // Ensure the parent manifest knows about the folder so the hidden flag has
+    // something to filter against on render.
+    const mh = await loadManifest(abs);
+    if (!mh.folders.includes(name)) await manifestAddFolder(abs, name);
+    const hide = q.get('hide') !== '0';
+    await manifestSetHidden(abs, name, hide);
+    return sendJson(res, 200, { ok: true, name, hidden: hide });
+  }
   if (q.has('upload') && method === 'POST') {
     if (!isAdmin(req)) return sendText(res, 403, 'admin only');
     return handleUpload(req, res, abs, q);
   }
 
-  // Render gallery page (manifest-cached: never readdir on the hot path).
+  // Two on-view triggers piggyback on the manifest read:
+  //   1. Lazy-build  — no manifest yet → queue a full build.
+  //   2. Crash-recovery — manifest.building=true but folder is idle → sweep
+  //      .__tmp orphans and re-enqueue.
+  const manifestExisted = fs.existsSync(manifestPathFor(abs));
   const m = await loadManifest(abs);
   const folders = m.folders, images = m.images;
+  if (!manifestExisted && images.length > 0) {
+    buildQueue.enqueueFolder(abs).then(n => {
+      if (n) console.log('[lazy-build]', abs, 'queued', n, 'job(s)');
+      // Only kick sprite directly if no LoD work was queued (folder was already
+      // built). Otherwise the drain-finally trigger fires it once the queue
+      // finishes — kicking it now would race the LoD builds and produce a
+      // mostly-placeholder sprite.
+      else scheduleSpriteBuild(abs);
+    }).catch(e => console.warn('[lazy-build]', abs, e.message));
+  } else if (m.building && !isFolderBusy(abs)) {
+    (async () => {
+      const removed = await sweepFolderTmps(path.join(abs, GG_DIR));
+      const queued = await buildQueue.enqueueFolder(abs);
+      console.log('[crash-recover]', abs, 'queued:', queued, 'swept:', removed);
+      if (queued === 0) {
+        m.building = false; await writeManifest(abs, m);
+        scheduleSpriteBuild(abs);
+      }
+    })().catch(e => console.warn('[crash-recover]', abs, e.message));
+  }
   let spriteMeta = await readSpriteMeta(abs);
-  if (!spriteIsCurrent(spriteMeta, images, abs)) spriteMeta = null;
+  if (!spriteIsServable(spriteMeta, images, abs)) spriteMeta = null;
   const html = galleryHTML({
     urlPath: pathname,
     folders,
+    hiddenFolders: Array.isArray(m.hiddenFolders) ? m.hiddenFolders : [],
     images,
     spriteMeta,
     isAdminFlag: isAdmin(req),
     hasPasskey: !!getPasskey(),
   });
+  // Pageviews are dynamic (admin state, gallery contents). No-cache so the
+  // browser revalidates; Cloudflare won't edge-cache HTML by default
+  // anyway, but be explicit so a future cache-everything rule doesn't
+  // surprise us.
+  res.setHeader('Cache-Control', 'no-cache');
   return sendText(res, 200, html, 'text/html; charset=utf-8');
 }
 
@@ -1696,152 +1522,153 @@ async function clearcache(abs) {
   }
   return 'caches cleared';
 }
-// Global trash: STATE_DIR/trash/<rel-from-galleries-root>/<filename>. Same fs as the
-// galleries (both under /var/lib/goodgallery), so renames stay atomic. Restore puts the
-// file back at its original location and recreates the parent gallery folder if it has
-// since been removed. Cached .v thumbs and preview JPEGs persist while the file is in
-// trash, so restore is instant.
-async function movetotrash(abs, filename) {
+// Per-folder trash: <folder>/gg/trash/<filename>. LoDs at <folder>/gg/*.h*.avif
+// stay where they are — restore is just renaming the image back. Trash-side
+// name collisions get a .trashed-<stamp> suffix so trashing always succeeds.
+async function movetotrash(folderAbs, filename) {
   if (!filename || !isImage(filename)) throw new Error('bad filename');
-  const src = path.join(abs, filename);
-  const dst = trashPathFor(abs, filename);
-  await fsp.mkdir(path.dirname(dst), { recursive: true });
+  const src = path.join(folderAbs, filename);
+  const tdir = trashDirFor(folderAbs);
+  await fsp.mkdir(tdir, { recursive: true });
+  let dst = path.join(tdir, filename);
+  let renamed = false;
   if (fs.existsSync(dst)) {
-    // Collision: a file with the same name was already trashed from this folder. Append
-    // a timestamp suffix so we don't lose either.
     const ext = path.extname(filename);
-    const base = filename.slice(0, -ext.length);
+    const base = ext && filename.endsWith(ext) ? filename.slice(0, -ext.length) : filename;
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const dst2 = path.join(path.dirname(dst), `${base}.trashed-${stamp}${ext}`);
-    await fsp.rename(src, dst2);
-    await manifestRemoveImage(abs, filename);
-    return `${filename} moved to trash (renamed to avoid collision)`;
+    dst = path.join(tdir, `${base}.trashed-${stamp}${ext}`);
+    renamed = true;
   }
   await fsp.rename(src, dst);
-  await manifestRemoveImage(abs, filename);
-  return `${filename} moved to trash`;
+  await manifestRemoveImage(folderAbs, filename);
+  return renamed
+    ? `${filename} moved to trash (renamed to avoid collision)`
+    : `${filename} moved to trash`;
 }
 
-async function restoreByPath(relPath) {
-  const src = safeTrashPath(relPath);
-  if (!src || !fs.existsSync(src)) throw new Error('not in trash');
-  const dst = path.join(GALLERIES_ROOT, relPath);
-  if (fs.existsSync(dst)) throw new Error(`a file at ${relPath} already exists`);
-  await fsp.mkdir(path.dirname(dst), { recursive: true });
+// Restore from <folder>/gg/trash/<name> back to <folder>/<name>. Handles
+// both single images and whole folders. Refuses on destination collision.
+async function restoreFromTrash(folderAbs, name) {
+  if (!isValidTrashName(name)) throw new Error('invalid trash item name');
+  const src = path.join(trashDirFor(folderAbs), name);
+  let st;
+  try { st = await fsp.stat(src); } catch { throw new Error('not in trash'); }
+  const dst = path.join(folderAbs, name);
+  if (fs.existsSync(dst)) throw new Error(`'${name}' already exists; rename or remove it first, then retry`);
   await fsp.rename(src, dst);
-  // Update manifest of the destination gallery.
-  const segs = relPath.split('/').filter(Boolean);
-  const filename = segs.pop();
-  const galleryAbs = path.join(GALLERIES_ROOT, ...segs);
-  await manifestAddImage(galleryAbs, filename);
-  // Clean up empty trash subdirs left behind
-  let parent = path.dirname(src);
-  while (parent.startsWith(TRASH_DIR + path.sep)) {
-    try { await fsp.rmdir(parent); } catch { break; }  // rmdir refuses non-empty dirs
-    parent = path.dirname(parent);
-  }
-  return `restored ${relPath}`;
+  if (st.isDirectory()) await manifestAddFolder(folderAbs, name);
+  else if (isImage(name)) await manifestAddImage(folderAbs, name);
+  try { await fsp.rmdir(trashDirFor(folderAbs)); } catch {}
+  return `restored ${name}`;
 }
 
-// Move every image in a folder (recursively) to the global trash, then delete
-// the now-empty source folder + its gg/ cache. Updates the parent's manifest
-// and drops the folder's entries from manifestCache. Returns the count of
-// images trashed. Refuses to delete the gallery root itself.
-async function deleteFolderToTrash(galleryAbs) {
-  if (!galleryAbs.startsWith(GALLERIES_ROOT) || galleryAbs === GALLERIES_ROOT ||
-      path.dirname(galleryAbs).indexOf(GALLERIES_ROOT) !== 0) {
-    throw new Error('refusing: not a deletable gallery folder');
+// Single-rename folder trash. The folder's gg/ travels with it so all
+// derived state (manifests, LoDs, sprite) is preserved for restore. Refuses
+// the gallery root.
+async function deleteFolderToTrash(folderAbs) {
+  if (folderAbs === GALLERIES_ROOT) throw new Error('cannot delete the gallery root');
+  if (!folderAbs.startsWith(GALLERIES_ROOT + path.sep)) {
+    throw new Error('refusing: not under galleries root');
   }
-  let trashed = 0;
-  async function walk(dir) {
-    let entries;
-    try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { return; }
-    for (const e of entries) {
-      if (e.name.startsWith('.')) continue;
-      const full = path.join(dir, e.name);
-      if (e.isDirectory()) {
-        if (RESERVED.has(e.name)) {
-          // gg/, ggTrash/, etc. — pure derived state, no need to keep.
-          await fsp.rm(full, { recursive: true, force: true }).catch(() => {});
-        } else {
-          await walk(full);
-          // After contents trashed, drop manifestCache for this subfolder.
-          manifestCache.delete(full);
-        }
-      } else if (e.isFile() && isImage(e.name)) {
-        const dst = trashPathFor(dir, e.name);
-        await fsp.mkdir(path.dirname(dst), { recursive: true });
-        if (fs.existsSync(dst)) {
-          const ext = path.extname(e.name);
-          const base = e.name.slice(0, -ext.length);
-          const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-          await fsp.rename(full, path.join(path.dirname(dst), `${base}.trashed-${stamp}${ext}`));
-        } else {
-          await fsp.rename(full, dst);
-        }
-        trashed++;
-      } else {
-        // Non-image leaf (stray file). Delete outright.
-        try { await fsp.unlink(full); } catch {}
+  const parentAbs = path.dirname(folderAbs);
+  const name = path.basename(folderAbs);
+  const tdir = trashDirFor(parentAbs);
+  await fsp.mkdir(tdir, { recursive: true });
+  let dst = path.join(tdir, name);
+  let renamed = false;
+  if (fs.existsSync(dst)) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    dst = path.join(tdir, `${name}.trashed-${stamp}`);
+    renamed = true;
+  }
+  await fsp.rename(folderAbs, dst);
+  await manifestRemoveFolder(parentAbs, name);
+  manifestCache.delete(folderAbs);
+  for (const k of Array.from(manifestCache.keys())) {
+    if (k.startsWith(folderAbs + path.sep)) manifestCache.delete(k);
+  }
+  return renamed
+    ? `${name} moved to trash (renamed to avoid collision)`
+    : `${name} moved to trash`;
+}
+
+// Permanent delete. For trashed images, also drop the LoDs that
+// movetotrash left behind in the source folder's gg/. Folder-trashed
+// items carry their own gg/ inside so no extra LoD cleanup needed.
+async function deleteFromTrash(folderAbs, name) {
+  if (!isValidTrashName(name)) throw new Error('invalid trash item name');
+  const src = path.join(trashDirFor(folderAbs), name);
+  let st;
+  try { st = await fsp.stat(src); } catch { throw new Error('not in trash'); }
+  if (st.isDirectory()) {
+    await fsp.rm(src, { recursive: true, force: true });
+  } else {
+    await fsp.unlink(src);
+    if (isImage(name)) {
+      const orig = name.replace(/\.trashed-[\d\-TZ]+(\.[^.]+)?$/, (m, ext) => ext || '');
+      const thumbDirAbs = path.join(folderAbs, GG_DIR);
+      for (const tier of LOD_TIERS) {
+        try { await fsp.unlink(lodPath(thumbDirAbs, orig, tier.h, tier.format)); } catch {}
       }
+      try { await fsp.unlink(path.join(thumbDirAbs, orig + '.resized.v')); } catch {}
     }
   }
-  await walk(galleryAbs);
-  // Remove the now-empty folder tree.
-  await fsp.rm(galleryAbs, { recursive: true, force: true });
-  // Update parent's manifest.
-  const parentAbs = path.dirname(galleryAbs);
-  const folderName = path.basename(galleryAbs);
-  await manifestRemoveFolder(parentAbs, folderName);
-  manifestCache.delete(galleryAbs);
-  return trashed;
+  try { await fsp.rmdir(trashDirFor(folderAbs)); } catch {}
+  return `deleted ${name}`;
 }
 
-async function deleteByPath(relPath) {
-  const src = safeTrashPath(relPath);
-  if (!src || !fs.existsSync(src)) throw new Error('not in trash');
-  await fsp.unlink(src);
-  // Reclaim every LoD tier + preview JPEG at the original location.
-  const segs = relPath.split('/').filter(Boolean);
-  const filename = segs.pop();
-  const galleryAbs = path.join(GALLERIES_ROOT, ...segs);
-  const thumbDirAbs = path.join(galleryAbs, GG_DIR);
-  for (const tier of LOD_TIERS) {
-    try { await fsp.unlink(lodPath(thumbDirAbs, filename, tier.h, tier.format)); } catch {}
-  }
-  for (const cf of [
-    path.join(thumbDirAbs, filename + '.resized.v'),
-  ]) { try { await fsp.unlink(cf); } catch {} }
-  // GC empty trash subdirs
-  let parent = path.dirname(src);
-  while (parent.startsWith(TRASH_DIR + path.sep)) {
-    try { await fsp.rmdir(parent); } catch { break; }
-    parent = path.dirname(parent);
-  }
-  return `deleted ${relPath}`;
-}
-
-async function restoreAllTrash() {
-  const list = await listAllTrash();
+async function restoreAllInFolder(folderAbs) {
+  const items = await listFolderTrash(folderAbs);
   let ok = 0, fail = 0;
-  for (const item of list) {
-    try { await restoreByPath(item.relPath); ok++; } catch { fail++; }
+  const errs = [];
+  for (const it of items) {
+    try { await restoreFromTrash(folderAbs, it.name); ok++; }
+    catch (e) { fail++; errs.push(`${it.name}: ${e.message}`); }
   }
-  return `restored ${ok}` + (fail ? ` (${fail} failed)` : '');
+  let msg = `restored ${ok}`;
+  if (fail) {
+    msg += ` (${fail} failed`;
+    if (errs.length) msg += '; ' + errs.slice(0, 3).join('; ');
+    if (errs.length > 3) msg += '; ...';
+    msg += ')';
+  }
+  return msg;
 }
 
-async function emptyAllTrash() {
-  const list = await listAllTrash();
-  let n = 0;
-  for (const item of list) {
-    try { await deleteByPath(item.relPath); n++; } catch {}
+// Atomic park-then-background-rm. Renames <folder>/gg/trash to a hidden
+// sibling, then rm -rf in the background. User-facing latency is one rename
+// regardless of how much is in the trash. Lazy GC in listFolderTrash sweeps
+// any parked entries left by a prior crash.
+async function emptyFolderTrash(folderAbs) {
+  const tdir = trashDirFor(folderAbs);
+  if (!fs.existsSync(tdir)) return 'trash already empty';
+  const parked = path.join(folderAbs, GG_DIR, '.trash-emptying-' + Date.now());
+  try { await fsp.rename(tdir, parked); }
+  catch (e) {
+    if (e.code === 'ENOENT') return 'trash already empty';
+    throw e;
   }
-  return `permanently deleted ${n}`;
+  (async () => {
+    try { await fsp.rm(parked, { recursive: true, force: true }); }
+    catch (e) { console.warn('[trash:empty:rm]', parked, e.message); }
+  })();
+  return 'trash emptied (background cleanup in progress)';
 }
+
+// One-time startup cleanup of the legacy global trash dir, if empty. Hands
+// back a clean state dir without surprising the operator with mystery
+// directories. Non-empty legacy dirs are left alone.
+(async () => {
+  const legacy = path.join(STATE_DIR, 'trash');
+  try {
+    const entries = await fsp.readdir(legacy);
+    if (entries.length === 0) await fsp.rmdir(legacy);
+  } catch {}
+})();
 
 // ---------- upload (admin) ----------
-// Phase-1 upload: a single file in a multipart/form-data POST. Will be replaced by
-// sendinator-style chunked uploads in a later iteration.
+// Single-shot multipart/form-data upload. The chunked upload API above is the
+// preferred path for large files.
 async function handleUpload(req, res, abs, q) {
   const ct = req.headers['content-type'] || '';
   const m = ct.match(/^multipart\/form-data;\s*boundary=(.+)$/i);
@@ -1849,7 +1676,6 @@ async function handleUpload(req, res, abs, q) {
   const boundary = '--' + m[1];
   const body = await readBody(req, 1024 * 1024 * 1024);
 
-  // Find first part with filename=
   const parts = splitMultipart(body, boundary);
   const filePart = parts.find(p => /filename="([^"]+)"/.test(p.headers['content-disposition'] || ''));
   if (!filePart) return badRequest(res, 'no file');
@@ -1859,7 +1685,6 @@ async function handleUpload(req, res, abs, q) {
   if (filename.startsWith('.') || RESERVED.has(filename)) return badRequest(res, 'invalid filename');
   const dst = path.join(abs, filename);
   if (fs.existsSync(dst)) return sendText(res, 409, 'already exists');
-  // Write through a tmp suffix that preserves the canonical extension, then rename.
   const tmp = dst + '.__tmp' + path.extname(dst);
   await new Promise((resolve, reject) => {
     const ws = fs.createWriteStream(tmp);
@@ -1868,14 +1693,14 @@ async function handleUpload(req, res, abs, q) {
     ws.end(filePart.body);
   });
   await fsp.rename(tmp, dst);
-  // pre-build asynchronously; don't block the response
+  // Fire-and-forget pre-build.
   ensureBuilt(abs, filename).catch(()=>{});
   return sendJson(res, 200, { ok: true, filename });
 }
 
 function splitMultipart(buf, boundary) {
   const sep = Buffer.from('\r\n' + boundary);
-  // First boundary may not have leading CRLF
+  // First boundary has no leading CRLF.
   const firstSep = Buffer.from(boundary);
   const out = [];
   let start = buf.indexOf(firstSep);
@@ -1904,33 +1729,46 @@ function splitMultipart(buf, boundary) {
 }
 
 // ---------- admin auth API ----------
-async function handleTrashAPI(req, res, pathname, method) {
+async function handleTrashAPI(req, res, pathname, method, u) {
   if (!isAdmin(req)) return sendJson(res, 401, { error: 'admin only' });
+  function resolveFolderFromString(rel) {
+    const segs = typeof rel === 'string' ? rel.split('/').filter(Boolean) : [];
+    return resolveGallery(segs);
+  }
   if (method === 'GET' && pathname === '/api/trash') {
-    return sendJson(res, 200, { files: await listAllTrash() });
+    const folderAbs = resolveFolderFromString(u && u.searchParams.get('folder'));
+    if (!folderAbs) return sendJson(res, 400, { error: 'invalid folder' });
+    return sendJson(res, 200, { items: await listFolderTrash(folderAbs) });
   }
-  if (method === 'POST' && pathname === '/api/trash/restore') {
+  if (method === 'POST') {
+    if ((req.headers['content-type']||'').split(';')[0].trim() !== 'application/json') {
+      return sendJson(res, 415, { error: 'expected application/json' });
+    }
     let body; try { body = JSON.parse(await readBody(req, 64 * 1024)); } catch { return badRequest(res); }
-    try { return sendJson(res, 200, { ok: true, message: await restoreByPath(body.path) }); }
-    catch (e) { return sendJson(res, 400, { error: e.message }); }
-  }
-  if (method === 'POST' && pathname === '/api/trash/delete') {
-    let body; try { body = JSON.parse(await readBody(req, 64 * 1024)); } catch { return badRequest(res); }
-    try { return sendJson(res, 200, { ok: true, message: await deleteByPath(body.path) }); }
-    catch (e) { return sendJson(res, 400, { error: e.message }); }
-  }
-  if (method === 'POST' && pathname === '/api/trash/restoreAll') {
-    return sendJson(res, 200, { ok: true, message: await restoreAllTrash() });
-  }
-  if (method === 'POST' && pathname === '/api/trash/empty') {
-    return sendJson(res, 200, { ok: true, message: await emptyAllTrash() });
+    const folderAbs = resolveFolderFromString(body && body.folder);
+    if (!folderAbs) return sendJson(res, 400, { error: 'invalid folder' });
+    if (pathname === '/api/trash/restore') {
+      try { return sendJson(res, 200, { ok: true, message: await restoreFromTrash(folderAbs, body.name) }); }
+      catch (e) { return sendJson(res, 400, { error: e.message }); }
+    }
+    if (pathname === '/api/trash/delete') {
+      try { return sendJson(res, 200, { ok: true, message: await deleteFromTrash(folderAbs, body.name) }); }
+      catch (e) { return sendJson(res, 400, { error: e.message }); }
+    }
+    if (pathname === '/api/trash/restoreAll') {
+      try { return sendJson(res, 200, { ok: true, message: await restoreAllInFolder(folderAbs) }); }
+      catch (e) { return sendJson(res, 400, { error: e.message }); }
+    }
+    if (pathname === '/api/trash/empty') {
+      try { return sendJson(res, 200, { ok: true, message: await emptyFolderTrash(folderAbs) }); }
+      catch (e) { return sendJson(res, 400, { error: e.message }); }
+    }
   }
   return notFound(res);
 }
 
 async function handleAdminAPI(req, res, pathname, method) {
   if (method === 'POST' && pathname === '/api/admin/logout') {
-    // Best-effort: drop server-side session if we know it, then expire the cookie.
     const cookies = parseCookies(req.headers.cookie);
     const tok = cookies[SESSION_COOKIE];
     if (tok && sessions.delete(tok)) saveSessions();
@@ -1938,20 +1776,27 @@ async function handleAdminAPI(req, res, pathname, method) {
     return sendJson(res, 200, { ok: true });
   }
   if (method === 'GET' && pathname === '/api/admin/probe') {
-    return sendJson(res, isAdmin(req) ? 200 : 401, { admin: isAdmin(req) });
+    const admin = isAdmin(req);
+    return sendJson(res, admin ? 200 : 401, { admin: admin, origin: admin ? sessionOriginFor(req) : null });
   }
   if (method === 'GET' && pathname === '/api/admin/status') {
     return sendJson(res, 200, { passkeyExists: !!getPasskey() });
   }
+  if (method === 'POST' && pathname === '/api/admin/clearqueue') {
+    if (!isAdmin(req)) return sendJson(res, 401, { error: 'admin only' });
+    const n = buildQueue.clear();
+    console.log('[clearqueue] dropped=' + n + ' (workers still draining in-flight tiles)');
+    return sendJson(res, 200, { ok: true, dropped: n });
+  }
   if (method === 'POST' && pathname === '/api/admin/fullrescan') {
     if (!isAdmin(req)) return sendJson(res, 401, { error: 'admin only' });
-    // Fire-and-forget across all phases. scanAll walks the tree once per phase and
-    // enqueues anything missing for that phase. Returns immediately so the UI doesn't
-    // block; client can poll ?build-status on individual galleries.
+    if (fullrescanInProgress) return sendJson(res, 409, { error: 'a full rescan is already running' });
+    fullrescanInProgress = true;
+    // Fire-and-forget. scanAll walks the tree once per phase and enqueues
+    // missing tiers; the client polls ?build-status to track progress.
     (async () => {
       try {
-        // Rebuild every manifest from disk (drift correction for files dropped via rsync
-        // / mv outside the uploader). Walks the tree once.
+        // Manifest pass first — picks up files dropped outside the uploader.
         let rebuilt = 0;
         async function walkRebuild(dir) {
           let entries;
@@ -1969,16 +1814,16 @@ async function handleAdminAPI(req, res, pathname, method) {
         }
         try { await rebuildManifest(GALLERIES_ROOT); rebuilt++; } catch {}
         await walkRebuild(GALLERIES_ROOT);
-        let queuedV = 0;
-        for (const tierH of ATLAS_TIERS) {
-          queuedV += await buildQueue.scanAll(GALLERIES_ROOT, { phase: 'h' + tierH });
-        }
-        const b = await buildQueue.scanAll(GALLERIES_ROOT, { phase: 'avif' });
-        // Wait for everything to drain, then force-sprite every folder. This
-        // catches folders where the per-job _runOne trigger never fired, or
-        // fired prematurely between phases.
-        await buildQueue.drainPromise();
-        let spriteOk = 0, spriteSkipped = 0;
+        // Sprite pass FIRST, before any LoD queueing. Fire-and-forget so the
+        // overall rescan doesn't block on a single slow gallery's atlas
+        // rebuild. maybeBuildSprite serializes via _spriteWorkerChain anyway —
+        // we just don't want forceWalk awaiting that chain, because a 100k-
+        // image atlas can take ~10 min and we want LoD enqueueing to start
+        // immediately so vips/vipsthumbnail workers can spin up in parallel.
+        // A gallery whose phase-1 isn't complete will defer in the worker
+        // (returns null), then re-trigger via the queue's drain-debounce
+        // once its h100.v + earlier tiers finish.
+        let spriteKicked = 0;
         async function forceWalk(dir) {
           let entries;
           try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { return; }
@@ -1991,14 +1836,25 @@ async function handleAdminAPI(req, res, pathname, method) {
             } else if (e.isFile() && isImage(e.name)) hasImages = true;
           }
           if (hasImages) {
-            try { await maybeBuildSprite(dir); spriteOk++; }
-            catch (e) { console.warn('[fullrescan:sprite]', dir, e.message); spriteSkipped++; }
+            // No await — schedule into the worker chain and move on.
+            maybeBuildSprite(dir).catch(e => console.warn('[fullrescan:sprite]', dir, e.message));
+            spriteKicked++;
           }
           for (const sub of subs) await forceWalk(path.join(dir, sub));
         }
         await forceWalk(GALLERIES_ROOT);
-        console.log('[fullrescan] manifests=' + rebuilt + ' v=' + queuedV + ' avif=' + b + ' sprites=' + spriteOk);
+        // Now queue the missing LoDs; the queue runs in the background, and
+        // its per-folder drain trigger reruns the sprite build as folders
+        // complete. No await on drainPromise — fullrescan returns once work
+        // is queued, not when work finishes.
+        let queuedV = 0;
+        for (const tierH of ATLAS_TIERS) {
+          queuedV += await buildQueue.scanAll(GALLERIES_ROOT, { phase: 'h' + tierH });
+        }
+        const b = await buildQueue.scanAll(GALLERIES_ROOT, { phase: 'avif' });
+        console.log('[fullrescan] manifests=' + rebuilt + ' sprites-kicked=' + spriteKicked + ' v-queued=' + queuedV + ' avif-queued=' + b);
       } catch (e) { console.warn('[fullrescan]', e.message); }
+      finally { fullrescanInProgress = false; }
     })();
     return sendJson(res, 200, { ok: true, started: true });
   }
@@ -2020,6 +1876,7 @@ async function handleAdminAPI(req, res, pathname, method) {
   }
   if (method === 'POST' && pathname === '/api/admin/register/finish') {
     if (getPasskey()) return sendJson(res, 400, { error: 'passkey already registered' });
+    if ((req.headers['content-type']||'').split(';')[0].trim() !== 'application/json') return sendJson(res, 415, { error: 'expected application/json' });
     let body;
     try { body = JSON.parse(await readBody(req, 1024 * 1024)); } catch { return badRequest(res); }
     const cookies = parseCookies(req.headers.cookie);
@@ -2034,6 +1891,13 @@ async function handleAdminAPI(req, res, pathname, method) {
     if (clientData.type !== 'webauthn.create') return sendJson(res, 400, { error: 'bad clientData type' });
     const expectedChallenge = bufToB64u(ch.challenge);
     if (clientData.challenge !== expectedChallenge) return sendJson(res, 400, { error: 'challenge mismatch' });
+    // clientData.origin is authenticator-signed; must match the Origin header.
+    const reqOrigin = req.headers.origin;
+    if (reqOrigin && clientData.origin !== reqOrigin) {
+      console.warn('[webauthn] register origin mismatch:', clientData.origin, 'vs', reqOrigin);
+      return sendJson(res, 400, { error: 'origin mismatch' });
+    }
+    if (!reqOrigin) console.warn('[webauthn] register: no Origin header on request, skipping origin check');
 
     const coseKey = decodeCBOR(authData.publicKeyBytes);
     const { algorithm, publicKey } = coseToPublicKey(coseKey);
@@ -2046,7 +1910,7 @@ async function handleAdminAPI(req, res, pathname, method) {
       origin: clientData.origin,
       createdAt: Date.now(),
     });
-    const token = newSession();
+    const token = newSession("passkey");
     setSessionCookie(req, res, token);
     console.log('Admin passkey registered. Origin:', clientData.origin);
     return sendJson(res, 200, { success: true });
@@ -2068,6 +1932,7 @@ async function handleAdminAPI(req, res, pathname, method) {
   if (method === 'POST' && pathname === '/api/admin/login/finish') {
     const pk = getPasskey();
     if (!pk) return sendJson(res, 400, { error: 'no passkey' });
+    if ((req.headers['content-type']||'').split(';')[0].trim() !== 'application/json') return sendJson(res, 415, { error: 'expected application/json' });
     let body;
     try { body = JSON.parse(await readBody(req, 1024 * 1024)); } catch { return badRequest(res); }
     const cookies = parseCookies(req.headers.cookie);
@@ -2082,6 +1947,12 @@ async function handleAdminAPI(req, res, pathname, method) {
     const clientData = JSON.parse(clientDataBuf.toString('utf8'));
     if (clientData.type !== 'webauthn.get') return sendJson(res, 400, { error: 'bad clientData type' });
     if (clientData.challenge !== bufToB64u(ch.challenge)) return sendJson(res, 400, { error: 'challenge mismatch' });
+    const reqOrigin = req.headers.origin;
+    if (reqOrigin && clientData.origin !== reqOrigin) {
+      console.warn('[webauthn] login origin mismatch:', clientData.origin, 'vs', reqOrigin);
+      return sendJson(res, 400, { error: 'origin mismatch' });
+    }
+    if (!reqOrigin) console.warn('[webauthn] login: no Origin header on request, skipping origin check');
 
     const clientDataHash = crypto.createHash('sha256').update(clientDataBuf).digest();
     const signedData = Buffer.concat([authDataBuf, clientDataHash]);
@@ -2090,10 +1961,51 @@ async function handleAdminAPI(req, res, pathname, method) {
 
     const parsed = parseAuthenticatorData(authDataBuf);
     if (parsed.signCount > pk.signCount) { pk.signCount = parsed.signCount; savePasskey(pk); }
-    const token = newSession();
+    const token = newSession('passkey');
     setSessionCookie(req, res, token);
     return sendJson(res, 200, { success: true });
   }
+
+  // Mint a one-time login link. Admin-only. Token is single-use and expires
+  // after LOGIN_LINK_TTL. Returns the full URL so the admin can copy it to
+  // another device (e.g. one that can't access the passkey).
+  if (method === 'POST' && pathname === '/api/admin/login/link') {
+    if (!isAdmin(req)) return sendJson(res, 401, { error: 'admin only' });
+    // A session created from a login link can't mint another link — otherwise
+    // one leaked link would be a permanent foothold (redeem -> mint -> share
+    // -> repeat). Only the passkey holder can issue new links.
+    if (sessionOriginFor(req) !== 'passkey') {
+      return sendJson(res, 403, { error: 'only passkey-authenticated sessions can generate login links' });
+    }
+    const token = crypto.randomBytes(32).toString('base64url');
+    loginLinks.set(token, { createdAt: Date.now() });
+    const isSecure = req.headers['x-forwarded-proto'] === 'https' || (req.connection && req.connection.encrypted);
+    const proto = isSecure ? 'https' : 'http';
+    const host = req.headers.host || 'localhost';
+    const link = `${proto}://${host}/#auth=${token}`;
+    return sendJson(res, 200, { link, ttlSeconds: Math.floor(LOGIN_LINK_TTL / 1000) });
+  }
+
+  // Redeem a one-time login link. Body: { token }. On success, mints a
+  // normal 24h session (replaces any existing session cookie). The link is
+  // consumed on first successful redeem regardless of whether the caller was
+  // previously signed in.
+  if (method === 'POST' && pathname === '/api/admin/login/redeem') {
+    let body; try { body = JSON.parse(await readBody(req, 4 * 1024)); } catch { return badRequest(res); }
+    const t = body && typeof body.token === 'string' ? body.token : '';
+    if (!t) return sendJson(res, 400, { error: 'missing token' });
+    const entry = loginLinks.get(t);
+    if (!entry) return sendJson(res, 400, { error: 'invalid or expired link' });
+    if (Date.now() - entry.createdAt > LOGIN_LINK_TTL) {
+      loginLinks.delete(t);
+      return sendJson(res, 400, { error: 'invalid or expired link' });
+    }
+    loginLinks.delete(t);
+    const token = newSession('link');
+    setSessionCookie(req, res, token);
+    return sendJson(res, 200, { ok: true });
+  }
+
   return notFound(res);
 }
 
@@ -2118,18 +2030,42 @@ function serveStatic(req, res, rel) {
   if (rel.includes('..')) return notFound(res);
   return serveStaticFile(req, res, path.join(PUBLIC_DIR, rel));
 }
+// Cache policy is based on the on-disk filename, not the URL — so admin
+// pages and gallery pageviews share the policy table.
+function cacheControlFor(abs) {
+  const base = path.basename(abs);
+  // Per-image LoDs and sprite atlases are content-addressed: a rebuild
+  // mints new filenames (sprite version bump, .h<N>.avif keyed by image
+  // mtime via the build pipeline). Safe to cache forever.
+  if (/\.h\d+\.(avif|v)$/.test(base)) return 'public, max-age=31536000, immutable';
+  if (/^sprite(?:-h\d+)?-\d+\.(jpg|avif)$/.test(base)) return 'public, max-age=31536000, immutable';
+  // Imagemap + sprite metadata don't change name but do change content.
+  // Short cache + ETag for cheap revalidation.
+  if (base === '_imagemap.bin' || base === '_sprite.json') return 'public, max-age=60, must-revalidate';
+  // Other static assets (gallery.js, css, html, svg, favicon) — shortish
+  // cache plus ETag. Cloudflare edge caches these per Browser Cache TTL.
+  return 'public, max-age=300, must-revalidate';
+}
+
 function serveStaticFile(req, res, abs) {
   fs.stat(abs, (err, st) => {
     if (err || !st.isFile()) return notFound(res);
-    const headers = {
+    // Weak ETag from size+mtime is cheap and sufficient for browser
+    // conditional GETs. Rebuild produces a new mtime so cache invalidates.
+    const etag = 'W/"' + st.size.toString(36) + '-' + Math.floor(st.mtimeMs).toString(36) + '"';
+    const inm = req.headers['if-none-match'];
+    const ims = req.headers['if-modified-since'];
+    if (inm === etag || (ims && new Date(ims).getTime() >= Math.floor(st.mtimeMs))) {
+      res.writeHead(304, { ETag: etag, 'Cache-Control': cacheControlFor(abs) });
+      return res.end();
+    }
+    res.writeHead(200, {
       'Content-Type': contentType(abs),
       'Content-Length': st.size,
       'Last-Modified': st.mtime.toUTCString(),
-    };
-    if (req.headers['if-modified-since'] && new Date(req.headers['if-modified-since']).getTime() >= st.mtime.getTime()) {
-      res.writeHead(304); return res.end();
-    }
-    res.writeHead(200, headers);
+      'ETag': etag,
+      'Cache-Control': cacheControlFor(abs),
+    });
     fs.createReadStream(abs).pipe(res);
   });
 }
@@ -2148,62 +2084,9 @@ const server = http.createServer((req, res) => {
   });
 });
 (async () => {
-  const swept = await sweepOrphanTmps(GALLERIES_ROOT);
-  if (swept) console.log(`Swept ${swept} orphan tmp file(s) at startup.`);
-  await migrateLegacyTrash();
-  await migrateLegacyThumbcache();
-  await warmManifests(GALLERIES_ROOT);
-  // Two-phase build:
-  //   Phase 1 (.v) — atlas inputs across every gallery. Fast (no AVIF encoding),
-  //                  unblocks the gallery as soon as atlases can build.
-  //   Atlases — fired explicitly per gallery once Phase 1 drains; without this the
-  //             debounced scheduleSpriteBuild would never fire because Phase 2 jumps
-  //             in and keeps the queue busy.
-  //   Phase 2 (avif + preview) — runs in the background; on-demand handler still
-  //                              covers any tier the user actually looks at.
-  (async () => {
-    try {
-      // Walk the tree once up-front to know which gallery folders contain images;
-      // we'll bake atlases for each one after each tier completes.
-      const galleryDirs = new Set();
-      async function walkForSprites(dir) {
-        let entries;
-        try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { return; }
-        let hasImages = false;
-        const subs = [];
-        for (const e of entries) {
-          if (e.name.startsWith('.')) continue;
-          if (e.isDirectory()) {
-            if (!RESERVED.has(e.name)) subs.push(e.name);
-          } else if (e.isFile() && isImage(e.name)) hasImages = true;
-        }
-        if (hasImages) galleryDirs.add(dir);
-        for (const sub of subs) await walkForSprites(path.join(dir, sub));
-      }
-      await walkForSprites(GALLERIES_ROOT);
-
-      // Staged build: smallest atlas tier first, so the gallery becomes browsable
-      // after just h5 (~33% of the total .v work) instead of waiting for h10 + h50
-      // too. After each tier's .v files drain, bake that one atlas across every
-      // gallery and merge into _sprite.json — the client's pickAtlasHeight picks
-      // whatever atlas heights are currently available.
-      for (const tierH of ATLAS_TIERS) {
-        const n = await buildQueue.scanAll(GALLERIES_ROOT, { phase: 'h' + tierH });
-        if (n) console.log(`Phase h${tierH}: queued ${n} job(s) (concurrency=${BUILD_CONCURRENCY}).`);
-        await buildQueue.drainPromise();
-        for (const g of galleryDirs) {
-          try { await maybeBuildSpriteAtTier(g, tierH); }
-          catch (e) { console.warn('[sprite h' + tierH + ']', g, e.message); }
-        }
-        console.log(`Atlas h${tierH} ready across ${galleryDirs.size} gallery folder(s).`);
-      }
-
-      const n2 = await buildQueue.scanAll(GALLERIES_ROOT, { phase: 'avif' });
-      if (n2) console.log(`Per-image AVIFs queued ${n2} job(s) — running in background.`);
-    } catch (e) {
-      console.warn('Startup scan error:', e.message);
-    }
-  })();
+  // Startup is O(1): LoDs and atlases build on first pageview; crashed-mid-build
+  // folders are recovered via the 'building' manifest flag on first read.
+  brokenTilesReady();  // kick off placeholder tile generation (memoized)
   server.listen(PORT, HOST, () => {
     console.log(`Goodgallery listening on http://${HOST}:${PORT}`);
     console.log(`  galleries root: ${GALLERIES_ROOT}`);
