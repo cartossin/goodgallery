@@ -68,10 +68,8 @@
   }
 
   var GG_DIR = 'gg';
-  var inum = 1;
   var focusedIdx = 0;       // 0 = grid view; 1..N = focused image
   var keyslocked = 0;
-  var hashmirror = '';
 
 
   function $(id) { return document.getElementById(id); }
@@ -122,9 +120,6 @@
   }
 
   // ---------- nav helpers ----------
-
-  function nextimage()    { shiftFocus(+1); }
-  function previousimage(){ shiftFocus(-1); }
 
   function isThumbView() { return focusedIdx === 0; }
   function leftbutton()  { if (focusedIdx > 0) shiftFocus(-1); }
@@ -345,7 +340,6 @@
     }
     if (location.hash !== newHash) {
       try { history.replaceState(null, '', newHash); } catch (_) {}
-      hashmirror = lv.hash;
     }
     scheduleRender();
     renderZoomControl();
@@ -452,7 +446,6 @@
   }
 
   // Per-atlas-height ImageBitmap cache (h5/h10/h50, loaded lazily).
-  var spriteBitmapsByHeight = {};      // { '50': Promise<[ImageBitmap, ...]>, ... }
   // Sync mirror so drag-paint can blit prev/next without a microtask hop.
   var atlasBitmapsSync = {};
   // DEBUG: expose for memory-leak repro harness. Counts non-null bitmap refs
@@ -506,20 +499,6 @@
         return bm;
       });
     return spritePromises[key][spriteIdx];
-  }
-
-  // Bulk-load every sprite for an atlas height. Safety helper; most callers
-  // use loadSpriteAt for the specific sprite they need.
-  function loadSpriteBitmapsForAtlas(atlasH) {
-    var key = String(atlasH);
-    if (spriteBitmapsByHeight[key]) return spriteBitmapsByHeight[key];
-    var atlas = window.spriteMeta && spriteMeta.atlases && spriteMeta.atlases[key];
-    if (!atlas) return Promise.resolve([]);
-    if (!atlasBitmapsSync[key]) atlasBitmapsSync[key] = new Array(atlas.sprites.length).fill(null);
-    var ps = [];
-    for (var i = 0; i < atlas.sprites.length; i++) ps.push(loadSpriteAt(atlasH, i));
-    spriteBitmapsByHeight[key] = Promise.all(ps);
-    return spriteBitmapsByHeight[key];
   }
 
   // Atlas tier closest to targetH in log scale. The previous "smallest ≥
@@ -927,27 +906,6 @@
     };
   })();
 
-  // Best already-cached per-image tier for `name`. Prefers exact target,
-  // falls back to any smaller cached tier. Keeps zoom transitions from
-  // flashing black while the target tier loads.
-  function bestCachedPerImage(name, targetTier) {
-    if (targetTier === 0) {
-      for (var i = PER_IMAGE_TIERS.length - 1; i >= 0; i--) {
-        var bm = getPerImageBitmapSync(name, PER_IMAGE_TIERS[i]);
-        if (bm) return bm;
-      }
-      return null;
-    }
-    var bm = getPerImageBitmapSync(name, targetTier);
-    if (bm) return bm;
-    for (var i = PER_IMAGE_TIERS.length - 1; i >= 0; i--) {
-      if (PER_IMAGE_TIERS[i] >= targetTier) continue;
-      var bm2 = getPerImageBitmapSync(name, PER_IMAGE_TIERS[i]);
-      if (bm2) return bm2;
-    }
-    return null;
-  }
-
   // Best already-loaded atlas source for `name` (h50 → h10 → h5).
   function bestCachedAtlasSrc(name) {
     if (!window.spriteMeta || !spriteMeta.atlases) return null;
@@ -1233,12 +1191,6 @@
     atlasInstancesLayoutH = currentRowHeight;
   }
 
-  // Drop a static buffer for an atlas sprite that's no longer needed (the
-  // sprite texture itself is dropped separately by evictAtlasBitmaps).
-  function dropStaticAtlasBuffer(atlasH, spriteIdx) {
-    gridRenderer.dropStatic(String(atlasH) + ':' + spriteIdx);
-  }
-
   // Indices of sprites that have at least one tile in the buffer y-range.
   function spritesNeededForBuffer(atlasH) {
     var key = String(atlasH);
@@ -1506,15 +1458,9 @@
   var filmstripEl = null; // filmstrip scroll container
   var filmCanvasEl = null;// canvas inside filmstrip
   var filmSpacerEl = null;
-  // Swipe drag state. Focused image translates by dragDX; neighbors are painted
-  // at ±viewportW. Release commits (snap to ±W + shift focus) or reverts.
-  var dragActive = false;
-  var dragDX = 0;
-  var dragRaf = null;     // animation id for commit/revert
   // Sync source for the main canvas: { bitmap, sx, sy, sw, sh, forIdx } | null.
-  // Updated by drawMainImage (atlas) then upgradeMainImage (high-LoD).
+  // Updated by drawMainImage with the best resolved per-image / atlas source.
   var mainDrawSrc = null;
-  var touchOnMain = false;
   // Filmstrip layout (rebuilt on filmstrip setup / resize).
   var filmTilePos = null;
   var filmTileW   = null;
@@ -1998,9 +1944,6 @@
     }, FOCUS_STABLE_MS);
   }
 
-  var mainUpgradeTimer = null;
-  function upgradeMainImage() { mainUpgradeTimer = null; }
-
   // Best already-cached source for `idx1` at `targetH`: walk per-image tiers
   // (target then smaller), then fall back to atlas h50.
   function getBestSrcForFocus(idx1, targetH) {
@@ -2039,100 +1982,6 @@
     return { bitmap: bitmap, sx: col * atlas.cellW, sy: row * atlas.cellH, sw: srcW, sh: atlas.cellH, natW: loc.w, natH: CANONICAL_H };
   }
 
-  function destRectForLoc(natW, natH, areaW, areaH) {
-    var scale = Math.min(areaW / natW, areaH / natH);
-    var dw = Math.round(natW * scale), dh = Math.round(natH * scale);
-    return { dw: dw, dh: dh, dx: Math.round((areaW - dw) / 2), dy: Math.round((areaH - dh) / 2) };
-  }
-
-  // Drag paint: current at dragDX, prev/next at dragDX∓W.
-  function paintMainDragged(dx) {
-    if (!mainEl) return;
-    var W = layoutWidth(), H = layoutHeight();
-    var mainH = Math.max(120, H - FILM_H);
-    var dpr = devicePixelRatio();
-    var ctx = mainEl.getContext('2d', { alpha: false });
-    ctx.imageSmoothingQuality = 'high';
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.fillStyle = '#000';
-    ctx.fillRect(0, 0, W, mainH);
-
-    function paintAt(idx1, offsetX) {
-      if (idx1 < 1 || idx1 > lastimagevalue) return;
-      var name = images[idx1];
-      var loc = name && spriteMeta && spriteMeta.imageMap && spriteMeta.imageMap[name];
-      if (!loc) return;
-      var dest = destRectForLoc(loc.w, CANONICAL_H, W, mainH);
-      // Center: live mainDrawSrc. Neighbors: best cached tier, atlas fallback.
-      var src;
-      if (idx1 === focusedIdx && mainDrawSrc && mainDrawSrc.forIdx === idx1) {
-        src = mainDrawSrc;
-      } else {
-        src = getBestSrcForFocus(idx1, dest.dh * devicePixelRatio());
-      }
-      if (!src) return;
-      ctx.drawImage(src.bitmap, src.sx, src.sy, src.sw, src.sh, dest.dx + offsetX, dest.dy, dest.dw, dest.dh);
-    }
-    paintAt(focusedIdx, dx);
-    paintAt(focusedIdx - 1, dx - W);
-    paintAt(focusedIdx + 1, dx + W);
-  }
-
-  // Proportional-step chase from dragDX → targetDX, painting each step.
-  function animateDragTo(targetDX, done) {
-    if (dragRaf) cancelAnimationFrame(dragRaf);
-    function tick() {
-      dragRaf = null;
-      var diff = targetDX - dragDX;
-      if (Math.abs(diff) < 1) {
-        dragDX = targetDX;
-        paintMainDragged(dragDX);
-        if (done) done();
-        return;
-      }
-      var step = diff * 0.3;
-      if (Math.abs(step) < 1) step = (diff > 0 ? 1 : -1);
-      dragDX += step;
-      paintMainDragged(dragDX);
-      dragRaf = requestAnimationFrame(tick);
-    }
-    dragRaf = requestAnimationFrame(tick);
-  }
-
-  // direction: -1 = went to previous, +1 = went to next.
-  function commitDrag(direction) {
-    var W = layoutWidth();
-    var targetDx = -direction * W;
-    animateDragTo(targetDx, function () {
-      var newIdx = focusedIdx + direction;
-      while (newIdx < 1) newIdx += lastimagevalue;
-      while (newIdx > lastimagevalue) newIdx -= lastimagevalue;
-      // Pre-populate mainDrawSrc with best cached source so the next paint
-      // doesn't black-flash while drawMainImage resolves.
-      var newSrc = getBestSrcForFocus(newIdx, mainImageGeom() && mainImageGeom().dh * devicePixelRatio());
-      if (newSrc) {
-        mainDrawSrc = { bitmap: newSrc.bitmap, sx: newSrc.sx, sy: newSrc.sy, sw: newSrc.sw, sh: newSrc.sh, forIdx: newIdx };
-      }
-      focusedIdx = newIdx;
-      dragDX = 0;
-      dragActive = false;
-      hideControls();
-      // Sync filmstrip without chase — visual commit already happened.
-      if (filmstripEl) filmstripEl.scrollLeft = filmScrollForIdx1(focusedIdx, W);
-      scheduleHashUpdate('#' + encodeURIComponent(images[focusedIdx]));
-      paintMain();
-      if (mainUpgradeTimer) clearTimeout(mainUpgradeTimer);
-      mainUpgradeTimer = setTimeout(upgradeMainImage, 150);
-    });
-  }
-  function revertDrag() {
-    animateDragTo(0, function () {
-      dragActive = false;
-      dragDX = 0;
-      paintMain();
-    });
-  }
-
   // 1-finger horizontal drag on the main image becomes a filmstrip scrub: we
   // adjust filmstripEl.scrollLeft directly, and the existing scroll handler
   // updates focusedIdx + repaints. On touchend we run a manual momentum decay
@@ -2168,7 +2017,6 @@
     }
 
     mainEl.addEventListener('touchstart', function (e) {
-      touchOnMain = true;
       stopDecay();
       multiTouch = e.touches.length > 1;
       if (multiTouch) { dragging = false; return; }
@@ -2210,7 +2058,6 @@
     }, { passive: false });
 
     mainEl.addEventListener('touchend', function (e) {
-      touchOnMain = false;
       if (multiTouch) { multiTouch = e.touches.length > 0; return; }
       if (dragging) {
         startDecay();
@@ -2230,7 +2077,6 @@
     });
 
     mainEl.addEventListener('touchcancel', function () {
-      touchOnMain = false;
       dragging = false;
       multiTouch = false;
     });
@@ -2345,7 +2191,6 @@
   function displaythumbs() {
     showAdminBar();
     focusedIdx = 0;
-    hashmirror = '';
     setText('counter', '');
     // Apply current grid level so the render matches the toolbar label.
     var levels = availableLevels();
@@ -2362,8 +2207,7 @@
 
   // ---------- hash routing ----------
   function refreshfromhash() {
-    hashmirror = location.hash.slice(1);
-    var raw = decodeURIComponent(hashmirror || '');
+    var raw = decodeURIComponent(location.hash.slice(1) || '');
     // #fit and #sizeN → ZOOM_LEVELS entries; bare names → focus.
     var levels = availableLevels();
     var matchedIdx = -1;
@@ -2398,7 +2242,6 @@
       for (var i = 1; i <= lastimagevalue; i++) {
         if (raw === images[i]) {
           focusedIdx = i;
-          inum = i;
           document.body.classList.add('image-view');
           document.body.classList.remove('thumb-view');
           renderGallery();
@@ -2414,67 +2257,28 @@
   }
 
   // ---------- admin bar ----------
+  // In focus view: a single "Move to trash" action on the current image.
+  // In grid view: just a link to the admin panel — full management lives there.
   function showAdminBar() {
     var bar = $('adminnotify');
     if (!window.isadmin) { bar.classList.remove('on'); return; }
     bar.classList.add('on');
-    var inImage = (decodeURIComponent(location.hash.slice(1)) || '').charAt(0) !== ':';
-    bar.innerHTML = inImage
-      ? '<button onclick="ggMoveToTrash()">Move to trash</button>'
-      : '<button onclick="ggClearCache()">Clear cache</button>' +
-        '<button onclick="ggExploreTrash()">Explore trash</button>' +
-        '<a href="/_admin/" style="margin-left:auto">Admin panel →</a>';
+    bar.innerHTML = focusedIdx > 0
+      ? '<button onclick="ggMoveToTrash()">Move to trash</button>' +
+        '<a href="/_admin/" style="margin-left:auto">Admin panel →</a>'
+      : '<a href="/_admin/" style="margin-left:auto">Admin panel →</a>';
   }
-  function clearAdminBar() { var b = $('adminnotify'); if (b) b.classList.remove('on'); }
-
   // ---------- admin actions ----------
   function ggMoveToTrash() {
-    // No confirm — trash is reversible via Explore Trash.
-    note('Moving ' + images[inum] + ' to trash…');
-    gghttp('POST', 'movetotrash=' + encodeURIComponent(images[inum]), function (t) {
+    // No confirm — trash is reversible via the admin panel's per-folder trash.
+    if (focusedIdx <= 0) return;
+    var name = images[focusedIdx];
+    note('Moving ' + name + ' to trash…');
+    gghttp('POST', 'movetotrash=' + encodeURIComponent(name), function (t) {
       note(t || 'moved to trash');
       setTimeout(function () { location.reload(); }, 600);
     });
   }
-  function ggClearCache() {
-    if (!confirm('Delete all cached thumbs and previews?')) return;
-    gghttp('POST', 'clearcache=1', function (t) { note(t); });
-  }
-  function ggExploreTrash() {
-    fetch('/api/trash', { headers: adminHeader() })
-      .then(function (r) { return r.json(); })
-      .then(function (data) {
-        var place = $('thumbs');
-        if (!data || !data.files || !data.files.length) {
-          place.innerHTML = '<div style="padding:24px;text-align:center;color:#888">Trash is empty.</div>';
-          return;
-        }
-        var rows = data.files.map(function (f) {
-          var fromFolder = f.relPath.indexOf('/') >= 0 ? f.relPath.slice(0, f.relPath.lastIndexOf('/')) : '';
-          var origin = fromFolder ? '/' + fromFolder : '/';
-          return '<div style="display:flex;align-items:center;gap:8px;padding:6px 12px;border-bottom:1px solid #222">' +
-                 '<button onclick="ggRestoreFile(\'' + f.relPath.replace(/\'/g, "\\'") + '\')">Restore</button>' +
-                 '<button onclick="ggDeleteFile(\''  + f.relPath.replace(/\'/g, "\\'") + '\')">Delete</button>' +
-                 '<span>' + f.name + ' <small style="color:#888">from ' + origin + '</small></span></div>';
-        }).join('');
-        place.innerHTML = '<div style="display:flex;flex-direction:column;align-items:stretch;width:100%;max-width:720px;margin:0 auto">' +
-          '<h3 style="text-align:center;color:#bbb">Trash (' + data.files.length + ')</h3>' +
-          rows +
-          '<div style="display:flex;gap:8px;justify-content:center;padding:12px"><button onclick="ggRestoreAll()">Restore all</button><button onclick="ggEmptyTrash()">Empty trash</button></div>' +
-          '</div>';
-      });
-  }
-  function trashApi(action, body) {
-    return fetch('/api/trash/' + action, {
-      method: 'POST',
-      headers: Object.assign({ 'Content-Type': 'application/json' }, adminHeader()),
-      body: body ? JSON.stringify(body) : undefined,
-    }).then(r => r.json()).then(j => { note(j.message || j.error || 'ok'); });
-  }
-  function ggRestoreFile(p) { trashApi('restore', { path: p }).then(ggExploreTrash); }
-  function ggDeleteFile(p)  { if (!confirm('Permanently delete ' + p + '?')) return; trashApi('delete', { path: p }).then(ggExploreTrash); }
-  function ggRestoreAll()   { trashApi('restoreAll').then(ggExploreTrash); }
-  function ggEmptyTrash()   { if (!confirm('Permanently delete ALL trashed files?')) return; trashApi('empty').then(ggExploreTrash); }
 
   // Image whose tile-center is closest to the viewport center.
   function findCenteredImageName() {
@@ -2529,7 +2333,7 @@
         refreshfromhash();
       } else if (lastimagevalue > 0) {
         var found = 0;
-        for (var j = 1; j <= lastimagevalue; j++) if (raw === images[j]) { inum = j; found = 1; break; }
+        for (var j = 1; j <= lastimagevalue; j++) if (raw === images[j]) { found = 1; break; }
         if (found) refreshfromhash(); else displaythumbs();
       } else {
         displaythumbs();
@@ -2571,20 +2375,8 @@
       .catch(function () {});
   }
 
-  // Expose for inline handlers.
-  window.startjs = startjs;
-  window.keycheck = keycheck;
-  window.unlockkeys = unlockkeys;
-  window.leftbutton = leftbutton;
-  window.rightbutton = rightbutton;
-  window.displaythumbs = displaythumbs;
+  // Inline handler reachable from showAdminBar's innerHTML.
   window.ggMoveToTrash = ggMoveToTrash;
-  window.ggClearCache = ggClearCache;
-  window.ggExploreTrash = ggExploreTrash;
-  window.ggRestoreFile = ggRestoreFile;
-  window.ggDeleteFile = ggDeleteFile;
-  window.ggRestoreAll = ggRestoreAll;
-  window.ggEmptyTrash = ggEmptyTrash;
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', startjs);
   else startjs();

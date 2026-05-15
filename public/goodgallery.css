@@ -6,8 +6,6 @@
   --fg: #cfcfcf;
   --muted: #888;
   --accent: #fff;
-  --thumb-pad: 2px;
-  --thumb-bg: #000;
   --border: #2a2a2a;
 }
 
@@ -146,7 +144,6 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   padding: 8px 12px;
   color: var(--accent);
   font-size: 13px;
-  min-height: 0;
 }
 #realtime:empty { padding: 0; }
 
@@ -158,13 +155,6 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 }
 
 
-
-#login { padding: 14px; text-align: center; }
-#login form { display: inline-flex; gap: 8px; }
-#login input[type="password"] {
-  background: #000; color: var(--fg); border: 1px solid var(--fg);
-  padding: 6px 10px; font: inherit;
-}
 
 #bottomlink {
   text-align: center;
@@ -192,7 +182,6 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 html, body { overflow-x: hidden; }
 
 /* Discrete zoom-level control: [−] Label [+] in grid mode, [← back] in focus. */
-#prevnext { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 8px 12px; }
 .zoom-control { display: flex; align-items: center; gap: 4px; user-select: none; }
 .zoom-control button {
   background: transparent; color: var(--fg); border: 1px solid var(--border);

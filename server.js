@@ -5,14 +5,14 @@
 //   GALLERIES_ROOT/<path...>/gg/<image>.h<H>.<format>   per-image LoDs (avif/v)
 //   GALLERIES_ROOT/<path...>/gg/sprite-h<H>-<N>.avif    sprite atlases
 //   GALLERIES_ROOT/<path...>/gg/_manifest.json          per-gallery manifest
-//   STATE_DIR/trash/<rel-path>/<image>                  soft-deleted (global)
+//   GALLERIES_ROOT/<path...>/gg/trash/<image>           soft-deleted (per-folder)
 //
 // Each folder is its own gallery; subfolders appear as cards in the parent.
 
 import http from 'http';
-import https from 'https';
 import fs from 'fs';
 import fsp from 'fs/promises';
+import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import { spawn } from 'child_process';
@@ -30,7 +30,6 @@ const STATE_DIR        = path.resolve(process.env.STATE_DIR     || '/var/lib/goo
 const PUBLIC_DIR       = path.join(__dirname, 'public');
 const PASSKEY_FILE     = path.join(STATE_DIR, 'passkey.json');
 const SITE_TITLE       = process.env.SITE_TITLE || 'Goodgallery';
-const THUMBS_PER_PAGE  = parseInt(process.env.THUMBS_PER_PAGE || '50', 10);
 // Small tiers are lossless `.v` (raw, fast to decode for atlas packing);
 // large tiers are AVIF Q=80.
 const LOD_TIERS = [
@@ -49,9 +48,6 @@ function lodPath(thumbDir, filename, height, format) {
 
 // Atlas tiers are built smallest-first so the gallery is usable as soon as h5 lands.
 const ATLAS_TIERS = [5, 10, 50, 100];
-const THUMB_CELL       = parseInt(process.env.THUMB_CELL || '200', 10);
-const THUMB_DIM        = THUMB_CELL;  // alias for clarity in build path
-const SPRITE_ACROSS      = parseInt(process.env.SPRITE_ACROSS || '20', 10);   // cells per row (target)
 // Sprite size is capped by target file bytes. Translate bytes → pixel budget via
 // an empirical bytes/pixel constant; tune BYTES_PER_PIXEL_Q92 lower for flat-color
 // content, higher for extreme detail.
@@ -59,7 +55,6 @@ const MAX_SPRITE_BYTES   = parseInt(process.env.MAX_SPRITE_BYTES || String(4 * 1
 const BYTES_PER_PIXEL_Q92 = parseFloat(process.env.BYTES_PER_PIXEL_Q92 || '0.30');
 const MAX_SPRITE_PIXELS   = Math.max(1, Math.floor(MAX_SPRITE_BYTES / BYTES_PER_PIXEL_Q92));
 
-const THUMB_QUALITY    = parseInt(process.env.THUMB_QUALITY || '82', 10);
 const SESSION_DURATION = 24 * 60 * 60 * 1000;
 const LOGIN_LINK_TTL   = 10 * 60 * 1000;
 const RP_NAME          = SITE_TITLE;
@@ -171,7 +166,6 @@ function isOrphanTmp(name) {
 // Concurrency = N CPUs (vips is single-threaded per process). Per-(folder,file)
 // dedupe collapses repeated triggers. ensureBuilt is idempotent + atomic, so a
 // process kill loses only in-memory progress counters, never on-disk integrity.
-import os from 'os';
 const BUILD_CONCURRENCY = parseInt(process.env.BUILD_CONCURRENCY || '0', 10) || os.cpus().length;
 
 class BuildQueue {
@@ -759,7 +753,7 @@ async function ensureBuilt(folderAbs, filename, opts) {
   let st;
   try { st = await fsp.stat(src); } catch { throw new Error('missing original'); }
   if (process.env.GG_DEBUG_BUILDS) {
-    console.log('[build]', filename, 'phase=' + phase, 'size=' + st.size, 'preview=' + (st.size >= PREVIEW_SIZE_THRESHOLD));
+    console.log('[build]', filename, 'phase=' + phase, 'size=' + st.size);
   }
   const thumbDir = path.join(folderAbs, GG_DIR);
   await fsp.mkdir(thumbDir, { recursive: true });
@@ -779,28 +773,6 @@ async function ensureBuilt(folderAbs, filename, opts) {
 }
 
 
-// JPEG width/height by parsing the SOF marker — no subprocess.
-function readJpegDims(absPath) {
-  let buf;
-  try { buf = fs.readFileSync(absPath); } catch { return null; }
-  let i = 2;
-  while (i < buf.length) {
-    if (buf[i] !== 0xFF) return null;
-    while (buf[i] === 0xFF) i++;
-    const marker = buf[i++];
-    if (marker === 0xD8 || marker === 0xD9) continue;
-    const sof = (marker >= 0xC0 && marker <= 0xCF) && marker !== 0xC4 && marker !== 0xC8 && marker !== 0xCC;
-    if (sof) {
-      const h = buf.readUInt16BE(i + 3);
-      const w = buf.readUInt16BE(i + 5);
-      return { w, h };
-    }
-    const len = buf.readUInt16BE(i);
-    i += len;
-  }
-  return null;
-}
-
 // ---------- sprite atlas ----------
 // spriteMeta is cached in RAM after first read so pageviews skip the disk JSON.
 const spriteMetaCache = new Map(); // galleryAbs -> meta (or null if file is missing)
@@ -816,25 +788,11 @@ async function readSpriteMeta(galleryAbs) {
   return meta;
 }
 
-// Strict check: sprite matches the manifest AND is the current version. Used
-// to decide whether maybeBuildSprite should re-run the worker.
+// Sprite matches the manifest AND is the current version. Used by both the
+// pageview path (decide whether to ship sprite metadata to the client) and
+// maybeBuildSprite (decide whether to re-run the worker).
 function spriteIsCurrent(meta, images, galleryAbs) {
   if (!meta || meta.version !== 5 || !meta.atlases) return false;
-  if (meta.imageCount !== images.length) return false;
-  if (!fs.existsSync(path.join(galleryAbs, GG_DIR, '_imagemap.bin'))) return false;
-  return true;
-}
-// TEMPORARY (added 2026-05-12 for the v3 → v4 sprite migration when h100
-// was promoted to an atlas tier). Looser than spriteIsCurrent so we can keep
-// serving the existing v3 atlases (h5/h10/h50 only) to the client while v4
-// atlases are being built in the background. v3 atlases are coherent; the
-// client just falls back to per-image AVIFs for h100+ zooms during the gap.
-//
-// REMOVE THIS once every gallery is rebuilt to v4 (no 'v=3' rows in the
-// _sprite.json inventory). At that point, replace the pageview call site with
-// spriteIsCurrent and delete this function. See TODO.md "v3 sprite cleanup".
-function spriteIsServable(meta, images, galleryAbs) {
-  if (!meta || !meta.atlases || typeof meta.version !== 'number' || meta.version < 3) return false;
   if (meta.imageCount !== images.length) return false;
   if (!fs.existsSync(path.join(galleryAbs, GG_DIR, '_imagemap.bin'))) return false;
   return true;
@@ -1296,8 +1254,6 @@ ${visibleFolders.length ? `<details id="foldersWrap"${images.length ? '' : ' ope
 <div id="topreveal" aria-label="Show controls"></div>
 <div id="thumbs"></div>
 
-<div id="login"></div>
-
 <script>
 var images           = [null];
 var lastimagevalue   = ${lastImageValue};
@@ -1490,7 +1446,7 @@ async function handle(req, res) {
     })().catch(e => console.warn('[crash-recover]', abs, e.message));
   }
   let spriteMeta = await readSpriteMeta(abs);
-  if (!spriteIsServable(spriteMeta, images, abs)) spriteMeta = null;
+  if (!spriteIsCurrent(spriteMeta, images, abs)) spriteMeta = null;
   const html = galleryHTML({
     urlPath: pathname,
     folders,
@@ -2037,7 +1993,7 @@ function cacheControlFor(abs) {
   // Per-image LoDs and sprite atlases are content-addressed: a rebuild
   // mints new filenames (sprite version bump, .h<N>.avif keyed by image
   // mtime via the build pipeline). Safe to cache forever.
-  if (/\.h\d+\.(avif|v)$/.test(base)) return 'public, max-age=31536000, immutable';
+  if (/\.h\d+\.avif$/.test(base)) return 'public, max-age=31536000, immutable';
   if (/^sprite(?:-h\d+)?-\d+\.(jpg|avif)$/.test(base)) return 'public, max-age=31536000, immutable';
   // Imagemap + sprite metadata don't change name but do change content.
   // Short cache + ETag for cheap revalidation.
@@ -2069,13 +2025,6 @@ function serveStaticFile(req, res, abs) {
     fs.createReadStream(abs).pipe(res);
   });
 }
-async function serveFileWithFallback(req, res, abs, recover) {
-  if (fs.existsSync(abs)) return serveStaticFile(req, res, abs);
-  const recovered = await recover();
-  if (recovered && fs.existsSync(recovered)) return serveStaticFile(req, res, recovered);
-  return notFound(res);
-}
-
 // ---------- start ----------
 const server = http.createServer((req, res) => {
   handle(req, res).catch(err => {

@@ -40,7 +40,7 @@
   small { color: #888; }
 </style>
 </head>
-<body onkeyup="unlockkeys(event)" onkeydown="keycheck(event)">
+<body>
 
 <h1 style="display:flex;align-items:center;gap:12px">
   <a href="/" style="text-decoration:none;font-size:18px;opacity:0.6" title="Back to gallery">←</a>
@@ -169,9 +169,6 @@ function bufToB64(buf) {
 // in JS, which means XSS can't read it; CSRF is mitigated by SameSite=Strict.
 var cwdPath = '/'; // gallery folder we're administrating
 function authHeaders() { return {}; }  // legacy stub — fetches use cookies automatically
-
-function unlockkeys(){}
-function keycheck(){}
 
 async function checkAuth() {
   var t = document.getElementById('authTitle');
