@@ -224,7 +224,11 @@
     if (!images[1]) return 100;
     var W = layoutWidth();
     var H = layoutHeight();
-    var lo = 2, hi = CANONICAL_H;
+    // Upper bound is the viewport height so a few-image gallery can fill the
+    // viewport at #fit. Beyond CANONICAL_H the renderer reaches for the h1600
+    // tier and the browser upscales — quality cost is mild, layout completeness
+    // win is real.
+    var lo = 2, hi = Math.max(CANONICAL_H, H);
     for (var i = 0; i < 18; i++) {
       var mid = (lo + hi) / 2;
       var measured = simulateLayoutHeight(mid, W);
@@ -283,7 +287,7 @@
     { name: 'focus', hash: null,    h: 'focus' },
   ];
   // lastGridLevelIdx is preserved so back-from-focus restores the prior zoom.
-  var DEFAULT_LEVEL_NAME = 'size3';
+  var DEFAULT_LEVEL_NAME = 'fit';
   function defaultLevelIdx() {
     var levels = availableLevels();
     for (var i = 0; i < levels.length; i++) {
