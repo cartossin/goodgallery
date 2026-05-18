@@ -69,7 +69,6 @@
 
   var GG_DIR = 'gg';
   var focusedIdx = 0;       // 0 = grid view; 1..N = focused image
-  var keyslocked = 0;
 
 
   function $(id) { return document.getElementById(id); }
@@ -143,7 +142,6 @@
   }
 
   // ---------- keys ----------
-  function unlockkeys() { keyslocked = 0; }
   function keycheck(e) {
     // Don't hijack typing in inputs / textareas / contenteditable.
     var tn = e.target && e.target.tagName;
@@ -167,7 +165,6 @@
       return;
     }
 
-    if (keyslocked) return;
     var isArrow = (k === 37 || k === 38 || k === 39 || k === 40);
     // Focus mode: arrow keys shift focus. preventDefault blocks the native
     // ~40px arrow-key scroll on the strip that would race with shiftFocus().
@@ -177,10 +174,7 @@
     } else if (k === 27 && focusedIdx > 0) {
       e.preventDefault();
       location.hash = '';
-    } else {
-      return;
     }
-    keyslocked = 1;
   }
 
   // ---------- view ----------
@@ -2359,7 +2353,6 @@
     // Programmatic key handlers; inline onkey* attributes hit a race with the
     // IIFE's window.* exports on Safari.
     window.addEventListener('keydown', keycheck);
-    window.addEventListener('keyup', unlockkeys);
     pollBuildStatus();
   }
 
