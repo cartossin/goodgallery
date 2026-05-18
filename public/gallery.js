@@ -152,27 +152,19 @@
 
     var k = e.which || e.keyCode;
 
-    // Grid view: scroll keys move the thumbs viewport. The thumbs container
-    // is a custom scroller (overflow:auto), so without explicit handling
-    // these keys do nothing until the user clicks the scrollbar to give the
-    // browser a focused scroll target. Don't lock — holding PageDown should
-    // keep paging.
-    if (focusedIdx === 0) {
+    // Grid view: route scroll keys to native browser handling by ensuring
+    // #thumbs has focus. We don't preventDefault and we don't scroll ourselves —
+    // the browser does it with its native fast animation. If focus drifted
+    // (clicked breadcrumb, admin link, etc.) the first keystroke is lost, but
+    // subsequent ones (including OS keyrepeat) work because focus is now correct.
+    if (focusedIdx === 0 &&
+        (k === 33 || k === 34 || k === 35 || k === 36 ||
+         (e.metaKey && (k === 38 || k === 40)))) {
       var thumbsEl = document.getElementById('thumbs');
-      if (!thumbsEl) return;
-      var pageDelta = thumbsEl.clientHeight * 0.85;  // 15% overlap for context
-      var target = null;
-      if (k === 33) target = Math.max(0, thumbsEl.scrollTop - pageDelta);                       // PageUp / Fn+Up
-      else if (k === 34) target = thumbsEl.scrollTop + pageDelta;                               // PageDown / Fn+Down
-      else if (k === 36) target = 0;                                                            // Home / Fn+Left
-      else if (k === 35) target = thumbsEl.scrollHeight;                                        // End / Fn+Right
-      else if (e.metaKey && k === 38) target = 0;                                               // Cmd+Up (Mac)
-      else if (e.metaKey && k === 40) target = thumbsEl.scrollHeight;                           // Cmd+Down (Mac)
-      if (target !== null) {
-        e.preventDefault();
-        thumbsEl.scrollTo({ top: target, behavior: 'smooth' });
-        return;
+      if (thumbsEl && document.activeElement !== thumbsEl) {
+        thumbsEl.focus({ preventScroll: true });
       }
+      return;
     }
 
     if (keyslocked) return;
@@ -2361,6 +2353,8 @@
       runInitialRoute();
     }
 
+    var _thumbsForInit = document.getElementById('thumbs');
+    if (_thumbsForInit) { _thumbsForInit.tabIndex = -1; _thumbsForInit.focus({ preventScroll: true }); }
     window.addEventListener('hashchange', refreshfromhash);
     // Programmatic key handlers; inline onkey* attributes hit a race with the
     // IIFE's window.* exports on Safari.

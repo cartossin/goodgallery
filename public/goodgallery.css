@@ -147,6 +147,8 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 }
 #realtime:empty { padding: 0; }
 
+#thumbs:focus, #thumbs:focus-visible { outline: none; }
+
 #thumbs {
   /* Was a flex grid back when each thumb was a DOM <img>. The renderer is now a
      single canvas + spacer, so we just need the box to size+scroll cleanly. */
