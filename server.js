@@ -62,7 +62,7 @@ const RP_NAME          = SITE_TITLE;
 // Each gallery folder owns a child dir named GG_DIR holding all derived state
 // (manifest, per-image LoDs, atlases). RESERVED names are excluded from listings.
 const GG_DIR = 'gg';
-const RESERVED = new Set([GG_DIR, 'thumbcache', 'previewcache']);
+const RESERVED = new Set([GG_DIR]);
 
 // Cache-bust static assets by mtime so edits land without a restart while
 // unchanged files stay browser-cached.
@@ -341,7 +341,7 @@ const buildQueue = new BuildQueue(BUILD_CONCURRENCY);
 let fullrescanInProgress = false;
 
 // No filesystem watcher: recursive fs.watch re-walks the tree on every event,
-// which costs an entire core's worth of getdents64 once thumbcaches get large.
+// which costs an entire core's worth of getdents64 once gg/ gets large.
 // The uploader writes files we already know about; rsync drops are picked up
 // via the admin "Full rescan" button.
 
