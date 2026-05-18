@@ -3,16 +3,11 @@
 Fast, scalable photo gallery. Vanilla JS client, zero npm runtime deps, image
 resizing via libvips (`vipsthumbnail`).
 
-Preserves the URL/data layout of the 2008 PHP build:
-```
-GALLERIES_ROOT/<path>/<image>                    # original
-GALLERIES_ROOT/<path>/thumbcache/<image>.resized.jpg
-GALLERIES_ROOT/<path>/previewcache/<image>.resized.jpg   # only for originals >= 500KB
-GALLERIES_ROOT/<path>/ggTrash/<image>             # soft-deleted
-```
+Per-gallery derived state (manifest, sprite atlases, per-image AVIF LoDs,
+trash) lives in a single `gg/` subdirectory alongside the originals.
 
-New: folder hierarchy, mobile-friendly UI, WebAuthn admin enrollment,
-admin upload of files and folders.
+Folder hierarchy, mobile-friendly UI, WebAuthn admin enrollment, admin
+upload of files and folders.
 
 ## Run
 
