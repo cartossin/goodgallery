@@ -93,6 +93,13 @@
 
   // The page just monitors server-side build state; mutations live in /_admin/.
   var statusTimer = null;
+  function formatEta(s) {
+    if (s < 60) return s + 's';
+    if (s < 3600) return Math.round(s / 60) + 'm';
+    var h = Math.floor(s / 3600);
+    var m = Math.round((s - h * 3600) / 60);
+    return m === 0 ? h + 'h' : h + 'h ' + m + 'm';
+  }
   function pollBuildStatus(opts) {
     opts = opts || {};
     var reloadOnComplete = !!opts.reloadOnComplete;
@@ -100,17 +107,17 @@
     fetch(folderURL + '?build-status', { headers: adminHeader() })
       .then(function (r) { return r.json(); })
       .then(function (p) {
-        var active = (p.pending || 0) + (p.inProgress || 0);
-        if (active > 0) {
-          note('Building LoD cache — ' + active + ' remaining (' + p.done + '/' + p.total + ' done)');
+        if (p.remaining > 0) {
+          var eta = p.etaSeconds != null ? ' — ETA ' + formatEta(p.etaSeconds) : '';
+          note('Building ' + p.remaining + ' image' + (p.remaining === 1 ? '' : 's') + eta);
           statusTimer = setTimeout(function () { pollBuildStatus({ reloadOnComplete: reloadOnComplete }); }, 5000);
-        } else if (reloadOnComplete && p.total > 0 && p.spriteUpToDate === false) {
-          // Queue drained but sprite is still rebuilding (debounced).
-          note('Build complete; finalizing…');
+        } else if (reloadOnComplete && !p.spriteUpToDate) {
+          // Queue drained; sprite still baking (debounce + bake itself).
+          note('Finalizing…');
           statusTimer = setTimeout(function () { pollBuildStatus({ reloadOnComplete: reloadOnComplete }); }, 2000);
-        } else if (reloadOnComplete && p.total > 0) {
-          note('Build complete (' + p.done + '/' + p.total + '). Reloading…');
-          setTimeout(function () { location.reload(); }, 800);
+        } else if (reloadOnComplete) {
+          note('Build complete. Reloading…');
+          setTimeout(function () { location.reload(); }, 1500);
         } else {
           note('');
         }

@@ -175,6 +175,7 @@ class BuildQueue {
     this.inFlight = new Set();
     this.workers = 0;
     this.progress = new Map();
+    this.doneAt = [];  // timestamps of completed jobs (trimmed to last 60s on read)
   }
   _key(g, f, phase) { return g + '\0' + f + '\0' + (phase || 'all'); }
   _bumpProgress(g, fn) {
@@ -235,6 +236,7 @@ class BuildQueue {
             p.recent.unshift(filename);
             if (p.recent.length > 10) p.recent.length = 10;
           });
+          this.doneAt.push(Date.now());
         } catch (e) {
           this._bumpProgress(galleryAbs, p => { p.lastError = filename + ': ' + e.message; });
           console.warn('[build]', filename, 'in', galleryAbs, '-', e.message);
@@ -275,6 +277,23 @@ class BuildQueue {
     }
     this.queue.length = 0;
     return dropped;
+  }
+  // Rolling ETA across all galleries. Rate is files completed in the last
+  // ~60s; if we don't have enough history yet, etaSeconds is null.
+  globalProgress() {
+    let remaining = 0;
+    for (const p of this.progress.values()) remaining += p.pending + p.inProgress;
+    const now = Date.now();
+    while (this.doneAt.length && now - this.doneAt[0] > 60000) this.doneAt.shift();
+    let etaSeconds = null;
+    if (remaining > 0 && this.doneAt.length >= 5) {
+      const spanSec = (now - this.doneAt[0]) / 1000;
+      if (spanSec > 0) {
+        const rate = this.doneAt.length / spanSec;
+        if (rate > 0) etaSeconds = Math.round(remaining / rate);
+      }
+    }
+    return { remaining, etaSeconds };
   }
   progressFor(galleryAbs) {
     const p = this.progress.get(galleryAbs);
@@ -1359,10 +1378,10 @@ async function handle(req, res) {
   });
   if (q.has('movetotrash')) return adminAction(req, res, () => movetotrash(abs, q.get('movetotrash')));
   if (q.has('build-status')) {
-    // Pure read: in-memory queue progress + a stat on _sprite.json. Never
-    // queues work — that's the page-render path's job (lazy-build / crash-
-    // recovery). Polling this endpoint is cheap regardless of folder size.
-    const status = buildQueue.progressFor(abs);
+    // Global rolling counters. spriteUpToDate is per-folder (the polled
+    // folder's atlas) and exists solely so the reload-after-upload poller
+    // doesn't reload before the sprite bake finishes. Never displayed.
+    const status = buildQueue.globalProgress();
     let spriteOk = false;
     try {
       const sMeta = await readSpriteMeta(abs);
