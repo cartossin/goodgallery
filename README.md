@@ -11,9 +11,13 @@ upload of files and folders.
 
 ## Run
 
-    apt install -y nodejs npm git libvips-tools
+    apt install -y nodejs libvips-tools
     node server.js
 
-Env vars: `PORT` (3000), `GALLERIES_ROOT` (/var/lib/goodgallery/galleries),
-`STATE_DIR` (/var/lib/goodgallery), `SITE_TITLE`, `THUMBS_PER_PAGE`,
-`THUMB_DIM`, `PREVIEW_DIM`, `PREVIEW_SIZE_THRESHOLD`.
+Env vars: `PORT` (3000), `HOST` (0.0.0.0), `GALLERIES_ROOT`
+(/var/lib/goodgallery/galleries), `STATE_DIR` (/var/lib/goodgallery),
+`SITE_TITLE` (Goodgallery).
+
+Tuning knobs (defaults usually fine): `MAX_SPRITE_BYTES`,
+`BYTES_PER_PIXEL_Q92`, `BUILD_CONCURRENCY`, `AVIF_MAX_DIM`,
+`SPRITE_CELL_W_MAX`, `SPRITE_DEBOUNCE_MS`, `CHUNK_SIZE`.
