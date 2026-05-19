@@ -100,6 +100,11 @@
     var m = Math.round((s - h * 3600) / 60);
     return m === 0 ? h + 'h' : h + 'h ' + m + 'm';
   }
+  function setBuildMessage(msg) {
+    note(msg);
+    var b = document.getElementById('buildstatus-main');
+    if (b) b.textContent = msg || 'Building LoD cache…';
+  }
   function pollBuildStatus(opts) {
     opts = opts || {};
     var reloadOnComplete = !!opts.reloadOnComplete;
@@ -109,17 +114,17 @@
       .then(function (p) {
         if (p.remaining > 0) {
           var eta = p.etaSeconds != null ? ' — ETA ' + formatEta(p.etaSeconds) : '';
-          note('Building ' + p.remaining + ' image' + (p.remaining === 1 ? '' : 's') + eta);
+          setBuildMessage('Building ' + p.remaining + ' image' + (p.remaining === 1 ? '' : 's') + eta);
           statusTimer = setTimeout(function () { pollBuildStatus({ reloadOnComplete: reloadOnComplete }); }, 5000);
         } else if (reloadOnComplete && !p.spriteUpToDate) {
           // Queue drained; sprite still baking (debounce + bake itself).
-          note('Finalizing…');
+          setBuildMessage('Finalizing…');
           statusTimer = setTimeout(function () { pollBuildStatus({ reloadOnComplete: reloadOnComplete }); }, 2000);
         } else if (reloadOnComplete) {
-          note('Build complete. Reloading…');
+          setBuildMessage('Build complete. Reloading…');
           setTimeout(function () { location.reload(); }, 1500);
         } else {
-          note('');
+          setBuildMessage('');
         }
       })
       .catch(function () {});
@@ -2101,7 +2106,7 @@
     }
     if (!window.spriteMeta) {
       thumbsEl.innerHTML = '<div style="padding:32px;text-align:center;color:#888">' +
-        '<div style="font-size:16px;margin-bottom:8px">Building LoD cache…</div>' +
+        '<div id="buildstatus-main" style="font-size:16px;margin-bottom:8px">Building LoD cache…</div>' +
         '<div style="font-size:13px">' + lastimagevalue + ' images in this folder</div>' +
         '</div>';
       pollBuildStatus({ reloadOnComplete: true });
