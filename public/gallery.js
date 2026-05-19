@@ -145,7 +145,7 @@
     var next = base + delta;
     if (next < 1) next = lastimagevalue;
     if (next > lastimagevalue) next = 1;
-    if (focusedIdx > 0 && canvasEl) {
+    if (focusedIdx > 0 && filmstripEl) {
       commandedIdx = next;
       startFocusChase();
     } else {
