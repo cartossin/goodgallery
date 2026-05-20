@@ -4,6 +4,8 @@
 // Inputs (workerData):
 //   - galleryAbs       absolute path to the gallery folder
 //   - images           sorted list of image filenames to atlas
+//   - outputDir        subdir under gg/ to write atlas files into (e.g. "atlas_<hash>_building").
+//                      If absent, falls back to the legacy flat layout (gg/ itself).
 //   - brokenDir        path to the global broken-tile dir (unused; kept for compatibility)
 //   - maxSpritePixels  byte-budget translated to pixels (matches main's MAX_SPRITE_PIXELS)
 //   - spriteCellWMax   max cell width in pixels
@@ -16,7 +18,7 @@ import fsp from 'fs/promises';
 import path from 'path';
 import { spawn } from 'child_process';
 
-const { galleryAbs, images, brokenDir, maxSpritePixels, spriteCellWMax } = workerData;
+const { galleryAbs, images, outputDir, brokenDir, maxSpritePixels, spriteCellWMax } = workerData;
 const GG_DIR = 'gg';
 const VIPS_HEADER_BYTES = 64;
 const ATLAS_HEIGHTS = [
@@ -199,7 +201,7 @@ async function packAndEncodeSprite(inputPaths, cellW, cellH, across, dstAvif) {
   await fsp.rename(avifTmp, dstAvif);
 }
 
-async function buildAtlasAtHeight(thumbDir, images, aspects, height, inputFormat) {
+async function buildAtlasAtHeight(thumbDir, outputAbs, images, aspects, height, inputFormat) {
   const cellH = height;
   const widths = aspects.map(a => Math.round(a * height));
   const cellW = Math.min(spriteCellWMax, Math.max(cellH, ...widths));
@@ -216,7 +218,7 @@ async function buildAtlasAtHeight(thumbDir, images, aspects, height, inputFormat
     const inputPaths = chunk.map(name =>
       lodPath(thumbDir, name, height, inputFormat));
     const spriteFile = 'sprite-h' + height + '-' + c + '.avif';
-    const spriteAbs = path.join(thumbDir, spriteFile);
+    const spriteAbs = path.join(outputAbs, spriteFile);
     console.log('[sprite-worker] building ' + spriteFile + ': ' + chunk.length + ' tiles, cell ' + cellW + 'x' + cellH + ', across ' + across);
     if (inputFormat !== 'v') throw new Error('atlas only supports .v inputs (got ' + inputFormat + ')');
     await packAndEncodeSprite(inputPaths, cellW, cellH, across, spriteAbs);
@@ -225,7 +227,7 @@ async function buildAtlasAtHeight(thumbDir, images, aspects, height, inputFormat
   return { cellW, cellH, across, cellsPerSprite, sprites };
 }
 
-async function writeBinaryImagemap(thumbDir, images, aspects) {
+async function writeBinaryImagemap(outputAbs, images, aspects) {
   const enc = new TextEncoder();
   const nameBytes = images.map(n => enc.encode(n));
   const widths = images.map((_, i) => Math.min(65535, Math.round(aspects[i] * 200)));
@@ -242,13 +244,18 @@ async function writeBinaryImagemap(thumbDir, images, aspects) {
     pos += nameBytes[i].length;
     buf[pos++] = 0;
   }
-  const dst = path.join(thumbDir, '_imagemap.bin');
+  const dst = path.join(outputAbs, '_imagemap.bin');
   await fsp.writeFile(dst + '.tmp', buf);
   await fsp.rename(dst + '.tmp', dst);
 }
 
 async function main() {
   const thumbDir = path.join(galleryAbs, GG_DIR);
+  // LoDs (h5.v etc.) always live at thumbDir directly; atlas outputs go
+  // into outputDir (a subdir like atlas_<hash>_building). Reads stay at
+  // thumbDir, writes go to outputAbs.
+  const outputAbs = outputDir ? path.join(thumbDir, outputDir) : thumbDir;
+  await fsp.mkdir(outputAbs, { recursive: true });
   if (!Array.isArray(images) || images.length === 0) {
     parentPort.postMessage({ ok: true, meta: null });
     return;
@@ -271,10 +278,10 @@ async function main() {
 
   const atlases = {};
   for (const at of ATLAS_HEIGHTS) {
-    atlases[String(at.h)] = await buildAtlasAtHeight(thumbDir, images, aspects, at.h, at.format);
+    atlases[String(at.h)] = await buildAtlasAtHeight(thumbDir, outputAbs, images, aspects, at.h, at.format);
   }
 
-  await writeBinaryImagemap(thumbDir, images, aspects);
+  await writeBinaryImagemap(outputAbs, images, aspects);
 
   const meta = {
     version: 5,
@@ -282,19 +289,9 @@ async function main() {
     imageCount: images.length,
     builtAt: Date.now(),
   };
-  const metaPath = path.join(thumbDir, '_sprite.json');
+  const metaPath = path.join(outputAbs, '_sprite.json');
   await fsp.writeFile(metaPath + '.tmp', JSON.stringify(meta));
   await fsp.rename(metaPath + '.tmp', metaPath);
-
-  // Drop sprite files no longer referenced (e.g., from a previous build that
-  // had more chunks). Main thread is responsible for the manifest commit.
-  const referenced = new Set();
-  for (const k in atlases) for (const sp of atlases[k].sprites) referenced.add(sp.file);
-  for (const e of await fsp.readdir(thumbDir)) {
-    if (/^sprite(-h\d+)?-\d+\.(jpg|avif)$/.test(e) && !referenced.has(e)) {
-      try { await fsp.unlink(path.join(thumbDir, e)); } catch {}
-    }
-  }
 
   parentPort.postMessage({ ok: true, meta });
 }

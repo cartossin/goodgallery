@@ -635,11 +635,17 @@ async function ensureBuilt(folderAbs, filename, opts) {
   const thumbDir = path.join(folderAbs, GG_DIR);
   await fsp.mkdir(thumbDir, { recursive: true });
   await brokenTilesReady();
+  const srcMtime = st.mtimeMs;
   let did = 0;
   for (const tier of LOD_TIERS) {
     if (!phaseAccepts(phase, tier)) continue;
     const out = lodPath(thumbDir, filename, tier.h, tier.format);
-    if (fs.existsSync(out)) continue;
+    // Skip only if the LoD is at least as new as the source. A replaced
+    // original (same name, newer mtime) invalidates every existing tier.
+    try {
+      const outSt = await fsp.stat(out);
+      if (outSt.mtimeMs >= srcMtime) continue;
+    } catch {}
     try {
       if (tier.format === 'v') {
         await vipsHeightThumbV(src, out, tier.h);
@@ -669,8 +675,13 @@ async function readSpriteMeta(galleryAbs) {
   if (spriteMetaCache.has(galleryAbs)) return spriteMetaCache.get(galleryAbs);
   let meta = null;
   try {
-    const raw = await fsp.readFile(path.join(galleryAbs, GG_DIR, '_sprite.json'), 'utf8');
+    const m = manifestCache.get(galleryAbs);
+    const dir = m && m.atlasDir
+      ? path.join(galleryAbs, GG_DIR, m.atlasDir)
+      : path.join(galleryAbs, GG_DIR);  // legacy flat layout
+    const raw = await fsp.readFile(path.join(dir, '_sprite.json'), 'utf8');
     meta = JSON.parse(raw);
+    if (meta && m && m.atlasDir) meta._atlasDir = m.atlasDir;
   } catch {}
   spriteMetaCache.set(galleryAbs, meta);
   return meta;
@@ -682,12 +693,13 @@ async function readSpriteMeta(galleryAbs) {
 // one worker at a time globally — a single 100k atlas build holds ~1GB; running
 // several at once on a moderate-RAM host risks OOM.
 let _spriteWorkerChain = Promise.resolve();
-function _runSpriteWorker(galleryAbs, images) {
+function _runSpriteWorker(galleryAbs, images, outputDir) {
   return new Promise((resolve, reject) => {
     const w = new Worker(new URL('./sprite_worker.js', import.meta.url), {
       workerData: {
         galleryAbs,
         images,
+        outputDir,  // subdir under gg/ (e.g. "atlas_<hash>_building")
         brokenDir: BROKEN_DIR,
         maxSpritePixels: MAX_SPRITE_PIXELS,
         spriteCellWMax: parseInt(process.env.SPRITE_CELL_W_MAX || '600', 10),
@@ -710,6 +722,46 @@ function _runSpriteWorker(galleryAbs, images) {
     });
   });
 }
+// ---------- atlas-dir content hash ----------
+// Hash the gallery's current source state — sorted image names + their
+// mtimes. The atlas content is fully determined by the originals, so if
+// this hash is unchanged the existing atlas is byte-identical. (h5.v is
+// derived, so we don't hash it.) ensureBuilt regenerates LoDs whenever a
+// source becomes newer than its LoD, so source-mtime changes propagate
+// correctly through to atlas content on rebuild.
+async function computeAtlasHash(galleryAbs, images) {
+  const h = crypto.createHash('sha256');
+  for (const name of images) {
+    const stat = await fsp.stat(path.join(galleryAbs, name)).catch(() => null);
+    h.update(name + '\0' + (stat ? Math.floor(stat.mtimeMs) : 0) + '\0');
+  }
+  return h.digest('hex').slice(0, 16);
+}
+
+async function sweepStaleAtlases(thumbDir, keepDir) {
+  let entries;
+  try { entries = await fsp.readdir(thumbDir); } catch { return; }
+  for (const e of entries) {
+    if (!/^atlas_[a-f0-9]+(_building)?$/.test(e)) continue;
+    if (e === keepDir) continue;
+    try { await fsp.rm(path.join(thumbDir, e), { recursive: true, force: true }); } catch {}
+  }
+}
+
+// Remove pre-2b.2 flat-layout sprite+imagemap files at the gg/ root (they
+// now live inside atlas_<hash>/). Called after a rebuild that produced a
+// new-layout manifest — naturally migrates galleries on first rebuild.
+async function sweepLegacyAtlasFiles(thumbDir) {
+  let entries;
+  try { entries = await fsp.readdir(thumbDir); } catch { return; }
+  for (const e of entries) {
+    if (e === '_sprite.json' || e === '_imagemap.bin' ||
+        /^sprite(-h\d+)?-\d+\.(jpg|avif)$/.test(e)) {
+      try { await fsp.unlink(path.join(thumbDir, e)); } catch {}
+    }
+  }
+}
+
 // ---------- atomic per-folder rebuild ----------
 // rebuildFolder is the single entry point for putting a folder into a
 // committed state. The contract: when this resolves successfully, a
@@ -725,50 +777,89 @@ function _runSpriteWorker(galleryAbs, images) {
 
 const rebuildInFlight = new Map();  // galleryAbs -> Promise<void>
 
+function _arraysEqual(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+// rebuildFolderIfNeeded is the public entry point. It does a cheap drift
+// check first — list the folder, hash sources+mtimes, compare against the
+// existing manifest's atlasDir+folders+hiddenFolders+images. If nothing
+// drifted, returns immediately without touching the build queue or sprite
+// worker. Otherwise calls rebuildFolder with the pre-computed target state.
 function rebuildFolderIfNeeded(galleryAbs) {
   if (rebuildInFlight.has(galleryAbs)) return rebuildInFlight.get(galleryAbs);
   const p = (async () => {
-    try { await rebuildFolder(galleryAbs); }
-    catch (e) { console.warn('[rebuild]', galleryAbs, e.message); throw e; }
+    try {
+      const { folders, images } = await listFolder(galleryAbs);
+      const hiddenFolders = await readHiddenSentinels(galleryAbs, folders);
+      const atlasDir = images.length > 0
+        ? 'atlas_' + (await computeAtlasHash(galleryAbs, images))
+        : null;
+      const m = await loadManifest(galleryAbs);
+      if (m &&
+          m.atlasDir === atlasDir &&
+          _arraysEqual(m.images, images) &&
+          _arraysEqual(m.folders, folders) &&
+          _arraysEqual(m.hiddenFolders, hiddenFolders)) {
+        return;  // manifest matches disk; nothing to do
+      }
+      await rebuildFolder(galleryAbs, images, folders, hiddenFolders, atlasDir);
+    } catch (e) { console.warn('[rebuild]', galleryAbs, e.message); throw e; }
     finally { rebuildInFlight.delete(galleryAbs); }
   })();
   rebuildInFlight.set(galleryAbs, p);
   return p;
 }
 
-async function rebuildFolder(galleryAbs) {
-  const { folders, images } = await listFolder(galleryAbs);
+async function rebuildFolder(galleryAbs, images, folders, hiddenFolders, atlasDir) {
   const thumbDir = path.join(galleryAbs, GG_DIR);
   await fsp.mkdir(thumbDir, { recursive: true });
   await sweepFolderTmps(thumbDir);
 
-  // Phase 1: per-image LoDs (parallel via the global worker pool).
+  // Phase 1: per-image LoDs (parallel via the global worker pool). ensureBuilt
+  // is mtime-aware, so this is a near-no-op when LoDs are already current —
+  // we still call it to handle the "one source replaced" case where the hash
+  // changed but most LoDs are still valid.
   if (images.length > 0) {
     await Promise.all(images.map(name => buildQueue.enqueueImage(galleryAbs, name)));
   }
 
-  // Phase 2: atlas + imagemap (serialized globally; one atlas at a time).
-  if (images.length > 0) {
-    const next = _spriteWorkerChain.then(() => _runSpriteWorker(galleryAbs, images));
-    _spriteWorkerChain = next.catch(() => {});
-    const meta = await next;
-    if (meta) spriteMetaCache.set(galleryAbs, meta);
-    else spriteMetaCache.delete(galleryAbs);
+  // Phase 2: atlas + imagemap into atlas_<hash>/. Reuse if the hash dir
+  // already exists (rare path now that the early-out check catches no-ops,
+  // but could happen if the atlas dir survived a manifest deletion).
+  if (atlasDir) {
+    const atlasAbs = path.join(thumbDir, atlasDir);
+    if (!fs.existsSync(atlasAbs)) {
+      const buildingDir = atlasDir + '_building';
+      const buildingAbs = path.join(thumbDir, buildingDir);
+      await fsp.rm(buildingAbs, { recursive: true, force: true });
+      await fsp.mkdir(buildingAbs, { recursive: true });
+      const next = _spriteWorkerChain.then(() => _runSpriteWorker(galleryAbs, images, buildingDir));
+      _spriteWorkerChain = next.catch(() => {});
+      await next;
+      await fsp.rename(buildingAbs, atlasAbs);
+    }
+    spriteMetaCache.delete(galleryAbs);
   } else {
-    // Empty folder: no sprite. Make sure the cache reflects "no sprite".
     spriteMetaCache.delete(galleryAbs);
   }
 
-  // Phase 3: commit manifest. Sentinel files are the source of truth for hidden.
-  const hiddenFolders = await readHiddenSentinels(galleryAbs, folders);
+  // Phase 3: commit manifest.
   const manifest = {
     version: MANIFEST_VERSION,
     builtAt: Date.now(),
     folders,
     images,
     hiddenFolders,
+    atlasDir,
   };
   await writeManifest(galleryAbs, manifest);
+
+  // Phase 4: cleanup stale atlas_* dirs + legacy flat-layout sprite files.
+  await sweepStaleAtlases(thumbDir, atlasDir);
+  await sweepLegacyAtlasFiles(thumbDir);
 }
 
 // ---------- chunked upload ----------
@@ -1124,7 +1215,9 @@ function galleryHTML({ urlPath, folders, hiddenFolders, images, spriteMeta, isAd
   }).join('');
 
   const lastImageValue = images.length;
-  const imagemapURL = spriteMeta ? jsString(urlPath + GG_DIR + '/_imagemap.bin') : 'null';
+  // New layout: atlas_<hash>/_imagemap.bin. Legacy (no atlasDir): flat gg/_imagemap.bin.
+  const _atlasSub = (spriteMeta && spriteMeta._atlasDir) ? (spriteMeta._atlasDir + '/') : '';
+  const imagemapURL = spriteMeta ? jsString(urlPath + GG_DIR + '/' + _atlasSub + '_imagemap.bin') : 'null';
 
   return `<!doctype html>
 <html lang="en">
@@ -1203,7 +1296,7 @@ async function handle(req, res) {
     const dirOfFile = segs[segs.length - 2];
     const grandparent = segs.slice(0, -2);
 
-    // gg/_imagemap.bin and gg/sprite-h<H>-<N>.{jpg,avif} and gg/<image>.h<H>.avif
+    // gg/_imagemap.bin and gg/sprite-h<H>-<N>.{jpg,avif} (legacy flat layout)
     if (dirOfFile === GG_DIR && fileName === '_imagemap.bin') {
       const galleryAbs = resolveGallery(grandparent);
       if (!galleryAbs) return notFound(res);
@@ -1213,6 +1306,13 @@ async function handle(req, res) {
       const galleryAbs = resolveGallery(grandparent);
       if (!galleryAbs) return notFound(res);
       return serveStaticFile(req, res, path.join(galleryAbs, GG_DIR, fileName));
+    }
+    // gg/atlas_<hash>/_imagemap.bin and gg/atlas_<hash>/sprite-h<H>-<N>.{jpg,avif}
+    if (/^atlas_[a-f0-9]+$/.test(dirOfFile) && segs.length >= 3 && segs[segs.length - 3] === GG_DIR &&
+        (fileName === '_imagemap.bin' || /^sprite(?:-h\d+)?-\d+\.(jpg|avif)$/.test(fileName))) {
+      const galleryAbs = resolveGallery(segs.slice(0, -3));
+      if (!galleryAbs) return notFound(res);
+      return serveStaticFile(req, res, path.join(galleryAbs, GG_DIR, dirOfFile, fileName));
     }
     if (dirOfFile === GG_DIR && /\.h\d+\.avif$/.test(fileName)) {
       const galleryAbs = resolveGallery(grandparent);
