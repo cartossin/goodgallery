@@ -22,6 +22,12 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
 
+// Single-threaded vips per subprocess. We do our own parallelism via the
+// BuildQueue worker pool — letting libvips spin internal threads on top
+// only causes lock contention and thread-setup overhead (esp. on tiny h5/h10
+// LoDs that finish in milliseconds).
+process.env.VIPS_CONCURRENCY = process.env.VIPS_CONCURRENCY || "1";
+
 // ---------- config ----------
 const PORT             = parseInt(process.env.PORT || '3000', 10);
 const HOST             = process.env.HOST || '0.0.0.0';
