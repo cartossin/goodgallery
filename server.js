@@ -179,47 +179,32 @@ class BuildQueue {
   constructor(concurrency) {
     this.concurrency = concurrency;
     this.queue = [];
-    this.inFlight = new Set();
+    this.inFlight = new Map();
     this.workers = 0;
     this.progress = new Map();
     this.doneAt = [];  // timestamps of completed jobs (trimmed to last 60s on read)
   }
   _key(g, f, phase) { return g + '\0' + f + '\0' + (phase || 'all'); }
   _bumpProgress(g, fn) {
-    const p = this.progress.get(g) || { pending: 0, inProgress: 0, done: 0, total: 0, recent: [] };
+    const p = this.progress.get(g) || { pending: 0, inProgress: 0, done: 0, total: 0 };
     fn(p);
     this.progress.set(g, p);
   }
-  enqueue(galleryAbs, filename, opts) {
-    const phase = (opts && opts.phase) || 'all';
-    const k = this._key(galleryAbs, filename, phase);
-    if (this.inFlight.has(k)) return false;
-    this.inFlight.add(k);
-    this.queue.push({ galleryAbs, filename, phase });
-    this._bumpProgress(galleryAbs, p => { p.pending++; p.total++; });
-    this._kick();
-    return true;
-  }
-  async enqueueFolder(galleryAbs, opts) {
-    const phase = (opts && opts.phase) || 'all';
-    const { images } = await listFolder(galleryAbs);
-    let n = 0;
-    for (const f of images) {
-      if (!needsBuildForPhase(galleryAbs, f, phase)) continue;
-      if (this.enqueue(galleryAbs, f, opts)) n++;
-    }
-    if (n > 0) markFolderDirty(galleryAbs).catch(()=>{});
-    return n;
-  }
-  // Resolves once the queue is fully drained.
-  drainPromise() {
-    return new Promise((resolve) => {
-      const tick = () => {
-        if (this.queue.length === 0 && this.workers === 0) resolve();
-        else setTimeout(tick, 500);
-      };
-      setTimeout(tick, 500);
+  // Enqueue a single image build. Returns a Promise that resolves once
+  // ensureBuilt completes (success OR failure — failures are logged and
+  // resolved; rebuildFolder's atlas step handles missing LoDs by retrying
+  // on the next call). Per-(folder,file) dedupe: a second concurrent
+  // enqueue for the same image returns the existing in-flight promise.
+  enqueueImage(galleryAbs, filename) {
+    const k = this._key(galleryAbs, filename, 'all');
+    if (this.inFlight.has(k)) return this.inFlight.get(k);
+    const p = new Promise((resolve, reject) => {
+      this.queue.push({ galleryAbs, filename, resolve, reject });
     });
+    this.inFlight.set(k, p);
+    this._bumpProgress(galleryAbs, x => { x.pending++; x.total++; });
+    this._kick();
+    return p;
   }
   _kick() {
     while (this.workers < this.concurrency && this.queue.length) {
@@ -230,45 +215,41 @@ class BuildQueue {
   async _runOne() {
     try {
       while (this.queue.length) {
-        const { galleryAbs, filename, phase } = this.queue.shift();
-        const k = this._key(galleryAbs, filename, phase);
+        const { galleryAbs, filename, resolve } = this.queue.shift();
+        const k = this._key(galleryAbs, filename, 'all');
         this._bumpProgress(galleryAbs, p => { p.pending--; p.inProgress++; });
         try {
-          await ensureBuilt(galleryAbs, filename, { phase });
-          this._bumpProgress(galleryAbs, p => {
-            p.done++;
-            p.recent.unshift(filename);
-            if (p.recent.length > 10) p.recent.length = 10;
-          });
+          await ensureBuilt(galleryAbs, filename);
+          this._bumpProgress(galleryAbs, p => { p.done++; });
           this.doneAt.push(Date.now());
         } catch (e) {
+          // ensureBuilt substitutes broken.svg on vips errors (commit 1),
+          // so we only end up here for missing-source / unsupported-type
+          // failures. Resolve the promise anyway so Promise.all in
+          // rebuildFolder doesn't hang; the atlas bake will read whatever's
+          // on disk (and re-enqueue happens on the next rebuild trigger).
           this._bumpProgress(galleryAbs, p => { p.lastError = filename + ': ' + e.message; });
           console.warn('[build]', filename, 'in', galleryAbs, '-', e.message);
         } finally {
           this._bumpProgress(galleryAbs, p => { p.inProgress--; });
           this.inFlight.delete(k);
-          // Debounced sprite rebuild on folder drain.
-          const after = this.progress.get(galleryAbs);
-          if (after && after.pending === 0 && after.inProgress === 0 && after.total > 0) {
-            scheduleSpriteBuild(galleryAbs);
-          }
-          markFolderCleanIfIdle(galleryAbs).catch(()=>{});
+          resolve();
         }
       }
     } finally { this.workers--; }
   }
-  // Drop all queued (not-yet-started) work and clear inFlight markers for
-  // them so a later enqueue can re-add. Workers currently inside _runOne keep
-  // running — interrupting a half-written tile would orphan a .__tmp file.
-  // Returns the count of queued items dropped.
+  // Drop all queued (not-yet-started) work. Workers currently inside
+  // _runOne keep running — interrupting a half-written tile would orphan a
+  // .__tmp file. Returns the count of queued items dropped.
   clear() {
     const dropped = this.queue.length;
-    // Remove inFlight markers for items still in the queue (not yet picked up).
     for (const job of this.queue) {
-      const k = this._key(job.galleryAbs, job.filename, job.phase);
+      const k = this._key(job.galleryAbs, job.filename, 'all');
       this.inFlight.delete(k);
+      // Awaiting rebuildFolder coroutines need their promises resolved so they
+      // don't hang. Treat clear() as "all queued jobs finished" (no-op build).
+      job.resolve();
     }
-    // Bulk-decrement pending counts per gallery.
     const perGallery = new Map();
     for (const job of this.queue) {
       perGallery.set(job.galleryAbs, (perGallery.get(job.galleryAbs) || 0) + 1);
@@ -298,30 +279,14 @@ class BuildQueue {
   }
   progressFor(galleryAbs) {
     const p = this.progress.get(galleryAbs);
-    if (!p) return { pending: 0, inProgress: 0, done: 0, total: 0, recent: [] };
-    return { pending: p.pending, inProgress: p.inProgress, done: p.done, total: p.total, recent: p.recent.slice(), lastError: p.lastError };
-  }
-  async scanAll(root, opts) {
-    let totalQueued = 0;
-    const walk = async (dir) => {
-      let entries;
-      try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { return; }
-      for (const e of entries) {
-        if (e.name.startsWith('.') || RESERVED.has(e.name)) continue;
-        if (e.isDirectory()) await walk(path.join(dir, e.name));
-      }
-      totalQueued += await this.enqueueFolder(dir, opts);
-    };
-    await walk(root);
-    return totalQueued;
+    if (!p) return { pending: 0, inProgress: 0, done: 0, total: 0 };
+    return { pending: p.pending, inProgress: p.inProgress, done: p.done, total: p.total, lastError: p.lastError };
   }
 }
 
-// ---------- crash-recovery: per-folder dirty flag ----------
-// Each manifest carries a 'building' flag set at start-of-build and cleared
-// when the folder is fully idle. On read, building=true + not-currently-busy
-// means a previous process died mid-build: sweep .__tmp files and re-enqueue.
-
+// ---------- tmp-file sweep ----------
+// Atomic writes leave .__tmp.* on the way to their final names; a kill mid-
+// write strands them. rebuildFolder sweeps these at the start of a bake.
 async function sweepFolderTmps(thumbDir) {
   let entries;
   try { entries = await fsp.readdir(thumbDir); } catch { return 0; }
@@ -332,29 +297,6 @@ async function sweepFolderTmps(thumbDir) {
     }
   }
   return removed;
-}
-
-function isFolderBusy(galleryAbs) {
-  const p = buildQueue ? buildQueue.progressFor(galleryAbs) : null;
-  if (p && (p.pending > 0 || p.inProgress > 0)) return true;
-  if (spriteInFlight && spriteInFlight.has(galleryAbs)) return true;
-  if (spriteDebounceTimers && spriteDebounceTimers.has(galleryAbs)) return true;
-  return false;
-}
-
-async function markFolderDirty(galleryAbs) {
-  const m = await loadManifest(galleryAbs);
-  if (m.building) return;
-  m.building = true;
-  try { await writeManifest(galleryAbs, m); } catch (e) { console.warn('[markDirty]', galleryAbs, e.message); }
-}
-
-async function markFolderCleanIfIdle(galleryAbs) {
-  if (isFolderBusy(galleryAbs)) return;
-  const m = manifestCache.get(galleryAbs);
-  if (!m || !m.building) return;
-  m.building = false;
-  try { await writeManifest(galleryAbs, m); } catch (e) { console.warn('[markClean]', galleryAbs, e.message); }
 }
 
 const buildQueue = new BuildQueue(BUILD_CONCURRENCY);
@@ -537,10 +479,10 @@ async function loadManifest(galleryAbs) {
       return m;
     }
   } catch {}
-  // Cold gallery: readdir once, persist, cache.
-  const m = await buildManifestFromDisk(galleryAbs);
-  await writeManifest(galleryAbs, m);
-  return m;
+  // Cold gallery: caller is expected to kick rebuildFolderIfNeeded and
+  // render a placeholder. We do NOT auto-write a manifest here — that would
+  // violate the invariant "manifest exists ⇒ all referenced files are built".
+  return null;
 }
 
 // Insort into a natural-numeric-sorted array; returns false on dup.
@@ -563,32 +505,7 @@ function spliceName(arr, name) {
   return true;
 }
 
-// Best-effort mutations: log + swallow on write failure. Drift is corrected
-// by Full Rescan.
-async function manifestAddImage(galleryAbs, name) {
-  try {
-    const m = await loadManifest(galleryAbs);
-    if (insortUnique(m.images, name)) { m.builtAt = Date.now(); await writeManifest(galleryAbs, m); }
-  } catch (e) { console.warn('[manifest:addImage]', galleryAbs, name, e.message); }
-}
-async function manifestRemoveImage(galleryAbs, name) {
-  try {
-    const m = await loadManifest(galleryAbs);
-    if (spliceName(m.images, name)) { m.builtAt = Date.now(); await writeManifest(galleryAbs, m); }
-  } catch (e) { console.warn('[manifest:removeImage]', galleryAbs, name, e.message); }
-}
-async function manifestAddFolder(galleryAbs, name) {
-  try {
-    const m = await loadManifest(galleryAbs);
-    if (insortUnique(m.folders, name)) { m.builtAt = Date.now(); await writeManifest(galleryAbs, m); }
-  } catch (e) { console.warn('[manifest:addFolder]', galleryAbs, name, e.message); }
-}
-async function manifestRemoveFolder(galleryAbs, name) {
-  try {
-    const m = await loadManifest(galleryAbs);
-    if (spliceName(m.folders, name)) { m.builtAt = Date.now(); await writeManifest(galleryAbs, m); }
-  } catch (e) { console.warn('[manifest:removeFolder]', galleryAbs, name, e.message); }
-}
+
 
 // Hidden state is canonical on disk as <folder>/gg/hidden (empty sentinel
 // file). Manifest still caches hiddenFolders for O(1) pageview reads, but a
@@ -608,60 +525,19 @@ async function readHiddenSentinels(galleryAbs, folderNames) {
 // Hidden folders are filtered from the public folder grid but stay reachable
 // by direct URL. Source of truth is the disk sentinel; this updates that
 // sentinel first, then mirrors the change into the cached hiddenFolders array.
-async function manifestSetHidden(galleryAbs, name, hide) {
-  const ggDir = path.join(galleryAbs, name, GG_DIR);
+// Toggle the hidden sentinel for a child folder. The parent's manifest
+// rebuild reads sentinels into manifest.hiddenFolders[]; this function
+// just touches the disk state. Caller is responsible for triggering the
+// parent rebuild.
+async function toggleHiddenSentinel(folderAbs, hide) {
+  const ggDir = path.join(folderAbs, GG_DIR);
   const sentinel = path.join(ggDir, 'hidden');
-  try {
-    if (hide) {
-      await fsp.mkdir(ggDir, { recursive: true });
-      await fsp.writeFile(sentinel, '');
-    } else {
-      await fsp.unlink(sentinel).catch(() => {});
-    }
-  } catch (e) {
-    console.warn('[manifest:setHidden:sentinel]', galleryAbs, name, e.message);
-    return;
+  if (hide) {
+    await fsp.mkdir(ggDir, { recursive: true });
+    try { await fsp.access(sentinel); } catch { await fsp.writeFile(sentinel, ''); }
+  } else {
+    try { await fsp.unlink(sentinel); } catch {}
   }
-  try {
-    const m = await loadManifest(galleryAbs);
-    if (!Array.isArray(m.hiddenFolders)) m.hiddenFolders = [];
-    const idx = m.hiddenFolders.indexOf(name);
-    if (hide && idx < 0) { m.hiddenFolders.push(name); m.hiddenFolders.sort(); }
-    else if (!hide && idx >= 0) { m.hiddenFolders.splice(idx, 1); }
-    else return; // no change
-    m.builtAt = Date.now();
-    await writeManifest(galleryAbs, m);
-  } catch (e) { console.warn('[manifest:setHidden]', galleryAbs, name, e.message); }
-}
-
-// Rebuild from disk (drift correction). Used by Full Rescan.
-async function rebuildManifest(galleryAbs) {
-  // Preserve admin-set fields that aren't derivable from listFolder().
-  const existing = await loadManifest(galleryAbs).catch(() => ({}));
-  const m = await buildManifestFromDisk(galleryAbs);
-  // Migration: any legacy hiddenFolders entry that still refers to a real
-  // subfolder gets its sentinel stamped now. Stale names (folders that no
-  // longer exist on disk) are dropped silently — don't materialize garbage
-  // dirs for them. Run after buildManifestFromDisk so we know the live set.
-  if (Array.isArray(existing.hiddenFolders) && existing.hiddenFolders.length > 0) {
-    const live = new Set(m.folders);
-    for (const name of existing.hiddenFolders) {
-      if (!live.has(name)) continue;
-      try {
-        const ggDir = path.join(galleryAbs, name, GG_DIR);
-        await fsp.mkdir(ggDir, { recursive: true });
-        const sentinel = path.join(ggDir, 'hidden');
-        try { await fsp.access(sentinel); }
-        catch { await fsp.writeFile(sentinel, ''); }
-      } catch (e) {
-        console.warn('[manifest:rebuild:hidden-migrate]', galleryAbs, name, e.message);
-      }
-    }
-  }
-  m.hiddenFolders = await readHiddenSentinels(galleryAbs, m.folders);
-  if (existing.building) m.building = existing.building;
-  await writeManifest(galleryAbs, m);
-  return m;
 }
 
 
@@ -747,15 +623,6 @@ function phaseAccepts(phase, tier) {
   return false;
 }
 
-function needsBuildForPhase(folderAbs, filename, phase) {
-  const thumbDir = path.join(folderAbs, GG_DIR);
-  for (const tier of LOD_TIERS) {
-    if (!phaseAccepts(phase, tier)) continue;
-    if (!fs.existsSync(lodPath(thumbDir, filename, tier.h, tier.format))) return true;
-  }
-  return false;
-}
-
 async function ensureBuilt(folderAbs, filename, opts) {
   if (!isImage(filename)) throw new Error('unsupported');
   const phase = (opts && opts.phase) || 'all';
@@ -809,29 +676,18 @@ async function readSpriteMeta(galleryAbs) {
   return meta;
 }
 
-// Sprite matches the manifest AND is the current version. Used by both the
-// pageview path (decide whether to ship sprite metadata to the client) and
-// maybeBuildSprite (decide whether to re-run the worker).
-function spriteIsCurrent(meta, images, galleryAbs) {
-  if (!meta || meta.version !== 5 || !meta.atlases) return false;
-  if (meta.imageCount !== images.length) return false;
-  if (!fs.existsSync(path.join(galleryAbs, GG_DIR, '_imagemap.bin'))) return false;
-  return true;
-}
-
-// Per-folder dedupe so concurrent triggers don't run two builds at once.
-const spriteInFlight = new Set();
 // Sprite atlas builds are CPU-heavy synchronous JS (pixel-copy 100k tiles at
 // 100k-image scale takes minutes). Run them in a worker thread so pageview
 // handling on the main thread stays responsive. We still gate concurrency to
 // one worker at a time globally — a single 100k atlas build holds ~1GB; running
 // several at once on a moderate-RAM host risks OOM.
 let _spriteWorkerChain = Promise.resolve();
-function _runSpriteWorker(galleryAbs) {
+function _runSpriteWorker(galleryAbs, images) {
   return new Promise((resolve, reject) => {
     const w = new Worker(new URL('./sprite_worker.js', import.meta.url), {
       workerData: {
         galleryAbs,
+        images,
         brokenDir: BROKEN_DIR,
         maxSpritePixels: MAX_SPRITE_PIXELS,
         spriteCellWMax: parseInt(process.env.SPRITE_CELL_W_MAX || '600', 10),
@@ -854,39 +710,65 @@ function _runSpriteWorker(galleryAbs) {
     });
   });
 }
-async function maybeBuildSprite(galleryAbs) {
-  if (spriteInFlight.has(galleryAbs)) return;
-  spriteInFlight.add(galleryAbs);
-  try {
-    // Cheap pre-check on the main thread: don't even spawn a worker if the
-    // sprite is already current. readSpriteMeta hits the spriteMetaCache.
-    const m = await loadManifest(galleryAbs);
-    const existing = await readSpriteMeta(galleryAbs);
-    if (spriteIsCurrent(existing, m.images, galleryAbs)) return;
-    // Global serial chain — at most one sprite worker runs at a time.
-    const next = _spriteWorkerChain.then(() => _runSpriteWorker(galleryAbs));
+// ---------- atomic per-folder rebuild ----------
+// rebuildFolder is the single entry point for putting a folder into a
+// committed state. The contract: when this resolves successfully, a
+// _manifest.json exists on disk and every file it references is fully
+// built (LoDs + sprite + imagemap).
+//
+// Flow:
+//   1. listFolder → target image+folder set from disk
+//   2. enqueueImage(folderAbs, name) for each image → Promise.all
+//   3. bakeAtlas(folderAbs, images) — serialized globally via _spriteWorkerChain
+//   4. readHiddenSentinels → manifest.hiddenFolders
+//   5. atomic write of _manifest.json
+
+const rebuildInFlight = new Map();  // galleryAbs -> Promise<void>
+
+function rebuildFolderIfNeeded(galleryAbs) {
+  if (rebuildInFlight.has(galleryAbs)) return rebuildInFlight.get(galleryAbs);
+  const p = (async () => {
+    try { await rebuildFolder(galleryAbs); }
+    catch (e) { console.warn('[rebuild]', galleryAbs, e.message); throw e; }
+    finally { rebuildInFlight.delete(galleryAbs); }
+  })();
+  rebuildInFlight.set(galleryAbs, p);
+  return p;
+}
+
+async function rebuildFolder(galleryAbs) {
+  const { folders, images } = await listFolder(galleryAbs);
+  const thumbDir = path.join(galleryAbs, GG_DIR);
+  await fsp.mkdir(thumbDir, { recursive: true });
+  await sweepFolderTmps(thumbDir);
+
+  // Phase 1: per-image LoDs (parallel via the global worker pool).
+  if (images.length > 0) {
+    await Promise.all(images.map(name => buildQueue.enqueueImage(galleryAbs, name)));
+  }
+
+  // Phase 2: atlas + imagemap (serialized globally; one atlas at a time).
+  if (images.length > 0) {
+    const next = _spriteWorkerChain.then(() => _runSpriteWorker(galleryAbs, images));
     _spriteWorkerChain = next.catch(() => {});
     const meta = await next;
     if (meta) spriteMetaCache.set(galleryAbs, meta);
-    else spriteMetaCache.delete(galleryAbs);  // worker deferred (missing LoDs) — let next read pick up freshly
-  } catch (e) { console.warn('[sprite]', galleryAbs, e.message); }
-  finally {
-    spriteInFlight.delete(galleryAbs);
-    markFolderCleanIfIdle(galleryAbs).catch(()=>{});
+    else spriteMetaCache.delete(galleryAbs);
+  } else {
+    // Empty folder: no sprite. Make sure the cache reflects "no sprite".
+    spriteMetaCache.delete(galleryAbs);
   }
-}
 
-// Debounce so a burst of build-completes collapses into one sprite rebuild.
-const SPRITE_DEBOUNCE_MS = parseInt(process.env.SPRITE_DEBOUNCE_MS || '1000', 10);
-const spriteDebounceTimers = new Map();
-function scheduleSpriteBuild(galleryAbs) {
-  const existing = spriteDebounceTimers.get(galleryAbs);
-  if (existing) clearTimeout(existing);
-  markFolderDirty(galleryAbs).catch(()=>{});
-  spriteDebounceTimers.set(galleryAbs, setTimeout(() => {
-    spriteDebounceTimers.delete(galleryAbs);
-    maybeBuildSprite(galleryAbs).finally(() => markFolderCleanIfIdle(galleryAbs).catch(()=>{}));
-  }, SPRITE_DEBOUNCE_MS));
+  // Phase 3: commit manifest. Sentinel files are the source of truth for hidden.
+  const hiddenFolders = await readHiddenSentinels(galleryAbs, folders);
+  const manifest = {
+    version: MANIFEST_VERSION,
+    builtAt: Date.now(),
+    folders,
+    images,
+    hiddenFolders,
+  };
+  await writeManifest(galleryAbs, manifest);
 }
 
 // ---------- chunked upload ----------
@@ -1072,9 +954,9 @@ async function handleUploadAPI(req, res, pathname, method) {
     try { await fsp.rm(path.join(UPLOAD_DIR, id), { recursive: true, force: true }); } catch {}
     uploads.delete(id);
 
-    // Awaited so an immediate refresh sees the new image.
-    await manifestAddImage(targetAbs, info.filename);
-    buildQueue.enqueue(targetAbs, info.filename);
+    // Trigger a folder rebuild — when it completes, the manifest will
+    // include the new image and the page will render normally.
+    rebuildFolderIfNeeded(targetAbs).catch(()=>{});
 
     return sendJson(res, 200, { ok: true, path: info.targetFolderRel + info.filename });
   }
@@ -1372,17 +1254,11 @@ async function handle(req, res) {
   });
   if (q.has('movetotrash')) return adminAction(req, res, () => movetotrash(abs, q.get('movetotrash')));
   if (q.has('build-status')) {
-    // Global rolling counters. spriteUpToDate is per-folder (the polled
-    // folder's atlas) and exists solely so the reload-after-upload poller
-    // doesn't reload before the sprite bake finishes. Never displayed.
+    // Global rolling counters. spriteUpToDate is per-folder and answers
+    // "does this folder have a committed manifest yet?" — the reload-after-
+    // upload poller waits for it. Never displayed.
     const status = buildQueue.globalProgress();
-    let spriteOk = false;
-    try {
-      const sMeta = await readSpriteMeta(abs);
-      const sMan = manifestCache.get(abs) || await loadManifest(abs).catch(() => ({ images: [] }));
-      spriteOk = spriteIsCurrent(sMeta, sMan.images, abs);
-    } catch {}
-    status.spriteUpToDate = spriteOk;
+    status.spriteUpToDate = fs.existsSync(manifestPathFor(abs));
     return sendJson(res, 200, status);
   }
   if (q.get('api') === 'list') {
@@ -1406,7 +1282,7 @@ async function handle(req, res) {
     let made = true;
     try { await fsp.mkdir(path.join(abs, name), { recursive: false }); }
     catch { made = false; }
-    if (made) await manifestAddFolder(abs, name);
+    if (made) rebuildFolderIfNeeded(abs).catch(()=>{});
     return sendJson(res, 200, { ok: true });
   }
   if (q.has('sethidden') && method === 'POST') {
@@ -1418,12 +1294,9 @@ async function handle(req, res) {
     let st;
     try { st = fs.statSync(path.join(abs, name)); } catch { return badRequest(res, 'no such subfolder'); }
     if (!st.isDirectory()) return badRequest(res, 'not a folder');
-    // Ensure the parent manifest knows about the folder so the hidden flag has
-    // something to filter against on render.
-    const mh = await loadManifest(abs);
-    if (!mh.folders.includes(name)) await manifestAddFolder(abs, name);
     const hide = q.get('hide') !== '0';
-    await manifestSetHidden(abs, name, hide);
+    await toggleHiddenSentinel(path.join(abs, name), hide);
+    rebuildFolderIfNeeded(abs).catch(()=>{});
     return sendJson(res, 200, { ok: true, name, hidden: hide });
   }
   if (q.has('upload') && method === 'POST') {
@@ -1431,39 +1304,28 @@ async function handle(req, res) {
     return handleUpload(req, res, abs, q);
   }
 
-  // Two on-view triggers piggyback on the manifest read:
-  //   1. Lazy-build  — no manifest yet → queue a full build.
-  //   2. Crash-recovery — manifest.building=true but folder is idle → sweep
-  //      .__tmp orphans and re-enqueue.
-  const manifestExisted = fs.existsSync(manifestPathFor(abs));
-  const m = await loadManifest(abs);
-  const folders = m.folders, images = m.images;
-  if (!manifestExisted && images.length > 0) {
-    buildQueue.enqueueFolder(abs).then(n => {
-      if (n) console.log('[lazy-build]', abs, 'queued', n, 'job(s)');
-      // Only kick sprite directly if no LoD work was queued (folder was already
-      // built). Otherwise the drain-finally trigger fires it once the queue
-      // finishes — kicking it now would race the LoD builds and produce a
-      // mostly-placeholder sprite.
-      else scheduleSpriteBuild(abs);
-    }).catch(e => console.warn('[lazy-build]', abs, e.message));
-  } else if (m.building && !isFolderBusy(abs)) {
-    (async () => {
-      const removed = await sweepFolderTmps(path.join(abs, GG_DIR));
-      const queued = await buildQueue.enqueueFolder(abs);
-      console.log('[crash-recover]', abs, 'queued:', queued, 'swept:', removed);
-      if (queued === 0) {
-        m.building = false; await writeManifest(abs, m);
-        scheduleSpriteBuild(abs);
-      }
-    })().catch(e => console.warn('[crash-recover]', abs, e.message));
+  // Cold path: no manifest yet (first visit or post-mutation). Kick a
+  // rebuild and render a placeholder gallery (folders+images from disk,
+  // spriteMeta=null → client shows "Building…" banner and polls).
+  let m = await loadManifest(abs);
+  let folders, images, hiddenFolders, spriteMeta;
+  if (m) {
+    folders = m.folders;
+    images = m.images;
+    hiddenFolders = Array.isArray(m.hiddenFolders) ? m.hiddenFolders : [];
+    spriteMeta = await readSpriteMeta(abs);
+  } else {
+    rebuildFolderIfNeeded(abs).catch(()=>{});
+    const live = await listFolder(abs);
+    folders = live.folders;
+    images = live.images;
+    hiddenFolders = await readHiddenSentinels(abs, folders);
+    spriteMeta = null;
   }
-  let spriteMeta = await readSpriteMeta(abs);
-  if (!spriteIsCurrent(spriteMeta, images, abs)) spriteMeta = null;
   const html = galleryHTML({
     urlPath: pathname,
     folders,
-    hiddenFolders: Array.isArray(m.hiddenFolders) ? m.hiddenFolders : [],
+    hiddenFolders,
     images,
     spriteMeta,
     isAdminFlag: isAdmin(req),
@@ -1509,7 +1371,7 @@ async function movetotrash(folderAbs, filename) {
     renamed = true;
   }
   await fsp.rename(src, dst);
-  await manifestRemoveImage(folderAbs, filename);
+  rebuildFolderIfNeeded(folderAbs).catch(()=>{});
   return renamed
     ? `${filename} moved to trash (renamed to avoid collision)`
     : `${filename} moved to trash`;
@@ -1525,9 +1387,8 @@ async function restoreFromTrash(folderAbs, name) {
   const dst = path.join(folderAbs, name);
   if (fs.existsSync(dst)) throw new Error(`'${name}' already exists; rename or remove it first, then retry`);
   await fsp.rename(src, dst);
-  if (st.isDirectory()) await manifestAddFolder(folderAbs, name);
-  else if (isImage(name)) await manifestAddImage(folderAbs, name);
   try { await fsp.rmdir(trashDirFor(folderAbs)); } catch {}
+  rebuildFolderIfNeeded(folderAbs).catch(()=>{});
   return `restored ${name}`;
 }
 
@@ -1551,11 +1412,11 @@ async function deleteFolderToTrash(folderAbs) {
     renamed = true;
   }
   await fsp.rename(folderAbs, dst);
-  await manifestRemoveFolder(parentAbs, name);
   manifestCache.delete(folderAbs);
   for (const k of Array.from(manifestCache.keys())) {
     if (k.startsWith(folderAbs + path.sep)) manifestCache.delete(k);
   }
+  rebuildFolderIfNeeded(parentAbs).catch(()=>{});
   return renamed
     ? `${name} moved to trash (renamed to avoid collision)`
     : `${name} moved to trash`;
@@ -1778,50 +1639,12 @@ async function handleAdminAPI(req, res, pathname, method) {
               if (!RESERVED.has(e.name)) { subs.push(e.name); hasContent = true; }
             } else if (e.isFile() && isImage(e.name)) hasContent = true;
           }
-          if (hasContent) { try { await rebuildManifest(dir); rebuilt++; } catch (e) { console.warn('[fullrescan:manifest]', dir, e.message); } }
+          if (hasContent) { try { await rebuildFolderIfNeeded(dir); rebuilt++; } catch (e) { console.warn('[fullrescan:rebuild]', dir, e.message); } }
           for (const sub of subs) await walkRebuild(path.join(dir, sub));
         }
-        try { await rebuildManifest(GALLERIES_ROOT); rebuilt++; } catch {}
+        try { await rebuildFolderIfNeeded(GALLERIES_ROOT); rebuilt++; } catch {}
         await walkRebuild(GALLERIES_ROOT);
-        // Sprite pass FIRST, before any LoD queueing. Fire-and-forget so the
-        // overall rescan doesn't block on a single slow gallery's atlas
-        // rebuild. maybeBuildSprite serializes via _spriteWorkerChain anyway —
-        // we just don't want forceWalk awaiting that chain, because a 100k-
-        // image atlas can take ~10 min and we want LoD enqueueing to start
-        // immediately so vips/vipsthumbnail workers can spin up in parallel.
-        // A gallery whose phase-1 isn't complete will defer in the worker
-        // (returns null), then re-trigger via the queue's drain-debounce
-        // once its h100.v + earlier tiers finish.
-        let spriteKicked = 0;
-        async function forceWalk(dir) {
-          let entries;
-          try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { return; }
-          let hasImages = false;
-          const subs = [];
-          for (const e of entries) {
-            if (e.name.startsWith('.')) continue;
-            if (e.isDirectory()) {
-              if (!RESERVED.has(e.name)) subs.push(e.name);
-            } else if (e.isFile() && isImage(e.name)) hasImages = true;
-          }
-          if (hasImages) {
-            // No await — schedule into the worker chain and move on.
-            maybeBuildSprite(dir).catch(e => console.warn('[fullrescan:sprite]', dir, e.message));
-            spriteKicked++;
-          }
-          for (const sub of subs) await forceWalk(path.join(dir, sub));
-        }
-        await forceWalk(GALLERIES_ROOT);
-        // Now queue the missing LoDs; the queue runs in the background, and
-        // its per-folder drain trigger reruns the sprite build as folders
-        // complete. No await on drainPromise — fullrescan returns once work
-        // is queued, not when work finishes.
-        let queuedV = 0;
-        for (const tierH of ATLAS_TIERS) {
-          queuedV += await buildQueue.scanAll(GALLERIES_ROOT, { phase: 'h' + tierH });
-        }
-        const b = await buildQueue.scanAll(GALLERIES_ROOT, { phase: 'avif' });
-        console.log('[fullrescan] manifests=' + rebuilt + ' sprites-kicked=' + spriteKicked + ' v-queued=' + queuedV + ' avif-queued=' + b);
+        console.log('[fullrescan] folders=' + rebuilt);
       } catch (e) { console.warn('[fullrescan]', e.message); }
       finally { fullrescanInProgress = false; }
     })();

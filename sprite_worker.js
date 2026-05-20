@@ -3,6 +3,7 @@
 //
 // Inputs (workerData):
 //   - galleryAbs       absolute path to the gallery folder
+//   - images           sorted list of image filenames to atlas
 //   - brokenDir        path to the global broken-tile dir (unused; kept for compatibility)
 //   - maxSpritePixels  byte-budget translated to pixels (matches main's MAX_SPRITE_PIXELS)
 //   - spriteCellWMax   max cell width in pixels
@@ -15,10 +16,9 @@ import fsp from 'fs/promises';
 import path from 'path';
 import { spawn } from 'child_process';
 
-const { galleryAbs, brokenDir, maxSpritePixels, spriteCellWMax } = workerData;
+const { galleryAbs, images, brokenDir, maxSpritePixels, spriteCellWMax } = workerData;
 const GG_DIR = 'gg';
 const VIPS_HEADER_BYTES = 64;
-const MANIFEST_VERSION = 1;
 const ATLAS_HEIGHTS = [
   { h: 5, format: 'v' },
   { h: 10, format: 'v' },
@@ -249,22 +249,17 @@ async function writeBinaryImagemap(thumbDir, images, aspects) {
 
 async function main() {
   const thumbDir = path.join(galleryAbs, GG_DIR);
-  let m;
-  try { m = JSON.parse(await fsp.readFile(path.join(thumbDir, '_manifest.json'), 'utf8')); }
-  catch (e) { throw new Error('cannot read manifest: ' + e.message); }
-  if (!m || m.version !== MANIFEST_VERSION || !Array.isArray(m.images)) {
-    throw new Error('invalid manifest');
-  }
-  const images = m.images;
-  if (images.length === 0) {
+  if (!Array.isArray(images) || images.length === 0) {
     parentPort.postMessage({ ok: true, meta: null });
     return;
   }
+
+  // All LoDs are guaranteed present (rebuildFolder awaited them before calling
+  // this worker). Still — verify defensively to surface bugs early.
   for (const f of images) {
     for (const at of ATLAS_HEIGHTS) {
       if (!fs.existsSync(lodPath(thumbDir, f, at.h, at.format))) {
-        parentPort.postMessage({ ok: true, meta: null });
-        return;
+        throw new Error('missing LoD: ' + f + ' h' + at.h + '.' + at.format);
       }
     }
   }
@@ -291,6 +286,8 @@ async function main() {
   await fsp.writeFile(metaPath + '.tmp', JSON.stringify(meta));
   await fsp.rename(metaPath + '.tmp', metaPath);
 
+  // Drop sprite files no longer referenced (e.g., from a previous build that
+  // had more chunks). Main thread is responsible for the manifest commit.
   const referenced = new Set();
   for (const k in atlases) for (const sp of atlases[k].sprites) referenced.add(sp.file);
   for (const e of await fsp.readdir(thumbDir)) {
