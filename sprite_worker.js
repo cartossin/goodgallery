@@ -6,7 +6,6 @@
 //   - images           sorted list of image filenames to atlas
 //   - outputDir        subdir under gg/ to write atlas files into (e.g. "atlas_<hash>_building").
 //                      If absent, falls back to the legacy flat layout (gg/ itself).
-//   - brokenDir        path to the global broken-tile dir (unused; kept for compatibility)
 //   - maxSpritePixels  byte-budget translated to pixels (matches main's MAX_SPRITE_PIXELS)
 //   - spriteCellWMax   max cell width in pixels
 //
@@ -18,7 +17,7 @@ import fsp from 'fs/promises';
 import path from 'path';
 import { spawn } from 'child_process';
 
-const { galleryAbs, images, outputDir, brokenDir, maxSpritePixels, spriteCellWMax } = workerData;
+const { galleryAbs, images, outputDir, maxSpritePixels, spriteCellWMax } = workerData;
 const GG_DIR = 'gg';
 const VIPS_HEADER_BYTES = 64;
 const ATLAS_HEIGHTS = [
@@ -30,9 +29,6 @@ const ATLAS_HEIGHTS = [
 
 function lodPath(thumbDir, filename, height, format) {
   return path.join(thumbDir, filename + '.h' + height + '.' + format);
-}
-function brokenTilePath(height, format) {
-  return path.join(brokenDir, 'broken.h' + height + '.' + format);
 }
 
 function runStep(cmd, args, expectedOutput) {

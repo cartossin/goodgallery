@@ -52,8 +52,6 @@ function lodPath(thumbDir, filename, height, format) {
   return path.join(thumbDir, filename + '.h' + height + '.' + format);
 }
 
-// Atlas tiers are built smallest-first so the gallery is usable as soon as h5 lands.
-const ATLAS_TIERS = [5, 10, 50, 100];
 // Sprite size is capped by target file bytes. Translate bytes → pixel budget via
 // an empirical bytes/pixel constant; tune BYTES_PER_PIXEL_Q92 lower for flat-color
 // content, higher for extreme detail.
@@ -184,7 +182,7 @@ class BuildQueue {
     this.progress = new Map();
     this.doneAt = [];  // timestamps of completed jobs (trimmed to last 60s on read)
   }
-  _key(g, f, phase) { return g + '\0' + f + '\0' + (phase || 'all'); }
+  _key(g, f) { return g + '\0' + f; }
   _bumpProgress(g, fn) {
     const p = this.progress.get(g) || { pending: 0, inProgress: 0, done: 0, total: 0 };
     fn(p);
@@ -196,7 +194,7 @@ class BuildQueue {
   // on the next call). Per-(folder,file) dedupe: a second concurrent
   // enqueue for the same image returns the existing in-flight promise.
   enqueueImage(galleryAbs, filename) {
-    const k = this._key(galleryAbs, filename, 'all');
+    const k = this._key(galleryAbs, filename);
     if (this.inFlight.has(k)) return this.inFlight.get(k);
     const p = new Promise((resolve, reject) => {
       this.queue.push({ galleryAbs, filename, resolve, reject });
@@ -216,7 +214,7 @@ class BuildQueue {
     try {
       while (this.queue.length) {
         const { galleryAbs, filename, resolve } = this.queue.shift();
-        const k = this._key(galleryAbs, filename, 'all');
+        const k = this._key(galleryAbs, filename);
         this._bumpProgress(galleryAbs, p => { p.pending--; p.inProgress++; });
         try {
           await ensureBuilt(galleryAbs, filename);
@@ -244,7 +242,7 @@ class BuildQueue {
   clear() {
     const dropped = this.queue.length;
     for (const job of this.queue) {
-      const k = this._key(job.galleryAbs, job.filename, 'all');
+      const k = this._key(job.galleryAbs, job.filename);
       this.inFlight.delete(k);
       // Awaiting rebuildFolder coroutines need their promises resolved so they
       // don't hang. Treat clear() as "all queued jobs finished" (no-op build).
@@ -612,25 +610,13 @@ function runStep(cmd, args, expectedOutput) {
   });
 }
 
-// Does `tier` match `phase`? phase is 'all' | 'v' | 'avif' | 'h<N>'.
-function phaseAccepts(phase, tier) {
-  if (!phase || phase === 'all') return true;
-  if (phase === 'v') return tier.format === 'v';
-  if (phase === 'avif') return tier.format === 'avif';
-  if (phase.charCodeAt(0) === 104 /* 'h' */) {
-    return tier.h === parseInt(phase.slice(1), 10);
-  }
-  return false;
-}
-
-async function ensureBuilt(folderAbs, filename, opts) {
+async function ensureBuilt(folderAbs, filename) {
   if (!isImage(filename)) throw new Error('unsupported');
-  const phase = (opts && opts.phase) || 'all';
   const src = path.join(folderAbs, filename);
   let st;
   try { st = await fsp.stat(src); } catch { throw new Error('missing original'); }
   if (process.env.GG_DEBUG_BUILDS) {
-    console.log('[build]', filename, 'phase=' + phase, 'size=' + st.size);
+    console.log('[build]', filename, 'size=' + st.size);
   }
   const thumbDir = path.join(folderAbs, GG_DIR);
   await fsp.mkdir(thumbDir, { recursive: true });
@@ -638,7 +624,6 @@ async function ensureBuilt(folderAbs, filename, opts) {
   const srcMtime = st.mtimeMs;
   let did = 0;
   for (const tier of LOD_TIERS) {
-    if (!phaseAccepts(phase, tier)) continue;
     const out = lodPath(thumbDir, filename, tier.h, tier.format);
     // Skip only if the LoD is at least as new as the source. A replaced
     // original (same name, newer mtime) invalidates every existing tier.
@@ -681,7 +666,17 @@ async function readSpriteMeta(galleryAbs) {
       : path.join(galleryAbs, GG_DIR);  // legacy flat layout
     const raw = await fsp.readFile(path.join(dir, '_sprite.json'), 'utf8');
     meta = JSON.parse(raw);
-    if (meta && m && m.atlasDir) meta._atlasDir = m.atlasDir;
+    if (meta && m && m.atlasDir) {
+      meta._atlasDir = m.atlasDir;
+      // Prepend atlasDir to sprite filenames so the client's URL builder
+      // (folderURL + GG_DIR + '/' + sprites[i].file) lands at the right
+      // path. Legacy galleries (no atlasDir) keep their flat filenames.
+      for (const k of Object.keys(meta.atlases || {})) {
+        for (const s of meta.atlases[k].sprites) {
+          if (!s.file.includes('/')) s.file = m.atlasDir + '/' + s.file;
+        }
+      }
+    }
   } catch {}
   spriteMetaCache.set(galleryAbs, meta);
   return meta;
@@ -1726,11 +1721,13 @@ async function handleAdminAPI(req, res, pathname, method) {
     if (!isAdmin(req)) return sendJson(res, 401, { error: 'admin only' });
     if (fullrescanInProgress) return sendJson(res, 409, { error: 'a full rescan is already running' });
     fullrescanInProgress = true;
-    // Fire-and-forget. scanAll walks the tree once per phase and enqueues
-    // missing tiers; the client polls ?build-status to track progress.
+    // Fire-and-forget. walkRebuild dispatches a rebuildFolderIfNeeded per
+    // folder; the client polls ?build-status to track progress.
     (async () => {
       try {
-        // Manifest pass first — picks up files dropped outside the uploader.
+        // Walk the gallery tree. For each folder with content, dispatch a
+        // rebuildFolderIfNeeded (fire-and-forget). The drift check is cheap
+        // for already-current folders; actual rebuilds run in the background.
         let rebuilt = 0;
         async function walkRebuild(dir) {
           let entries;
