@@ -798,12 +798,16 @@ function rebuildFolderIfNeeded(galleryAbs) {
         ? 'atlas_' + (await computeAtlasHash(galleryAbs, images))
         : null;
       const m = await loadManifest(galleryAbs);
+      // Treat absent atlasDir (pre-2b.2 legacy v1 manifests) as a wildcard:
+      // those galleries serve fine via the URL routing's flat-layout fallback,
+      // and Full Rescan should not stampede atlas migration. New mutations
+      // (upload/delete) still produce new-layout output on the next rebuild.
       if (m &&
-          m.atlasDir === atlasDir &&
           _arraysEqual(m.images, images) &&
           _arraysEqual(m.folders, folders) &&
-          _arraysEqual(m.hiddenFolders, hiddenFolders)) {
-        return;  // manifest matches disk; nothing to do
+          _arraysEqual(m.hiddenFolders, hiddenFolders) &&
+          (!m.atlasDir || m.atlasDir === atlasDir)) {
+        return;
       }
       await rebuildFolder(galleryAbs, images, folders, hiddenFolders, atlasDir);
     } catch (e) { console.warn('[rebuild]', galleryAbs, e.message); throw e; }
@@ -1739,10 +1743,15 @@ async function handleAdminAPI(req, res, pathname, method) {
               if (!RESERVED.has(e.name)) { subs.push(e.name); hasContent = true; }
             } else if (e.isFile() && isImage(e.name)) hasContent = true;
           }
-          if (hasContent) { try { await rebuildFolderIfNeeded(dir); rebuilt++; } catch (e) { console.warn('[fullrescan:rebuild]', dir, e.message); } }
+          if (hasContent) {
+            // Fire-and-forget per folder. rebuildFolderIfNeeded handles dedup
+            // and per-folder atomicity internally; the walk just dispatches.
+            rebuildFolderIfNeeded(dir).catch(e => console.warn('[fullrescan:rebuild]', dir, e.message));
+            rebuilt++;
+          }
           for (const sub of subs) await walkRebuild(path.join(dir, sub));
         }
-        try { await rebuildFolderIfNeeded(GALLERIES_ROOT); rebuilt++; } catch {}
+        rebuildFolderIfNeeded(GALLERIES_ROOT).catch(()=>{}); rebuilt++;
         await walkRebuild(GALLERIES_ROOT);
         console.log('[fullrescan] folders=' + rebuilt);
       } catch (e) { console.warn('[fullrescan]', e.message); }
