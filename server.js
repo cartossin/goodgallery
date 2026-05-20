@@ -87,9 +87,10 @@ function isValidTrashName(name) {
 }
 
 // ---------- broken-image placeholder ----------
-// Files that vips can't parse are tracked per-folder in manifest.unbuildableImages.
-// Their tier requests are served from pre-rendered placeholder tiles so the gallery
-// shows a visible "broken image" tile instead of going dark or stalling the sprite.
+// vips failures are caught per-tier in ensureBuilt; we copy the matching
+// pre-rendered broken tile into the actual LoD path. Downstream (sprite
+// build, URL serving) reads the LoD path unconditionally — the gallery
+// never knows the image was unbuildable, it just shows a red-X tile.
 const BROKEN_SVG = path.join(PUBLIC_DIR, 'broken.svg');
 const BROKEN_DIR = path.join(STATE_DIR, '_broken');
 function brokenTilePath(height, format) {
@@ -196,11 +197,8 @@ class BuildQueue {
   async enqueueFolder(galleryAbs, opts) {
     const phase = (opts && opts.phase) || 'all';
     const { images } = await listFolder(galleryAbs);
-    const m = await loadManifest(galleryAbs).catch(() => ({}));
-    const unbuildable = new Set(Array.isArray(m.unbuildableImages) ? m.unbuildableImages : []);
     let n = 0;
     for (const f of images) {
-      if (unbuildable.has(f)) continue;
       if (!needsBuildForPhase(galleryAbs, f, phase)) continue;
       if (this.enqueue(galleryAbs, f, opts)) n++;
     }
@@ -240,9 +238,6 @@ class BuildQueue {
         } catch (e) {
           this._bumpProgress(galleryAbs, p => { p.lastError = filename + ': ' + e.message; });
           console.warn('[build]', filename, 'in', galleryAbs, '-', e.message);
-          // Permanently bad source: mark unbuildable so sprite build skips it
-          // and serving substitutes the placeholder. Full Rescan resets the list.
-          manifestAddUnbuildable(galleryAbs, filename).catch(()=>{});
         } finally {
           this._bumpProgress(galleryAbs, p => { p.inProgress--; });
           this.inFlight.delete(k);
@@ -567,18 +562,8 @@ function spliceName(arr, name) {
 async function manifestAddImage(galleryAbs, name) {
   try {
     const m = await loadManifest(galleryAbs);
-    let dirty = insortUnique(m.images, name);
-    // Re-uploading a previously-broken file should let it retry.
-    if (Array.isArray(m.unbuildableImages) && spliceName(m.unbuildableImages, name)) dirty = true;
-    if (dirty) { m.builtAt = Date.now(); await writeManifest(galleryAbs, m); }
+    if (insortUnique(m.images, name)) { m.builtAt = Date.now(); await writeManifest(galleryAbs, m); }
   } catch (e) { console.warn('[manifest:addImage]', galleryAbs, name, e.message); }
-}
-async function manifestAddUnbuildable(galleryAbs, name) {
-  try {
-    const m = await loadManifest(galleryAbs);
-    if (!Array.isArray(m.unbuildableImages)) m.unbuildableImages = [];
-    if (insortUnique(m.unbuildableImages, name)) { m.builtAt = Date.now(); await writeManifest(galleryAbs, m); }
-  } catch (e) { console.warn('[manifest:addUnbuildable]', galleryAbs, name, e.message); }
 }
 async function manifestRemoveImage(galleryAbs, name) {
   try {
@@ -776,15 +761,26 @@ async function ensureBuilt(folderAbs, filename, opts) {
   }
   const thumbDir = path.join(folderAbs, GG_DIR);
   await fsp.mkdir(thumbDir, { recursive: true });
+  await brokenTilesReady();
   let did = 0;
   for (const tier of LOD_TIERS) {
     if (!phaseAccepts(phase, tier)) continue;
     const out = lodPath(thumbDir, filename, tier.h, tier.format);
     if (fs.existsSync(out)) continue;
-    if (tier.format === 'v') {
-      await vipsHeightThumbV(src, out, tier.h);
-    } else if (tier.format === 'avif') {
-      await vipsHeightThumbAVIF(src, out, tier.h, tier.quality);
+    try {
+      if (tier.format === 'v') {
+        await vipsHeightThumbV(src, out, tier.h);
+      } else if (tier.format === 'avif') {
+        await vipsHeightThumbAVIF(src, out, tier.h, tier.quality);
+      }
+    } catch (e) {
+      // Source can't be rendered (corrupt, libheif limit, exotic format).
+      // Drop in the pre-rendered broken tile so the LoD exists and the
+      // gallery shows a red-X. mtime check on the LoD prevents retry.
+      const tmp = out + '.__broken.tmp';
+      await fsp.copyFile(brokenTilePath(tier.h, tier.format), tmp);
+      await fsp.rename(tmp, out);
+      console.warn('[build:broken]', filename, 'tier h' + tier.h + ':', e.message);
     }
     did++;
   }
@@ -1333,16 +1329,8 @@ async function handle(req, res) {
     if (dirOfFile === GG_DIR && /\.h\d+\.avif$/.test(fileName)) {
       const galleryAbs = resolveGallery(grandparent);
       if (!galleryAbs) return notFound(res);
-      // Substitute the placeholder tier for unbuildable source images.
-      const m = /^(.+)\.h(\d+)\.(avif)$/.exec(fileName);
-      if (m) {
-        const srcName = m[1], tierH = parseInt(m[2], 10);
-        const mf = await loadManifest(galleryAbs).catch(() => ({}));
-        if (Array.isArray(mf.unbuildableImages) && mf.unbuildableImages.includes(srcName)) {
-          await brokenTilesReady();
-          return serveStaticFile(req, res, brokenTilePath(tierH, 'avif'));
-        }
-      }
+      // Unbuildable sources had their broken tile copied to the LoD path
+      // by ensureBuilt — just serve whatever's there.
       return serveStaticFile(req, res, path.join(galleryAbs, GG_DIR, fileName));
     }
 

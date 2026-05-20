@@ -3,7 +3,7 @@
 //
 // Inputs (workerData):
 //   - galleryAbs       absolute path to the gallery folder
-//   - brokenDir        path to the global broken-tile dir (for unbuildable substitutes)
+//   - brokenDir        path to the global broken-tile dir (unused; kept for compatibility)
 //   - maxSpritePixels  byte-budget translated to pixels (matches main's MAX_SPRITE_PIXELS)
 //   - spriteCellWMax   max cell width in pixels
 //
@@ -199,7 +199,7 @@ async function packAndEncodeSprite(inputPaths, cellW, cellH, across, dstAvif) {
   await fsp.rename(avifTmp, dstAvif);
 }
 
-async function buildAtlasAtHeight(thumbDir, images, aspects, height, inputFormat, unbuildable) {
+async function buildAtlasAtHeight(thumbDir, images, aspects, height, inputFormat) {
   const cellH = height;
   const widths = aspects.map(a => Math.round(a * height));
   const cellW = Math.min(spriteCellWMax, Math.max(cellH, ...widths));
@@ -214,7 +214,7 @@ async function buildAtlasAtHeight(thumbDir, images, aspects, height, inputFormat
   for (let c = 0; c < numChunks; c++) {
     const chunk = images.slice(c * cellsPerSprite, (c + 1) * cellsPerSprite);
     const inputPaths = chunk.map(name =>
-      unbuildable.has(name) ? brokenTilePath(height, inputFormat) : lodPath(thumbDir, name, height, inputFormat));
+      lodPath(thumbDir, name, height, inputFormat));
     const spriteFile = 'sprite-h' + height + '-' + c + '.avif';
     const spriteAbs = path.join(thumbDir, spriteFile);
     console.log('[sprite-worker] building ' + spriteFile + ': ' + chunk.length + ' tiles, cell ' + cellW + 'x' + cellH + ', across ' + across);
@@ -260,10 +260,7 @@ async function main() {
     parentPort.postMessage({ ok: true, meta: null });
     return;
   }
-  const unbuildable = new Set(Array.isArray(m.unbuildableImages) ? m.unbuildableImages : []);
-
   for (const f of images) {
-    if (unbuildable.has(f)) continue;
     for (const at of ATLAS_HEIGHTS) {
       if (!fs.existsSync(lodPath(thumbDir, f, at.h, at.format))) {
         parentPort.postMessage({ ok: true, meta: null });
@@ -273,14 +270,13 @@ async function main() {
   }
 
   const aspects = images.map(f => {
-    if (unbuildable.has(f)) return 1.0;
     const d = readVipsHeader(lodPath(thumbDir, f, 50, 'v'));
     return d ? d.w / 50 : 1.6;
   });
 
   const atlases = {};
   for (const at of ATLAS_HEIGHTS) {
-    atlases[String(at.h)] = await buildAtlasAtHeight(thumbDir, images, aspects, at.h, at.format, unbuildable);
+    atlases[String(at.h)] = await buildAtlasAtHeight(thumbDir, images, aspects, at.h, at.format);
   }
 
   await writeBinaryImagemap(thumbDir, images, aspects);
