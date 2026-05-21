@@ -196,7 +196,13 @@
   function scheduleRender() {
     if (rafPending) return;
     rafPending = true;
-    requestAnimationFrame(function () { rafPending = false; renderGallery(); });
+    requestAnimationFrame(function () {
+      rafPending = false;
+      renderGallery();
+      // Keep zoom-control disabled state synced with the dynamic sort
+      // order — fit's effective height changes with the viewport.
+      renderZoomControl();
+    });
   }
 
   function chromeHeight() {
