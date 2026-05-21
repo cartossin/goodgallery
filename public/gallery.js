@@ -2259,6 +2259,7 @@
 
   // ---------- hash routing ----------
   function refreshfromhash() {
+    showAdminBar();
     var raw = decodeURIComponent(location.hash.slice(1) || '');
     // #fit and #sizeN → ZOOM_LEVELS entries; bare names → focus.
     var levels = availableLevels();
@@ -2420,7 +2421,7 @@
 
   // Cookie is HttpOnly; the probe is the only way to detect a valid session.
   function maybePromoteAdmin() {
-    if (window.isadmin) return;
+    if (window.isadmin) { showAdminBar(); return; }
     fetch('/api/admin/probe', { credentials: 'same-origin' })
       .then(function (r) {
         if (r.ok) { window.isadmin = 1; showAdminBar(); }
