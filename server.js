@@ -789,6 +789,18 @@ function _arraysEqual(a, b) {
 // existing manifest's atlasDir+folders+hiddenFolders+images. If nothing
 // drifted, returns immediately without touching the build queue or sprite
 // worker. Otherwise calls rebuildFolder with the pre-computed target state.
+// Legacy manifests (pre-2b.2, no atlasDir) lack a stored content hash.
+// Detect source drift the only way we can: compare each source's mtime
+// against the manifest builtAt. Any source newer than the build → drift.
+async function legacyManifestFresh(galleryAbs, images, builtAt) {
+  if (!builtAt) return false;
+  for (const name of images) {
+    const stat = await fsp.stat(path.join(galleryAbs, name)).catch(() => null);
+    if (stat && stat.mtimeMs > builtAt) return false;
+  }
+  return true;
+}
+
 function rebuildFolderIfNeeded(galleryAbs) {
   if (rebuildInFlight.has(galleryAbs)) return rebuildInFlight.get(galleryAbs);
   const p = (async () => {
@@ -799,15 +811,20 @@ function rebuildFolderIfNeeded(galleryAbs) {
         ? 'atlas_' + (await computeAtlasHash(galleryAbs, images))
         : null;
       const m = await loadManifest(galleryAbs);
-      // Treat absent atlasDir (pre-2b.2 legacy v1 manifests) as a wildcard:
-      // those galleries serve fine via the URL routing's flat-layout fallback,
-      // and Full Rescan should not stampede atlas migration. New mutations
-      // (upload/delete) still produce new-layout output on the next rebuild.
+      // Atlas-freshness check:
+      //   • new-layout manifest: stored atlasDir must equal the computed hash
+      //   • legacy manifest (no atlasDir): no stored hash to compare, so fall
+      //     back to comparing source mtimes against manifest.builtAt. This
+      //     keeps Full Rescan from forcibly migrating untouched legacy
+      //     galleries while still catching real source changes (touch / replace).
+      const atlasFresh = m && m.atlasDir
+        ? (m.atlasDir === atlasDir)
+        : (m && await legacyManifestFresh(galleryAbs, images, m.builtAt));
       if (m &&
           _arraysEqual(m.images, images) &&
           _arraysEqual(m.folders, folders) &&
           _arraysEqual(m.hiddenFolders, hiddenFolders) &&
-          (!m.atlasDir || m.atlasDir === atlasDir)) {
+          atlasFresh) {
         return;
       }
       await rebuildFolder(galleryAbs, images, folders, hiddenFolders, atlasDir);
