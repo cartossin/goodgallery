@@ -468,7 +468,13 @@ async function writeManifest(galleryAbs, m) {
 
 async function loadManifest(galleryAbs) {
   const cached = manifestCache.get(galleryAbs);
-  if (cached) return cached;
+  if (cached) {
+    // Cache coherence: if the disk file was deleted out from under us
+    // (manual rm, Full Rescan staging, etc.), the cached copy is stale.
+    // Verify presence on the cheap before trusting the cache.
+    if (fs.existsSync(manifestPathFor(galleryAbs))) return cached;
+    manifestCache.delete(galleryAbs);
+  }
   try {
     const raw = await fsp.readFile(manifestPathFor(galleryAbs), 'utf8');
     const m = JSON.parse(raw);
