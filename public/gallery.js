@@ -347,6 +347,42 @@
     renderZoomControl();
   }
 
+  // ZOOM_LEVELS sorted by effective device-px height. fit's h-value
+  // resolves to fitAllHeight() * dpr at sort time so its position floats
+  // with the viewport. focus is pinned to the end.
+  function sortedLevels() {
+    var arr = ZOOM_LEVELS.slice();
+    var fitH = fitAllHeight() * devicePixelRatio();
+    arr.sort(function (a, b) {
+      if (a.h === 'focus') return 1;
+      if (b.h === 'focus') return -1;
+      var ah = a.h == null ? fitH : a.h;
+      var bh = b.h == null ? fitH : b.h;
+      return ah - bh;
+    });
+    return arr;
+  }
+
+  // Step the current level in the sorted (by effective height) view.
+  // -1 → genuinely smaller, +1 → genuinely bigger, regardless of where
+  // fit sits in the order this frame.
+  function stepLevel(delta) {
+    var sorted = sortedLevels();
+    var curName = ZOOM_LEVELS[currentLevelIdx] && ZOOM_LEVELS[currentLevelIdx].name;
+    if (!curName) return;
+    var idx = -1;
+    for (var i = 0; i < sorted.length; i++) {
+      if (sorted[i].name === curName) { idx = i; break; }
+    }
+    if (idx < 0) return;
+    var next = idx + delta;
+    if (next < 0 || next >= sorted.length) return;
+    var nextName = sorted[next].name;
+    for (var j = 0; j < ZOOM_LEVELS.length; j++) {
+      if (ZOOM_LEVELS[j].name === nextName) { setLevel(j); return; }
+    }
+  }
+
   // [-] Label [+] in grid mode; [↑] in focus mode.
   function renderZoomControl() {
     var el = document.getElementById('zoomControl');
@@ -370,14 +406,22 @@
     if (idx < 0) idx = 0;
     if (idx > levels.length - 1) idx = levels.length - 1;
     var name = levels[idx].name;
+    // Disable [-] only when current level is the smallest by effective
+    // height (per the dynamic sort). [+] stays enabled — past size6 it
+    // walks into focus, which is the up-arrow behavior the user expects.
+    var sorted = sortedLevels();
+    var sortedIdx = 0;
+    for (var i = 0; i < sorted.length; i++) {
+      if (sorted[i].name === name) { sortedIdx = i; break; }
+    }
     el.innerHTML =
-      '<button class="zoom-minus" title="Zoom out"' + (idx === 0 ? ' disabled' : '') + '>−</button>' +
+      '<button class="zoom-minus" title="Zoom out"' + (sortedIdx === 0 ? ' disabled' : '') + '>−</button>' +
       '<span class="zoom-label">' + name + '</span>' +
       '<button class="zoom-plus" title="Zoom in">+</button>';
     var minus = el.querySelector('.zoom-minus');
     var plus = el.querySelector('.zoom-plus');
-    if (minus) minus.addEventListener('click', function () { setLevel(currentLevelIdx - 1); });
-    if (plus) plus.addEventListener('click', function () { setLevel(currentLevelIdx + 1); });
+    if (minus) minus.addEventListener('click', function () { stepLevel(-1); });
+    if (plus) plus.addEventListener('click', function () { stepLevel(+1); });
   }
 
   function targetRowHeight() {
