@@ -749,6 +749,21 @@ async function sweepStaleAtlases(thumbDir, keepDir) {
   }
 }
 
+// Remove per-image LoDs whose source file no longer exists (deletion left
+// orphans behind). Matches <name>.h<digits>.<v|avif> and tests <name> for
+// membership in the live image set.
+async function sweepOrphanLoDs(thumbDir, imageSet) {
+  let entries;
+  try { entries = await fsp.readdir(thumbDir); } catch { return; }
+  for (const e of entries) {
+    const m = /^(.+)\.h\d+\.(v|avif)$/.exec(e);
+    if (!m) continue;
+    if (!imageSet.has(m[1])) {
+      try { await fsp.unlink(path.join(thumbDir, e)); } catch {}
+    }
+  }
+}
+
 // Remove pre-2b.2 flat-layout sprite+imagemap files at the gg/ root (they
 // now live inside atlas_<hash>/). Called after a rebuild that produced a
 // new-layout manifest — naturally migrates galleries on first rebuild.
@@ -882,6 +897,7 @@ async function rebuildFolder(galleryAbs, images, folders, hiddenFolders, atlasDi
   // Phase 4: cleanup stale atlas_* dirs + legacy flat-layout sprite files.
   await sweepStaleAtlases(thumbDir, atlasDir);
   await sweepLegacyAtlasFiles(thumbDir);
+  await sweepOrphanLoDs(thumbDir, new Set(images));
 }
 
 // ---------- chunked upload ----------
