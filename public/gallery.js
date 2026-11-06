@@ -644,7 +644,7 @@
   // fast the scrollbar is flicked; the real tier lands on top of it. Its
   // bitmaps are closed after upload (a context swap refetches from the HTTP
   // cache). A tier whose cells are too wide to afford is skipped.
-  var FLOOR_MAX_BYTES = 32 * 1024 * 1024;
+  var FLOOR_MAX_BYTES = 48 * 1024 * 1024;  // 100k images at 4:1 h5 cells = 40 MB
   var floorTierKey;                       // undefined until decided; null = none affordable
   var floorSpritesLoading = new Set();
 
