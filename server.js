@@ -1437,10 +1437,6 @@ async function handle(req, res) {
     rebuildFolderIfNeeded(abs).catch(()=>{});
     return sendJson(res, 200, { ok: true, name, hidden: hide });
   }
-  if (q.has('upload') && method === 'POST') {
-    if (!isAdmin(req)) return sendText(res, 403, 'admin only');
-    return handleUpload(req, res, abs, q);
-  }
 
   // Cold path: no manifest yet (first visit or post-mutation). Kick a
   // rebuild and render a placeholder gallery (folders+images from disk,
@@ -1647,68 +1643,6 @@ async function emptyFolderTrash(folderAbs) {
     if (entries.length === 0) await fsp.rmdir(legacy);
   } catch {}
 })();
-
-// ---------- upload (admin) ----------
-// Single-shot multipart/form-data upload. The chunked upload API above is the
-// preferred path for large files.
-async function handleUpload(req, res, abs, q) {
-  const ct = req.headers['content-type'] || '';
-  const m = ct.match(/^multipart\/form-data;\s*boundary=(.+)$/i);
-  if (!m) return badRequest(res, 'expected multipart/form-data');
-  const boundary = '--' + m[1];
-  const body = await readBody(req, 1024 * 1024 * 1024);
-
-  const parts = splitMultipart(body, boundary);
-  const filePart = parts.find(p => /filename="([^"]+)"/.test(p.headers['content-disposition'] || ''));
-  if (!filePart) return badRequest(res, 'no file');
-  const fnMatch = (filePart.headers['content-disposition'] || '').match(/filename="([^"]+)"/);
-  const filename = path.basename(fnMatch[1]);
-  if (!isImage(filename)) return badRequest(res, 'unsupported file type');
-  if (filename.startsWith('.') || RESERVED.has(filename)) return badRequest(res, 'invalid filename');
-  const dst = path.join(abs, filename);
-  if (fs.existsSync(dst)) return sendText(res, 409, 'already exists');
-  const tmp = dst + '.__tmp' + path.extname(dst);
-  await new Promise((resolve, reject) => {
-    const ws = fs.createWriteStream(tmp);
-    ws.on('error', reject);
-    ws.on('finish', resolve);
-    ws.end(filePart.body);
-  });
-  await fsp.rename(tmp, dst);
-  // Fire-and-forget pre-build.
-  ensureBuilt(abs, filename).catch(()=>{});
-  return sendJson(res, 200, { ok: true, filename });
-}
-
-function splitMultipart(buf, boundary) {
-  const sep = Buffer.from('\r\n' + boundary);
-  // First boundary has no leading CRLF.
-  const firstSep = Buffer.from(boundary);
-  const out = [];
-  let start = buf.indexOf(firstSep);
-  if (start < 0) return out;
-  start += firstSep.length;
-  while (start < buf.length) {
-    if (buf[start] === 0x2d && buf[start + 1] === 0x2d) break; // -- = end
-    // skip optional CRLF
-    if (buf[start] === 0x0d && buf[start + 1] === 0x0a) start += 2;
-    const end = buf.indexOf(sep, start);
-    if (end < 0) break;
-    const partBuf = buf.slice(start, end);
-    const headerEnd = partBuf.indexOf(Buffer.from('\r\n\r\n'));
-    if (headerEnd < 0) break;
-    const hdrText = partBuf.slice(0, headerEnd).toString('utf8');
-    const headers = {};
-    for (const line of hdrText.split('\r\n')) {
-      const i = line.indexOf(':');
-      if (i > 0) headers[line.slice(0, i).toLowerCase()] = line.slice(i + 1).trim();
-    }
-    const body = partBuf.slice(headerEnd + 4);
-    out.push({ headers, body });
-    start = end + sep.length;
-  }
-  return out;
-}
 
 // ---------- admin auth API ----------
 async function handleTrashAPI(req, res, pathname, method, u) {
