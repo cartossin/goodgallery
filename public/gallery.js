@@ -78,7 +78,6 @@
 
   function $(id) { return document.getElementById(id); }
   function setText(id, t) { var e = $(id); if (e) e.textContent = t; }
-  function setHTML(id, h) { var e = $(id); if (e) e.innerHTML = h; }
 
   // ---------- realtime monitor ----------
   function note(msg) {
@@ -88,13 +87,11 @@
   }
   function gghttp(method, qs, onText) {
     var url = folderURL + (qs ? '?' + qs : '');
-    fetch(url, { method: method, credentials: 'same-origin', headers: adminHeader() })
+    fetch(url, { method: method, credentials: 'same-origin' })
       .then(function (r) { return r.text(); })
       .then(function (t) { onText(t); })
       .catch(function () { onText(''); });
   }
-  // Auth is an HttpOnly cookie; no client-side token handling needed.
-  function adminHeader() { return {}; }
 
   // The page just monitors server-side build state; mutations live in /_admin/.
   var statusTimer = null;
@@ -114,7 +111,7 @@
     opts = opts || {};
     var reloadOnComplete = !!opts.reloadOnComplete;
     if (statusTimer) { clearTimeout(statusTimer); statusTimer = null; }
-    fetch(folderURL + '?build-status', { headers: adminHeader() })
+    fetch(folderURL + '?build-status')
       .then(function (r) { return r.json(); })
       .then(function (p) {
         if (p.remaining > 0) {
@@ -137,7 +134,6 @@
 
   // ---------- nav helpers ----------
 
-  function isThumbView() { return focusedIdx === 0; }
   function leftbutton()  { if (focusedIdx > 0) shiftFocus(-1); }
   function rightbutton() { if (focusedIdx > 0) shiftFocus(+1); }
   // commandedIdx is the most-recently-requested focus target. Fast successive
@@ -208,19 +204,6 @@
       // order — fit's effective height changes with the viewport.
       renderZoomControl();
     });
-  }
-
-  function chromeHeight() {
-    var top = document.getElementById('topbar');
-    var foot = document.getElementById('bottomlink');
-    return (top ? top.offsetHeight : 50) + (foot ? foot.offsetHeight : 50) + 24;
-  }
-
-  function avgThumbWidth() {
-    if (!window.spriteMeta || !spriteMeta.imageMap) return 200;
-    var sum = 0, n = 0;
-    for (var k in spriteMeta.imageMap) { sum += spriteMeta.imageMap[k].w; n++; }
-    return n ? sum / n : 200;
   }
 
   // Binary-search the largest target row height H such that the actual layout's total
@@ -2312,13 +2295,21 @@
     var bar = $('adminnotify');
     if (!window.isadmin) { bar.classList.remove('on'); return; }
     bar.classList.add('on');
-    bar.innerHTML = focusedIdx > 0
-      ? '<button onclick="ggMoveToTrash()">Move to trash</button>' +
-        '<a href="/_admin/" style="margin-left:auto">Admin panel →</a>'
-      : '<a href="/_admin/" style="margin-left:auto">Admin panel →</a>';
+    bar.textContent = '';
+    if (focusedIdx > 0) {
+      var trashButton = document.createElement('button');
+      trashButton.textContent = 'Move to trash';
+      trashButton.addEventListener('click', moveFocusedToTrash);
+      bar.appendChild(trashButton);
+    }
+    var adminLink = document.createElement('a');
+    adminLink.href = '/_admin/';
+    adminLink.style.marginLeft = 'auto';
+    adminLink.textContent = 'Admin panel →';
+    bar.appendChild(adminLink);
   }
   // ---------- admin actions ----------
-  function ggMoveToTrash() {
+  function moveFocusedToTrash() {
     // No confirm — trash is reversible via the admin panel's per-folder trash.
     if (focusedIdx <= 0) return;
     var name = images[focusedIdx];
@@ -2424,9 +2415,6 @@
       })
       .catch(function () {});
   }
-
-  // Inline handler reachable from showAdminBar's innerHTML.
-  window.ggMoveToTrash = ggMoveToTrash;
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', startjs);
   else startjs();
