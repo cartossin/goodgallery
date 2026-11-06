@@ -1305,9 +1305,14 @@ var imagemapURL      = ${imagemapURL};
 
 // ---------- request handler ----------
 async function handle(req, res) {
-  const u = new URL(req.url, `http://${req.headers.host}`);
   const method = req.method;
-  const pathname = decodeURIComponent(u.pathname);
+  let u, pathname;
+  try {
+    u = new URL(req.url, `http://${req.headers.host}`);
+    pathname = decodeURIComponent(u.pathname);
+  } catch {
+    return badRequest(res, 'malformed URL');
+  }
 
   if (pathname.startsWith('/_static/')) {
     return serveStatic(req, res, pathname.slice('/_static/'.length));
