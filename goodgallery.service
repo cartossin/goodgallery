@@ -4,8 +4,13 @@ After=network.target
 
 [Service]
 Type=simple
+User=goodgallery
+Group=goodgallery
 WorkingDirectory=/opt/goodgallery
 ExecStart=/usr/bin/node /opt/goodgallery/server.js
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
 Restart=on-failure
 RestartSec=2
 Environment=NODE_ENV=production
