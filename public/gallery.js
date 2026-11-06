@@ -501,16 +501,24 @@
       return n;
     },
     perImageBitmapCount: function () { return perImageBitmapsSync.size; },
+    perImageTextureCount: function () { return perImageTextures.size; },
   };
-  // Per-image bitmaps for high-zoom views. Keyed by `${name}|${tierH}`.
-  var perImageBitmaps = new Map();
-  // Sync mirror so paintMain can pick the best resolved tier without awaiting.
-  var perImageBitmapsSync = new Map();
+  // ---- per-image loads --------------------------------------------------
+  // Tiles above the largest atlas tier are fetched one AVIF per image. Two
+  // consumers want different things from the decoded ImageBitmap:
+  //   grid  → a GL texture. The bitmap is closed right after upload; the
+  //           grid never reads it again, and keeping it doubled the memory
+  //           of every large tile.
+  //   focus → the bitmap itself, drawn through the 2D main canvas.
+  // Both share one fetch/decode queue. Keys are `${name}|${tierH}`.
+  var perImageTextures = new Set();       // keys whose texture is on the GPU
+  var perImageBitmapsSync = new Map();    // key -> open ImageBitmap (focus)
+  var perImageTextureLoads = new Map();   // key -> Promise, in-progress only
+  var perImageBitmapLoads = new Map();    // key -> Promise, in-progress only
   // Names currently considered "warm" by the visible-buffer / focus-prefetch
-  // logic. Updated by drawCanvasForScroll (grid) and prefetchFilmstripVisible
-  // (focus); checked by _runPerImageJob so in-flight loads completing after
-  // the scroll stops can be closed immediately instead of leaking ~24 × 3MB
-  // bitmaps into perImageBitmapsSync with nothing to evict them.
+  // logic. Updated by drawGridPerImage (grid) and prefetchFilmstripVisible
+  // (focus); checked when a load completes so a tile the user has already
+  // scrolled past is dropped on arrival instead of waiting for eviction.
   var warmPerImageNames = new Set();
   var currentRowHeight = 200;
   var lastTileRects = [];              // [{x, y, w, h, name}] in layout coords
@@ -576,54 +584,63 @@
     return PER_IMAGE_TIERS[PER_IMAGE_TIERS.length - 1];
   }
 
-  // Per-image AVIF loader. Capped in-flight + pending queue so a size3 grid
-  // load (hundreds of tiles kicked off in one frame) doesn't trip Chrome's
-  // ERR_INSUFFICIENT_RESOURCES at the renderer-level fetch cap. HTTP/2
-  // multiplexes well — 64 concurrent streams is fast but stays clear of the
-  // ~256-per-renderer ceiling. Each fetch has its own AbortController so a
-  // scroll that moves past the target cancels the in-flight download AND
-  // discards still-queued requests for it.
+  // Capped in-flight + pending queue so a size3 grid load (hundreds of tiles
+  // kicked off in one frame) doesn't trip Chrome's ERR_INSUFFICIENT_RESOURCES
+  // at the renderer-level fetch cap. HTTP/2 multiplexes well — 64 concurrent
+  // streams is fast but stays clear of the ~256-per-renderer ceiling. Each
+  // fetch has its own AbortController so a scroll that moves past the target
+  // cancels the in-flight download AND discards still-queued requests for it.
   var PER_IMAGE_MAX_INFLIGHT = 64;
-  var perImageInflight = 0;
-  var perImageQueue = [];               // [{key, url, ctrl, resolve}]
-  var activeAborts = new Map();         // key -> AbortController (queued OR in-flight)
+  var perImageQueue = [];               // jobs waiting for an in-flight slot
+  var perImageInFlight = new Set();     // jobs fetching/decoding right now
+  // job: { key, wantBitmap, url, ctrl, resolve }
+
+  function imageNameOfKey(key) { return key.slice(0, key.lastIndexOf('|')); }
+  function closeBitmap(bm) {
+    try { if (bm && typeof bm.close === 'function') bm.close(); } catch (_) {}
+  }
+  function _perImageLoads(wantBitmap) { return wantBitmap ? perImageBitmapLoads : perImageTextureLoads; }
+  function _installPerImageTexture(key, bm) {
+    gridRenderer.uploadSprite('img:' + key, bm);
+    perImageTextures.add(key);
+  }
+
   function _runPerImageJob(job) {
     if (job.ctrl && job.ctrl.signal.aborted) {
       // Got cancelled while waiting in the queue — nothing to fetch.
-      activeAborts.delete(job.key);
-      perImageBitmaps.delete(job.key);
+      _perImageLoads(job.wantBitmap).delete(job.key);
       job.resolve(null);
       return;
     }
-    perImageInflight++;
+    perImageInFlight.add(job);
     fetch(job.url, { credentials: 'same-origin', signal: job.ctrl ? job.ctrl.signal : undefined })
       .then(function (r) { return r.blob(); })
       .then(function (b) { return createImageBitmap(b); })
       .catch(function () { return null; })
       .then(function (bm) {
-        perImageInflight--;
-        activeAborts.delete(job.key);
-        var name = job.key.slice(0, job.key.lastIndexOf('|'));
-        if (bm && !warmPerImageNames.has(name)) {
-          // User scrolled past during the load — drop right here so the bitmap
-          // does not sit in perImageBitmapsSync until eviction runs.
-          try { bm.close && bm.close(); } catch (_) {}
-          perImageBitmaps.delete(job.key);
+        perImageInFlight.delete(job);
+        _perImageLoads(job.wantBitmap).delete(job.key);
+        if (bm && !warmPerImageNames.has(imageNameOfKey(job.key))) {
+          // User moved on during the load — drop it here rather than leaving
+          // it for the next eviction pass.
+          closeBitmap(bm);
           bm = null;
-        } else if (!bm) {
-          // Aborted or failed — drop cached promise so a future call retries.
-          perImageBitmaps.delete(job.key);
         }
-        job.resolve(bm);
-        if (bm) {
+        if (!bm) {
+          job.resolve(null);              // aborted, failed, or no longer wanted
+        } else if (job.wantBitmap) {
           perImageBitmapsSync.set(job.key, bm);
-          gridRenderer.uploadSprite('img:' + job.key, bm);
+          job.resolve(bm);
+        } else {
+          _installPerImageTexture(job.key, bm);
+          closeBitmap(bm);
+          job.resolve(true);
         }
         _pumpPerImageQueue();
       });
   }
   function _pumpPerImageQueue() {
-    while (perImageInflight < PER_IMAGE_MAX_INFLIGHT && perImageQueue.length) {
+    while (perImageInFlight.size < PER_IMAGE_MAX_INFLIGHT && perImageQueue.length) {
       _runPerImageJob(perImageQueue.shift());
     }
   }
@@ -636,55 +653,78 @@
       var job = perImageQueue[i];
       if (keepKeys.has(job.key)) { kept.push(job); continue; }
       if (job.ctrl) try { job.ctrl.abort(); } catch (_) {}
-      activeAborts.delete(job.key);
-      perImageBitmaps.delete(job.key);
+      _perImageLoads(job.wantBitmap).delete(job.key);
       job.resolve(null);
     }
     perImageQueue = kept;
-    activeAborts.forEach(function (ctrl, key) {
-      if (!keepKeys.has(key)) try { ctrl.abort(); } catch (_) {}
+    perImageInFlight.forEach(function (job) {
+      if (!keepKeys.has(job.key) && job.ctrl) try { job.ctrl.abort(); } catch (_) {}
     });
     _pumpPerImageQueue();
   }
-  function loadPerImageBitmap(name, tierH) {
+  function _startPerImageLoad(name, tierH, wantBitmap) {
     var key = name + '|' + tierH;
-    if (perImageBitmaps.has(key)) return perImageBitmaps.get(key);
+    var loads = _perImageLoads(wantBitmap);
+    if (loads.has(key)) return loads.get(key);
     var url = folderURL + GG_DIR + '/' + encodeURIComponent(name) + '.h' + tierH + '.avif';
     var resolveFn;
     var prom = new Promise(function (res) { resolveFn = res; });
-    perImageBitmaps.set(key, prom);
+    loads.set(key, prom);
     var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
-    if (ctrl) activeAborts.set(key, ctrl);
-    var job = { key: key, url: url, ctrl: ctrl, resolve: resolveFn };
-    if (perImageInflight < PER_IMAGE_MAX_INFLIGHT) _runPerImageJob(job);
+    var job = { key: key, wantBitmap: wantBitmap, url: url, ctrl: ctrl, resolve: resolveFn };
+    if (perImageInFlight.size < PER_IMAGE_MAX_INFLIGHT) _runPerImageJob(job);
     else perImageQueue.push(job);
     return prom;
+  }
+  // Grid: resolves true once `name` at `tierH` has a texture on the GPU,
+  // null if the load was cancelled or failed.
+  function loadPerImageTexture(name, tierH) {
+    var key = name + '|' + tierH;
+    if (perImageTextures.has(key)) return Promise.resolve(true);
+    var bm = perImageBitmapsSync.get(key);
+    if (bm) {
+      // Focus mode already decoded this one (leaving focus back to the grid).
+      _installPerImageTexture(key, bm);
+      return Promise.resolve(true);
+    }
+    return _startPerImageLoad(name, tierH, false);
+  }
+  // Focus: resolves with an open ImageBitmap that stays in perImageBitmapsSync
+  // until evicted, null if the load was cancelled or failed.
+  function loadPerImageBitmap(name, tierH) {
+    var bm = perImageBitmapsSync.get(name + '|' + tierH);
+    if (bm) return Promise.resolve(bm);
+    return _startPerImageLoad(name, tierH, true);
   }
   function getPerImageBitmapSync(name, tierH) {
     return perImageBitmapsSync.get(name + '|' + tierH) || null;
   }
 
-  // Close + drop per-image bitmaps whose image name isn't in warmNames.
-  // ImageBitmap pixel data lives in GPU/native memory; without close() it stays
-  // pinned even after the JS Map entry is gone. Never close the bitmap that
+  // Drop per-image textures and bitmaps whose image name isn't in warmNames.
+  // ImageBitmap pixel data lives outside the JS heap; without close() it stays
+  // pinned even after the Map entry is gone. Never close the bitmap that
   // mainDrawSrc currently references — paintMain can fire after eviction and
   // would crash with "image source is detached" on the closed handle.
-  function evictPerImageBitmaps(warmNames) {
+  function evictPerImage(warmNames) {
     var pinned = (mainDrawSrc && mainDrawSrc.bitmap) || null;
-    var dead = [];
+    var deadKeys = [];
     perImageBitmapsSync.forEach(function (bm, key) {
-      var name = key.slice(0, key.lastIndexOf('|'));
-      if (warmNames.has(name)) return;
-      if (pinned && bm === pinned) return;
-      dead.push({ key: key, bm: bm });
+      if (warmNames.has(imageNameOfKey(key))) return;
+      if (bm === pinned) return;
+      deadKeys.push(key);
     });
-    for (var i = 0; i < dead.length; i++) {
-      var k = dead[i].key, bm = dead[i].bm;
-      try { if (bm && typeof bm.close === 'function') bm.close(); } catch (_) {}
-      perImageBitmapsSync.delete(k);
-      perImageBitmaps.delete(k);
-      gridRenderer.deleteTexture('img:' + k);
-    }
+    deadKeys.forEach(function (key) {
+      closeBitmap(perImageBitmapsSync.get(key));
+      perImageBitmapsSync.delete(key);
+    });
+    deadKeys = [];
+    perImageTextures.forEach(function (key) {
+      if (!warmNames.has(imageNameOfKey(key))) deadKeys.push(key);
+    });
+    deadKeys.forEach(function (key) {
+      gridRenderer.deleteTexture('img:' + key);
+      perImageTextures.delete(key);
+    });
   }
 
   // ---- grid renderer (WebGL2) -----------------------------------------
@@ -1024,11 +1064,11 @@
     }
     bufferTop = -1;
     atlasInstancesBuiltFor = null;
-    // Mode swap creates a fresh canvas → fresh GL context → re-upload textures.
-    // Cached loadPerImageBitmap promises resolve immediately and skip the
-    // upload path in _runPerImageJob, so per-image textures must be re-pushed
-    // here too. Static instance buffers are per-context too — drop them so
-    // renderGallery rebuilds for the new context.
+    // Mode swap creates a fresh canvas → fresh GL context → textures are gone.
+    // Atlas sprites re-upload from their kept bitmaps. Per-image textures had
+    // their bitmaps closed at upload, so forget them and let the grid fetch
+    // again (served from the HTTP cache). Static instance buffers are
+    // per-context too — drop them so renderGallery rebuilds for the new context.
     if (gridRenderer.attach(canvasEl)) {
       Object.keys(atlasBitmapsSync).forEach(function (k) {
         var arr = atlasBitmapsSync[k];
@@ -1036,9 +1076,7 @@
           if (arr[i]) gridRenderer.uploadSprite(k + ':' + i, arr[i]);
         }
       });
-      perImageBitmapsSync.forEach(function (bm, key) {
-        if (bm) gridRenderer.uploadSprite('img:' + key, bm);
-      });
+      perImageTextures.clear();
     }
   }
 
@@ -1335,7 +1373,7 @@
     gridRenderer.renderStatic(W, bufferH, dpr, bufferTop, batches);
     // Atlas mode doesn't use per-image bitmaps — release any leftovers.
     warmPerImageNames = new Set();
-    evictPerImageBitmaps(new Set());
+    evictPerImage(new Set());
   }
 
   function dropStaticBuffersOfPreviousAtlas(newKey) {
@@ -1379,16 +1417,16 @@
       // this, every redraw re-chains and an already-cached promise triggers
       // another redraw — infinite loop.
       if (!gridRenderer.hasTexture('img:' + t.name + '|' + tierH)) {
-        loadPerImageBitmap(t.name, tierH).then(function (bm) {
-          // bm===null means the load was canceled — no new content arrived.
+        loadPerImageTexture(t.name, tierH).then(function (ok) {
+          // null means the load was canceled — no new content arrived.
           // A per-image arrival is an UPGRADE (the fallback already shows
           // content), so defer the redraw until scrolling idles.
-          if (bm && canvasEl) scheduleUpgradeRedraw();
+          if (ok && canvasEl) scheduleUpgradeRedraw();
         }, function () {});
       }
     }
     warmPerImageNames = warmNames;
-    evictPerImageBitmaps(warmNames);
+    evictPerImage(warmNames);
 
     var batches = [];
     batchAccum.forEach(function (arr, key) {
@@ -1894,7 +1932,7 @@
     // sockets/decoder immediately for whatever's about to be requested next.
     cancelPerImageLoadsExcept(keepKeys);
     warmPerImageNames = warmNames;
-    evictPerImageBitmaps(warmNames);
+    evictPerImage(warmNames);
 
     // Restart the stable-focus timer. While the user is actively scrubbing,
     // each focusedIdx change resets this; nothing is fetched. When the user
