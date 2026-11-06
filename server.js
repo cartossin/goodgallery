@@ -15,7 +15,7 @@ import fsp from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import { Worker } from 'worker_threads';
 import { fileURLToPath } from 'url';
 
@@ -1956,6 +1956,22 @@ function serveStaticFile(req, res, abs) {
   });
 }
 // ---------- start ----------
+// Every build step shells out to libvips, so refuse to start without it
+// rather than failing on the first pageview.
+function preflightVips() {
+  for (const tool of ['vips', 'vipsthumbnail', 'vipsheader']) {
+    const probe = spawnSync(tool, ['--version']);
+    if (probe.error || probe.status !== 0) {
+      console.error(`[fatal] '${tool}' is missing or not runnable. Install libvips (Debian: apt install libvips-tools).`);
+      process.exit(1);
+    }
+  }
+  const svgProbe = spawnSync('vipsheader', [BROKEN_SVG]);
+  if (svgProbe.status !== 0) {
+    console.warn('[warn] libvips cannot load SVG (missing librsvg support); broken-image placeholders will not be generated.');
+  }
+}
+
 const server = http.createServer((req, res) => {
   handle(req, res).catch(err => {
     console.error('[handler error]', req.method, req.url, err);
@@ -1963,8 +1979,9 @@ const server = http.createServer((req, res) => {
   });
 });
 (async () => {
-  // Startup is O(1): LoDs and atlases build on first pageview; crashed-mid-build
-  // folders are recovered via the 'building' manifest flag on first read.
+  preflightVips();
+  // Startup is O(1): LoDs and atlases build on first pageview. An interrupted
+  // build leaves only an atlas_<hash>_building/ dir, which the next rebuild sweeps.
   brokenTilesReady();  // kick off placeholder tile generation (memoized)
   server.listen(PORT, HOST, () => {
     console.log(`Goodgallery listening on http://${HOST}:${PORT}`);
