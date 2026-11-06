@@ -579,13 +579,23 @@
 
   // On-demand per-sprite loading avoids whole-atlas decode spikes that crash
   // iOS Safari on large galleries.
-  var spritePromises = {};
+  var spriteLoads = {};  // tier key -> { spriteIdx -> { ctrl, promise } }, in progress or done
 
-  function fetchSpriteBitmap(atlas, spriteIdx) {
+  // Fetch + decode one sprite. Resolves null if `signal` was aborted, even
+  // after the bytes arrived: the decode is skipped when the abort came
+  // first, and closed when it came during the decode.
+  function fetchSpriteBitmap(atlas, spriteIdx, signal) {
     var url = folderURL + GG_DIR + '/' + atlas.sprites[spriteIdx].file;
-    return fetch(url, { credentials: 'same-origin' })
+    return fetch(url, { credentials: 'same-origin', signal: signal })
       .then(function (r) { return r.blob(); })
-      .then(function (b) { return createImageBitmap(b); });
+      .then(function (b) { return signal && signal.aborted ? null : createImageBitmap(b); })
+      .then(function (bm) {
+        if (bm && signal && signal.aborted) { closeBitmap(bm); return null; }
+        return bm;
+      }, function (err) {
+        if (signal && signal.aborted) return null;
+        throw err;
+      });
   }
 
   // ---- floor tier --------------------------------------------------------
@@ -660,18 +670,22 @@
 
   function loadSpriteAt(atlasH, spriteIdx) {
     var key = String(atlasH);
-    if (!spritePromises[key]) spritePromises[key] = {};
-    if (spritePromises[key][spriteIdx]) return spritePromises[key][spriteIdx];
+    if (!spriteLoads[key]) spriteLoads[key] = {};
+    var job = spriteLoads[key][spriteIdx];
+    if (job) return job.promise;
     var atlas = window.spriteMeta && spriteMeta.atlases && spriteMeta.atlases[key];
     if (!atlas || !atlas.sprites[spriteIdx]) return Promise.resolve(null);
     if (!atlasBitmapsSync[key]) atlasBitmapsSync[key] = new Array(atlas.sprites.length).fill(null);
-    spritePromises[key][spriteIdx] = fetchSpriteBitmap(atlas, spriteIdx)
-      .then(function (bm) {
-        atlasBitmapsSync[key][spriteIdx] = bm;
-        gridRenderer.uploadSprite(key + ':' + spriteIdx, bm);
-        return bm;
-      });
-    return spritePromises[key][spriteIdx];
+    var ctrl = new AbortController();
+    job = { ctrl: ctrl, promise: null };
+    job.promise = fetchSpriteBitmap(atlas, spriteIdx, ctrl.signal).then(function (bm) {
+      if (!bm) return null;  // evicted before it arrived
+      atlasBitmapsSync[key][spriteIdx] = bm;
+      gridRenderer.uploadSprite(key + ':' + spriteIdx, bm);
+      return bm;
+    });
+    spriteLoads[key][spriteIdx] = job;
+    return job.promise;
   }
 
   // Atlas tier closest to targetH in log scale. The previous "smallest ≥
@@ -754,7 +768,8 @@
     if (job.ctrl) fetchOpts.signal = job.ctrl.signal;
     fetch(job.url, fetchOpts)
       .then(function (r) { return r.blob(); })
-      .then(function (b) { return createImageBitmap(b); })
+      // Cancelled after the bytes arrived: skip the decode, it's the expensive part.
+      .then(function (b) { return job.ctrl && job.ctrl.signal.aborted ? null : createImageBitmap(b); })
       .catch(function () { return null; })
       .then(function (bm) {
         perImageInFlight.delete(job);
@@ -1446,16 +1461,16 @@
     if (key === floorAtlasKey()) return;  // resident for the whole gallery
     var arr = atlasBitmapsSync[key];
     if (!arr) return;
-    var promCache = spritePromises[key];
+    var jobs = spriteLoads[key];
     for (var i = 0; i < arr.length; i++) {
       if (neededIdxs.has(i)) continue;
-      var bm = arr[i];
-      if (bm) {
-        try { bm.close && bm.close(); } catch (_) {}
-        arr[i] = null;
-      }
+      closeBitmap(arr[i]);
+      arr[i] = null;
       gridRenderer.deleteTexture(key + ':' + i);
-      if (promCache) delete promCache[i];
+      if (jobs && jobs[i]) {
+        jobs[i].ctrl.abort();
+        delete jobs[i];
+      }
     }
   }
   // Drop ALL bitmaps + textures from atlas tiers not in keepTiers. Switching
@@ -1511,8 +1526,8 @@
         // Already on GPU? Nothing to wait on, nothing to redraw for.
         if (gridRenderer.hasTexture(aKey + ':' + spIdx)) return;
         // Atlas arrival is FIRST content for those tiles — redraw immediately.
-        loadSpriteAt(atlasH, spIdx).then(function () {
-          if (canvasEl) scheduleGridRedraw();
+        loadSpriteAt(atlasH, spIdx).then(function (bm) {
+          if (bm && canvasEl) scheduleGridRedraw();
         }, function () {});
       });
     }
