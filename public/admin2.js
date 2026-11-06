@@ -781,18 +781,7 @@ function sessionRow(session, canManage) {
   if (session.userAgent) row.querySelector('.row-name').title = session.userAgent;
   const via = session.origin === 'link' ? 'login link' : 'passkey';
   row.querySelector('.row-meta').textContent = 'Signed in ' + timeAgo(session.createdAt) + ' with ' + via;
-  const button = row.querySelector('button');
-  if (session.current || !canManage) button.remove();
-  else button.addEventListener('click', () => revokeSession(session.id));
   return row;
-}
-
-async function revokeSession(id) {
-  await runAction('Sign out session', async () => {
-    await postJson('/api/admin/sessions/revoke', { id });
-    return 'That session is signed out.';
-  });
-  loadSessions();
 }
 
 async function revokeOtherSessions() {
