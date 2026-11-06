@@ -598,9 +598,16 @@ function vipsHeightThumbV(srcAbs, dstAbs, height) {
 }
 
 // Run a vips subcommand and verify expectedOutput exists.
+// Builds run below interactive priority so pageviews stay responsive while
+// every core is busy encoding.
+function lowerPriority(proc) {
+  try { os.setPriority(proc.pid, 10); } catch {}
+}
+
 function runStep(cmd, args, expectedOutput) {
   return new Promise((resolve, reject) => {
     const proc = spawn(cmd, args);
+    lowerPriority(proc);
     let err = '', out = '';
     proc.stdout.on('data', d => { out += d; });
     proc.stderr.on('data', d => { err += d; });

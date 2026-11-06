@@ -14,6 +14,7 @@
 import { parentPort, workerData } from 'worker_threads';
 import fs from 'fs';
 import fsp from 'fs/promises';
+import os from 'os';
 import path from 'path';
 import { spawn } from 'child_process';
 
@@ -31,9 +32,16 @@ function lodPath(thumbDir, filename, height, format) {
   return path.join(thumbDir, filename + '.h' + height + '.' + format);
 }
 
+// Builds run below interactive priority so pageviews stay responsive while
+// every core is busy encoding.
+function lowerPriority(proc) {
+  try { os.setPriority(proc.pid, 10); } catch {}
+}
+
 function runStep(cmd, args, expectedOutput) {
   return new Promise((resolve, reject) => {
     const proc = spawn(cmd, args);
+    lowerPriority(proc);
     let err = '';
     proc.stderr.on('data', d => { err += d; });
     proc.on('error', reject);
