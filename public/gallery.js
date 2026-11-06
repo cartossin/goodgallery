@@ -32,6 +32,10 @@
 
   var CANONICAL_H = 200;
   var FOCUS_PREFETCH = 3;  // images on each side of focus to keep warm in the bitmap cache.
+  // fitAllHeight() is an 18-pass O(N) search; memoize it per viewport size.
+  // Its other inputs (images[], spriteMeta.imageMap) are fixed once the
+  // imagemap has loaded, and loadImagemap resets the memo.
+  var fitAllMemo = { W: -1, H: -1, value: 0 };
 
   // Binary imagemap format: 'GGMP' (4B) | version u16 LE | reserved u16 |
   // count u32 LE | widths (count × u16 LE) | NUL-terminated UTF-8 names.
@@ -64,6 +68,7 @@
     window.images = newImages;
     window.lastimagevalue = count;
     if (window.spriteMeta) spriteMeta.imageMap = imageMap;
+    fitAllMemo = { W: -1, H: -1, value: 0 };
     return true;
   }
 
@@ -228,6 +233,7 @@
     if (!images[1]) return 100;
     var W = layoutWidth();
     var H = layoutHeight();
+    if (fitAllMemo.W === W && fitAllMemo.H === H) return fitAllMemo.value;
     // Upper bound is the viewport height so a few-image gallery can fill the
     // viewport at #fit. Beyond CANONICAL_H the renderer reaches for the h1600
     // tier and the browser upscales — quality cost is mild, layout completeness
@@ -238,7 +244,9 @@
       var measured = simulateLayoutHeight(mid, W);
       if (measured > H) hi = mid; else lo = mid;
     }
-    return Math.max(2, lo);
+    var value = Math.max(2, lo);
+    fitAllMemo = { W: W, H: H, value: value };
+    return value;
   }
 
   // Use bounding rects so chrome height is exact (no hardcoded estimates).
