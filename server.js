@@ -53,11 +53,11 @@ function lodPath(thumbDir, filename, height, format) {
 }
 
 // Sprite size is capped by target file bytes. Translate bytes → pixel budget via
-// an empirical bytes/pixel constant; tune BYTES_PER_PIXEL_Q92 lower for flat-color
+// an empirical bytes/pixel constant; tune BYTES_PER_PIXEL lower for flat-color
 // content, higher for extreme detail.
-const MAX_SPRITE_BYTES   = parseInt(process.env.MAX_SPRITE_BYTES || String(4 * 1024 * 1024), 10);
-const BYTES_PER_PIXEL_Q92 = parseFloat(process.env.BYTES_PER_PIXEL_Q92 || '0.30');
-const MAX_SPRITE_PIXELS   = Math.max(1, Math.floor(MAX_SPRITE_BYTES / BYTES_PER_PIXEL_Q92));
+const MAX_SPRITE_BYTES  = parseInt(process.env.MAX_SPRITE_BYTES || String(4 * 1024 * 1024), 10);
+const BYTES_PER_PIXEL   = parseFloat(process.env.BYTES_PER_PIXEL || '0.30');
+const MAX_SPRITE_PIXELS = Math.max(1, Math.floor(MAX_SPRITE_BYTES / BYTES_PER_PIXEL));
 
 const SESSION_DURATION = 24 * 60 * 60 * 1000;
 const LOGIN_LINK_TTL   = 10 * 60 * 1000;
