@@ -16,6 +16,7 @@ import http from 'http';
 import { brokenTilesReady } from './lib/build.js';
 import { GALLERIES_ROOT, HOST, PORT, STATE_DIR } from './lib/config.js';
 import { sendText } from './lib/http.js';
+import { rebuildTreeIfNeeded } from './lib/rebuild.js';
 import { handle } from './lib/router.js';
 import { preflightVips } from './lib/vips.js';
 
@@ -30,6 +31,12 @@ const server = http.createServer((req, res) => {
   // Startup is O(1): LoDs and atlases build on first pageview. An interrupted
   // build leaves only an atlas_<hash>_building/ dir, which the next rebuild sweeps.
   brokenTilesReady();  // kick off placeholder tile generation (memoized)
+  // Folders whose atlas predates the current packing rule, or whose sources
+  // changed while we were down, re-bake in the background. Pageviews keep
+  // serving the previous atlas until each new one is committed.
+  rebuildTreeIfNeeded(GALLERIES_ROOT)
+    .then(n => console.log('[startup rescan] folders=' + n))
+    .catch(e => console.warn('[startup rescan]', e.message));
   server.listen(PORT, HOST, () => {
     console.log(`Goodgallery listening on http://${HOST}:${PORT}`);
     console.log(`  galleries root: ${GALLERIES_ROOT}`);
