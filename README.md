@@ -1,6 +1,6 @@
 # Goodgallery
 
-A fast photo gallery for very large collections. One Node.js process, no npm
+A web-based photo gallery solution focusing on ui and performance. One Node.js process, no npm
 dependencies, libvips for image work, a WebGL grid on the client. Built and
 tested against galleries of 100,000 images.
 
