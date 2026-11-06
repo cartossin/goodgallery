@@ -513,6 +513,22 @@
     // Histogram of the best source on the GPU per on-screen tile: per-image
     // tier height, atlas tier height, or 0 for nothing. Times each rung of
     // the quality ladder after a jump.
+    // Per-image mode: histogram of the tier each on-screen tile was DRAWN at
+    // by the last grid draw (a loaded texture the canvas hasn't shown yet
+    // does not count). Null in atlas mode.
+    visibleDrawnTiers: function () {
+      var thumbsEl = $('thumbs');
+      if (!thumbsEl || !canvasEl || pickAtlasHeight(currentRowHeight * devicePixelRatio()) != null) return null;
+      var top = thumbsEl.scrollTop, bot = top + thumbsEl.clientHeight;
+      var hist = {};
+      for (var i = firstTileIndexAtOrBelow(top); i < lastTileRects.length; i++) {
+        var t = lastTileRects[i];
+        if (t.y > bot) break;
+        var tier = drawnTierByName.has(t.name) ? drawnTierByName.get(t.name) : 0;
+        hist[tier] = (hist[tier] || 0) + 1;
+      }
+      return hist;
+    },
     visibleTiers: function () {
       var thumbsEl = $('thumbs');
       if (!thumbsEl || !canvasEl) return null;
@@ -1235,11 +1251,8 @@
   var atlasInstancesBuiltFor = null;  // String(atlasH) we built static buffers for
   var atlasInstancesLayoutH = -1;     // currentRowHeight when built
   var pendingReposition = false;
-  var lastScrollTime = 0;             // performance.now() of last user scroll
-  var deferredUpgradeTimer = null;
   var BUFFER_VIEWPORTS = 5;
   var EDGE_MARGIN_FRAC = 0.5;
-  var SCROLL_IDLE_MS = 250;           // wait this long after scroll before per-image upgrade redraw
 
   // Coalesce redraw requests into one drawCanvasForScroll per animation frame.
   function scheduleGridRedraw() {
@@ -1251,23 +1264,6 @@
     });
   }
 
-  // Schedule a redraw, but if the user is actively scrolling, defer until
-  // they pause. Edge crossings still draw immediately (handled separately).
-  // This prevents the visible per-image upgrade transition during scroll —
-  // user sees a stable canvas (atlas-fallback) while scrolling, then a
-  // one-shot upgrade after they stop.
-  function scheduleUpgradeRedraw() {
-    if (deferredUpgradeTimer) return;
-    var since = performance.now() - lastScrollTime;
-    if (since < SCROLL_IDLE_MS) {
-      deferredUpgradeTimer = setTimeout(function () {
-        deferredUpgradeTimer = null;
-        scheduleUpgradeRedraw();
-      }, SCROLL_IDLE_MS - since + 16);
-      return;
-    }
-    scheduleGridRedraw();
-  }
 
   function ensureCanvasAndSpacer(thumbsEl) {
     if (canvasEl && spacerEl && spacerEl.parentNode === thumbsEl && canvasEl.parentNode === spacerEl) return;
@@ -1324,7 +1320,6 @@
     if (focusedIdx > 0) return;
     if (suppressNextAnchorCapture) { suppressNextAnchorCapture = false; }
     else { captureAnchorFromScroll(); hideControls(); }
-    lastScrollTime = performance.now();
     var thumbsEl = $('thumbs');
     if (!thumbsEl || !canvasEl) return;
     var scrollY = thumbsEl.scrollTop;
@@ -1587,6 +1582,8 @@
   // Per-image mode: each tile in the buffer gets its own bitmap at the ideal
   // tier, with a small atlas as the instant placeholder. Batches are dynamic
   // and rebuilt only on edge crossings or bitmap arrivals, not per scroll event.
+  var drawnTierByName = new Map();  // per-image mode: tier height each buffered tile was last drawn at (test hook)
+
   function drawGridPerImage(W, dpr, scrollY, viewportH) {
     var bufBot = bufferTop + bufferH;
     var tierH = pickPerImageTier(currentRowHeight * dpr);
@@ -1614,16 +1611,23 @@
 
     var batchAccum = new Map();
     var warmNames = new Set();
+    drawnTierByName = new Map();
     for (var ti = 0; ti < tilesInBuffer.length; ti++) {
       var t = tilesInBuffer[ti];
       warmNames.add(t.name);
       var loadedKey = bestLoadedPerImageKey(t.name, loadedTiers);
-      if (loadedKey) pushBatch(batchAccum, loadedKey, t.x, t.y, t.w, t.h, 0, 0, 1, 1);
-      else pushAtlasFallback(batchAccum, t, ['50', '10', '5']);
+      var drawnTier;
+      if (loadedKey) {
+        pushBatch(batchAccum, loadedKey, t.x, t.y, t.w, t.h, 0, 0, 1, 1);
+        drawnTier = parseInt(loadedKey.slice(loadedKey.lastIndexOf('|') + 1), 10);
+      } else {
+        drawnTier = pushAtlasFallback(batchAccum, t, ['50', '10', '5']);
+      }
+      drawnTierByName.set(t.name, drawnTier);
       var distance = distanceFromViewport(t, scrollY, viewportH);
       if (stepTier && !bestTexturedPerImageTier(t.name)) {
         loadPerImageTexture(t.name, stepTier, distance).then(function (ok) {
-          if (ok && canvasEl) scheduleUpgradeRedraw();
+          if (ok && canvasEl) scheduleGridRedraw();
         }, function () {});
       }
       // Only chain a redraw if the IDEAL tier isn't already on GPU. Without
@@ -1632,9 +1636,10 @@
       if (!gridRenderer.hasTexture('img:' + t.name + '|' + tierH)) {
         loadPerImageTexture(t.name, tierH, distance).then(function (ok) {
           // null means the load was canceled — no new content arrived.
-          // A per-image arrival is an UPGRADE (the fallback already shows
-          // content), so defer the redraw until scrolling idles.
-          if (ok && canvasEl) scheduleUpgradeRedraw();
+          // An arrival redraws at once (coalesced to one draw per frame):
+          // with the floor under everything, tiles sharpening while the
+          // user drags is the feedback that loading is keeping up.
+          if (ok && canvasEl) scheduleGridRedraw();
         }, function () {});
       }
     }
@@ -1706,10 +1711,11 @@
     arr.push(x, y, w, h, u0, v0, du, dv);
   }
 
-  // Draw a tile from the first of `tiers` whose sprite is on the GPU, if any.
+  // Draw a tile from the first of `tiers` whose sprite is on the GPU.
+  // Returns the tier height drawn, 0 if none was available.
   function pushAtlasFallback(batchAccum, t, tiers) {
     var loc = spriteMeta.imageMap[t.name];
-    if (!loc) return false;
+    if (!loc) return 0;
     for (var i = 0; i < tiers.length; i++) {
       var atlas = spriteMeta.atlases[tiers[i]];
       if (!atlas) continue;
@@ -1718,9 +1724,9 @@
       if (!gridRenderer.hasTexture(textureKey)) continue;
       pushBatch(batchAccum, textureKey, t.x, t.y, t.w, t.h,
         cell.sx / cell.spriteW, cell.sy / cell.spriteH, cell.sw / cell.spriteW, cell.sh / cell.spriteH);
-      return true;
+      return parseInt(tiers[i], 10);
     }
-    return false;
+    return 0;
   }
   // ---- focus mode: main image + filmstrip ------------------------------
   // Layout: #thumbs (overflow:hidden, full viewport) holds #focus-main on top
