@@ -168,7 +168,6 @@ function bufToB64(buf) {
 // Auth is an HttpOnly cookie set by the server on login finish. We never see the token
 // in JS, which means XSS can't read it; CSRF is mitigated by SameSite=Strict.
 var cwdPath = '/'; // gallery folder we're administrating
-function authHeaders() { return {}; }  // legacy stub — fetches use cookies automatically
 
 async function checkAuth() {
   var t = document.getElementById('authTitle');
@@ -296,7 +295,7 @@ function setCWD(p) {
 
 async function loadFolder() {
   var url = cwdPath + '?api=list';
-  var r = await fetch(url, { headers: authHeaders() });
+  var r = await fetch(url);
   if (!r.ok) {
     if (r.status === 404) {
       // folder vanished; reset to root
@@ -333,21 +332,21 @@ function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;'
 
 async function deleteFolder(name) {
   if (!confirm('Delete folder "' + name + '"? All images inside will be moved to trash. This cannot be undone via the UI (use Explore Trash to restore individual files).')) return;
-  var r = await fetch(cwdPath + encodeURIComponent(name) + '/?deletefolder=1', { method: 'POST', headers: authHeaders() });
+  var r = await fetch(cwdPath + encodeURIComponent(name) + '/?deletefolder=1', { method: 'POST' });
   log(await r.text());
   loadFolder();
 }
 
 async function toggleHidden(name, currentlyHidden) {
   var hide = currentlyHidden ? 0 : 1;
-  var r = await fetch(cwdPath + '?sethidden=' + encodeURIComponent(name) + '&hide=' + hide, { method: 'POST', headers: authHeaders() });
+  var r = await fetch(cwdPath + '?sethidden=' + encodeURIComponent(name) + '&hide=' + hide, { method: 'POST' });
   if (!r.ok) { log('toggleHidden failed: ' + r.status); return; }
   loadFolder();
 }
 
 async function trashImage(name) {
   // No confirm — trash is reversible (Explore Trash button restores).
-  var r = await fetch(cwdPath + '?movetotrash=' + encodeURIComponent(name), { method: 'POST', headers: authHeaders() });
+  var r = await fetch(cwdPath + '?movetotrash=' + encodeURIComponent(name), { method: 'POST' });
   log(await r.text());
   loadFolder();
 }
@@ -419,14 +418,14 @@ document.getElementById('loginLinkCloseBtn').addEventListener('click', () => {
 document.getElementById('mkDirBtn').addEventListener('click', async () => {
   var name = document.getElementById('newDirName').value.trim();
   if (!name) return;
-  var r = await fetch(cwdPath + '?mkdir=' + encodeURIComponent(name), { method: 'POST', headers: authHeaders() });
+  var r = await fetch(cwdPath + '?mkdir=' + encodeURIComponent(name), { method: 'POST' });
   if (!r.ok) document.getElementById('dirError').textContent = await r.text();
   else { document.getElementById('newDirName').value = ''; document.getElementById('dirError').textContent = ''; loadFolder(); }
 });
 
 document.getElementById('clearCacheBtn').addEventListener('click', async () => {
   if (!confirm('Clear all cached thumbs/previews in ' + cwdPath + '?')) return;
-  var r = await fetch(cwdPath + '?clearcache=1', { method: 'POST', headers: authHeaders() });
+  var r = await fetch(cwdPath + '?clearcache=1', { method: 'POST' });
   log(await r.text());
 });
 document.getElementById('exploreTrashBtn').addEventListener('click', exploreTrash);
@@ -435,7 +434,7 @@ document.getElementById('emptyTrashBtn').addEventListener('click', async () => {
   if (!confirm('Permanently delete every trashed item in ' + (cwdPath || '/') + '? This cannot be undone.')) return;
   var r = await fetch('/api/trash/empty', {
     method: 'POST',
-    headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders()),
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ folder: cwdRel() }),
   });
   var j = await r.json().catch(() => ({}));
@@ -476,7 +475,7 @@ async function exploreTrash() {
   trashEl.innerHTML = '<strong>Trash <small style="color:#888">in ' + escapeHtml(folderLabel) + '</small></strong>' +
                       '<div id="trashList" style="margin-top:8px"><small>Loading…</small></div>';
 
-  var r = await fetch('/api/trash?folder=' + encodeURIComponent(cwdRel()), { headers: authHeaders() });
+  var r = await fetch('/api/trash?folder=' + encodeURIComponent(cwdRel()), {});
   var data = null; try { data = await r.json(); } catch (_) {}
   var listEl = document.getElementById('trashList');
   if (!data || !data.items || !data.items.length) {
@@ -498,7 +497,7 @@ async function exploreTrash() {
   async function trashCall(url, body) {
     var rr = await fetch(url, {
       method: 'POST',
-      headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders()),
+      headers: { 'Content-Type': 'application/json' },
       body: body ? JSON.stringify(body) : undefined,
     });
     var j = null; try { j = await rr.json(); } catch (_) {}
@@ -566,7 +565,7 @@ document.getElementById('folderPicker').addEventListener('change', async e => {
     for (var seg of pathSegs) {
       if (!seg) continue;
       var dec = decodeURIComponent(seg);
-      await fetch(here + '?mkdir=' + encodeURIComponent(dec), { method: 'POST', headers: authHeaders() });
+      await fetch(here + '?mkdir=' + encodeURIComponent(dec), { method: 'POST' });
       here += seg + '/';
     }
   }
@@ -583,7 +582,7 @@ async function uploadEntry(entry, parentPath) {
     await uploadFiles([file], parentPath);
   } else if (entry.isDirectory) {
     var dirPath = parentPath + encodeURIComponent(entry.name) + '/';
-    await fetch(parentPath + '?mkdir=' + encodeURIComponent(entry.name), { method: 'POST', headers: authHeaders() });
+    await fetch(parentPath + '?mkdir=' + encodeURIComponent(entry.name), { method: 'POST' });
     var reader = entry.createReader();
     var readBatch = () => new Promise(res => reader.readEntries(res));
     while (true) {
