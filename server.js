@@ -1483,13 +1483,26 @@ async function adminAction(req, res, fn) {
   try { const out = await fn(); sendText(res, 200, out == null ? 'ok' : String(out)); }
   catch (e) { sendText(res, 500, 'error: ' + e.message); }
 }
-async function clearcache(abs) {
-  for (const sub of [GG_DIR]) {
-    const dir = path.join(abs, sub);
-    if (!fs.existsSync(dir)) continue;
-    for (const f of fs.readdirSync(dir)) { try { fs.unlinkSync(path.join(dir, f)); } catch {} }
+// Drop every derived artifact in <folder>/gg/ so the next visit rebuilds
+// from scratch. trash/ and the hidden sentinel are durable state that
+// happens to live in gg/, not cache — leave them alone.
+async function clearcache(folderAbs) {
+  const thumbDir = path.join(folderAbs, GG_DIR);
+  let entries;
+  try { entries = await fsp.readdir(thumbDir, { withFileTypes: true }); }
+  catch { return 'nothing to clear'; }
+  let removed = 0;
+  for (const entry of entries) {
+    if (entry.name === 'trash' || entry.name === 'hidden') continue;
+    try {
+      await fsp.rm(path.join(thumbDir, entry.name), { recursive: true, force: true });
+      removed++;
+    } catch {}
   }
-  return 'caches cleared';
+  manifestCache.delete(folderAbs);
+  spriteMetaCache.delete(folderAbs);
+  rebuildFolderIfNeeded(folderAbs).catch(() => {});
+  return `cache cleared (${removed} entries removed); rebuilding`;
 }
 // Per-folder trash: <folder>/gg/trash/<filename>. LoDs at <folder>/gg/*.h*.avif
 // stay where they are — restore is just renaming the image back. Trash-side
