@@ -1598,7 +1598,6 @@ async function deleteFromTrash(folderAbs, name) {
       for (const tier of LOD_TIERS) {
         try { await fsp.unlink(lodPath(thumbDirAbs, orig, tier.h, tier.format)); } catch {}
       }
-      try { await fsp.unlink(path.join(thumbDirAbs, orig + '.resized.v')); } catch {}
     }
   }
   try { await fsp.rmdir(trashDirFor(folderAbs)); } catch {}
