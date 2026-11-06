@@ -1385,11 +1385,7 @@ async function handle(req, res) {
 
   const q = u.searchParams;
   if (q.has('clearcache'))  return adminAction(req, res, () => clearcache(abs));
-  if (q.has('deletefolder')) return adminAction(req, res, async () => {
-    if (abs === GALLERIES_ROOT) throw new Error('cannot delete the gallery root');
-    const n = await deleteFolderToTrash(abs);
-    return `${path.basename(abs)} deleted (${n} image${n === 1 ? '' : 's'} moved to trash)`;
-  });
+  if (q.has('deletefolder')) return adminAction(req, res, () => deleteFolderToTrash(abs));
   if (q.has('movetotrash')) return adminAction(req, res, () => movetotrash(abs, q.get('movetotrash')));
   if (q.has('build-status')) {
     // Global rolling counters. spriteUpToDate is per-folder and answers
