@@ -514,7 +514,6 @@
   // bitmaps into perImageBitmapsSync with nothing to evict them.
   var warmPerImageNames = new Set();
   var currentRowHeight = 200;
-  var renderFrame = 0;                 // bumped per render; async draws check it before painting
   var lastTileRects = [];              // [{x, y, w, h, name}] in layout coords
   var canvasEl = null;
   var spacerEl = null;
@@ -982,6 +981,16 @@
   var EDGE_MARGIN_FRAC = 0.5;
   var SCROLL_IDLE_MS = 250;           // wait this long after scroll before per-image upgrade redraw
 
+  // Coalesce redraw requests into one drawCanvasForScroll per animation frame.
+  function scheduleGridRedraw() {
+    if (pendingReposition) return;
+    pendingReposition = true;
+    requestAnimationFrame(function () {
+      pendingReposition = false;
+      drawCanvasForScroll();
+    });
+  }
+
   // Schedule a redraw, but if the user is actively scrolling, defer until
   // they pause. Edge crossings still draw immediately (handled separately).
   // This prevents the visible per-image upgrade transition during scroll —
@@ -997,12 +1006,7 @@
       }, SCROLL_IDLE_MS - since + 16);
       return;
     }
-    if (pendingReposition) return;
-    pendingReposition = true;
-    requestAnimationFrame(function () {
-      pendingReposition = false;
-      drawCanvasForScroll();
-    });
+    scheduleGridRedraw();
   }
 
   function ensureCanvasAndSpacer(thumbsEl) {
@@ -1067,12 +1071,7 @@
     var scrollY = thumbsEl.scrollTop;
     var viewportH = thumbsEl.clientHeight;
     if (!bufferNeedsReposition(scrollY, viewportH)) return;
-    if (pendingReposition) return;
-    pendingReposition = true;
-    requestAnimationFrame(function () {
-      pendingReposition = false;
-      drawCanvasForScroll();
-    });
+    scheduleGridRedraw();
   }
 
   // True if current scrollY is within EDGE_MARGIN_FRAC viewports of either
@@ -1223,6 +1222,18 @@
     atlasInstancesLayoutH = currentRowHeight;
   }
 
+  // Index of the first tile that overlaps or lies below world y `top`.
+  function firstTileIndexAtOrBelow(top) {
+    var n = lastTileRects.length, lo = 0, hi = n - 1, start = 0;
+    while (lo <= hi) {
+      var mid = (lo + hi) >> 1;
+      if (lastTileRects[mid].y < top) { start = mid + 1; lo = mid + 1; }
+      else { hi = mid - 1; }
+    }
+    if (start > 0 && lastTileRects[start - 1].y + lastTileRects[start - 1].h > top) start--;
+    return start;
+  }
+
   // Indices of sprites that have at least one tile in the buffer y-range.
   function spritesNeededForBuffer(atlasH) {
     var key = String(atlasH);
@@ -1231,16 +1242,8 @@
     var aPerSprite = atlas.cellsPerSprite;
     var top = bufferTop, bot = bufferTop + bufferH;
     var needed = new Set();
-    // Binary-search to first tile whose y ≥ top.
-    var n = lastTileRects.length, lo = 0, hi = n - 1, start = 0;
-    while (lo <= hi) {
-      var mid = (lo + hi) >> 1;
-      if (lastTileRects[mid].y < top) { start = mid + 1; lo = mid + 1; }
-      else { hi = mid - 1; }
-    }
-    // Step back one if start is past a tile that overlaps top.
-    if (start > 0 && lastTileRects[start - 1].y + lastTileRects[start - 1].h > top) start--;
-    for (var i = start; i < n; i++) {
+    var n = lastTileRects.length;
+    for (var i = firstTileIndexAtOrBelow(top); i < n; i++) {
       var t = lastTileRects[i];
       if (t.y > bot) break;
       var loc = spriteMeta.imageMap[t.name];
@@ -1288,194 +1291,181 @@
     var W = canvasEl.width / dpr;
     var viewportH = thumbsEl.clientHeight || (canvasEl.height / dpr);
     if (!viewportH) return;
-    var atlasH = pickAtlasHeight(currentRowHeight * dpr);
 
     if (bufferTop < 0 || bufferNeedsReposition(scrollY, viewportH)) {
       recenterBuffer(scrollY, viewportH);
     }
 
-    var bufTop = bufferTop, bufBot = bufferTop + bufferH;
-    var myFrame = ++renderFrame;
+    var atlasH = pickAtlasHeight(currentRowHeight * dpr);
+    if (atlasH != null) drawGridFromAtlas(atlasH, W, dpr);
+    else drawGridPerImage(W, dpr);
+  }
 
-    if (atlasH != null) {
-      var aKey = String(atlasH);
-      // Rebuild static instance buffers if layout/atlas changed.
-      if (atlasInstancesBuiltFor !== aKey || atlasInstancesLayoutH !== currentRowHeight) {
-        // Drop any stale buffers for the previous atlas.
-        if (atlasInstancesBuiltFor && atlasInstancesBuiltFor !== aKey) {
-          var oldAtlas = spriteMeta.atlases[atlasInstancesBuiltFor];
-          if (oldAtlas) for (var oi = 0; oi < oldAtlas.sprites.length; oi++) {
-            gridRenderer.dropStatic(atlasInstancesBuiltFor + ':' + oi);
-          }
-        }
-        buildStaticAtlasBuffers(atlasH);
-      }
-
-      // Free any prior atlas tier's sprites (zoom-tier transition).
-      evictAtlasTiersOtherThan(new Set([aKey]));
-      // Lazy-load only sprites the buffer needs; evict the rest within this tier.
-      var needed = spritesNeededForBuffer(atlasH);
-      evictAtlasBitmaps(atlasH, needed);
-      var atlas = spriteMeta.atlases[aKey];
-      needed.forEach(function (spIdx) {
-        var tk = aKey + ':' + spIdx;
-        // Already on GPU? Nothing to wait on, nothing to redraw for.
-        if (gridRenderer.hasTexture(tk)) return;
-        loadSpriteAt(atlasH, spIdx).then(function () {
-          if (!canvasEl) return;
-          // Atlas arrival is FIRST content for those tiles — redraw immediately.
-          if (!pendingReposition) {
-            pendingReposition = true;
-            requestAnimationFrame(function () {
-              pendingReposition = false;
-              drawCanvasForScroll();
-            });
-          }
-        }, function () {});
-      });
-
-      // Build batch list: one per sprite. renderStatic skips sprites
-      // whose texture isn't loaded yet.
-      var batches = [];
-      for (var b = 0; b < atlas.sprites.length; b++) {
-        var bk = aKey + ':' + b;
-        if (!gridRenderer.hasStatic(bk)) continue;
-        batches.push({ textureKey: bk, instanceKey: bk });
-      }
-      gridRenderer.renderStatic(W, bufferH, dpr, bufferTop, batches);
-      // Atlas mode doesn't use per-image bitmaps — release any leftovers.
-      warmPerImageNames = new Set();
-      evictPerImageBitmaps(new Set());
-      return;
+  // Atlas mode: every tile comes from one sprite tier. Instance buffers are
+  // static per layout; per frame we only make sure the sprites the buffer
+  // needs are on the GPU and issue one draw per sprite.
+  function drawGridFromAtlas(atlasH, W, dpr) {
+    var aKey = String(atlasH);
+    if (atlasInstancesBuiltFor !== aKey || atlasInstancesLayoutH !== currentRowHeight) {
+      dropStaticBuffersOfPreviousAtlas(aKey);
+      buildStaticAtlasBuffers(atlasH);
     }
 
-    // Per-image path: dynamic batches scoped to the buffer region. Rebuilt
-    // only on edge crossings or sprite arrivals (not per scroll event).
+    // Free any prior atlas tier's sprites (zoom-tier transition).
+    evictAtlasTiersOtherThan(new Set([aKey]));
+    // Lazy-load only sprites the buffer needs; evict the rest within this tier.
+    var needed = spritesNeededForBuffer(atlasH);
+    evictAtlasBitmaps(atlasH, needed);
+    needed.forEach(function (spIdx) {
+      // Already on GPU? Nothing to wait on, nothing to redraw for.
+      if (gridRenderer.hasTexture(aKey + ':' + spIdx)) return;
+      // Atlas arrival is FIRST content for those tiles — redraw immediately.
+      loadSpriteAt(atlasH, spIdx).then(function () {
+        if (canvasEl) scheduleGridRedraw();
+      }, function () {});
+    });
+
+    // One batch per sprite. renderStatic skips sprites whose texture isn't loaded yet.
+    var atlas = spriteMeta.atlases[aKey];
+    var batches = [];
+    for (var b = 0; b < atlas.sprites.length; b++) {
+      var bk = aKey + ':' + b;
+      if (!gridRenderer.hasStatic(bk)) continue;
+      batches.push({ textureKey: bk, instanceKey: bk });
+    }
+    gridRenderer.renderStatic(W, bufferH, dpr, bufferTop, batches);
+    // Atlas mode doesn't use per-image bitmaps — release any leftovers.
+    warmPerImageNames = new Set();
+    evictPerImageBitmaps(new Set());
+  }
+
+  function dropStaticBuffersOfPreviousAtlas(newKey) {
+    if (!atlasInstancesBuiltFor || atlasInstancesBuiltFor === newKey) return;
+    var oldAtlas = spriteMeta.atlases[atlasInstancesBuiltFor];
+    if (!oldAtlas) return;
+    for (var i = 0; i < oldAtlas.sprites.length; i++) {
+      gridRenderer.dropStatic(atlasInstancesBuiltFor + ':' + i);
+    }
+  }
+
+  // Per-image mode: each tile in the buffer gets its own bitmap at the ideal
+  // tier, with a small atlas as the instant placeholder. Batches are dynamic
+  // and rebuilt only on edge crossings or bitmap arrivals, not per scroll event.
+  function drawGridPerImage(W, dpr) {
+    var bufBot = bufferTop + bufferH;
     var tierH = pickPerImageTier(currentRowHeight * dpr);
-    var tiers = [tierH].concat(PER_IMAGE_TIERS.filter(function (h) { return h < tierH; }).reverse());
-
-    // Visible-in-buffer tiles via binary search.
-    var n = lastTileRects.length, lo = 0, hi = n - 1, start = 0;
-    while (lo <= hi) {
-      var mid = (lo + hi) >> 1;
-      if (lastTileRects[mid].y < bufTop) { start = mid + 1; lo = mid + 1; }
-      else { hi = mid - 1; }
-    }
-    if (start > 0 && lastTileRects[start - 1].y + lastTileRects[start - 1].h > bufTop) start--;
-
-    var batchAccum = new Map();
-    function pushBatch(key, x, y, w, h, u0, v0, du, dv) {
-      var arr = batchAccum.get(key);
-      if (!arr) { arr = []; batchAccum.set(key, arr); }
-      arr.push(x, y, w, h, u0, v0, du, dv);
-    }
-    function pushAtlasFallback(t) {
-      var src = bestCachedAtlasSrc(t.name);
-      if (!src) return false;
-      var loc = spriteMeta.imageMap[t.name];
-      if (!loc) return false;
-      var heights = ['50', '10', '5'];
-      for (var hi2 = 0; hi2 < heights.length; hi2++) {
-        var hKey = heights[hi2];
-        var atlasMeta = spriteMeta.atlases[hKey];
-        if (!atlasMeta) continue;
-        var arr = atlasBitmapsSync[hKey];
-        if (!arr) continue;
-        var spIdx = Math.floor(loc.idx / atlasMeta.cellsPerSprite);
-        if (arr[spIdx] !== src.bitmap) continue;
-        var bk = hKey + ':' + spIdx;
-        if (!gridRenderer.hasTexture(bk)) return false;
-        var w = arr[spIdx].width, h = arr[spIdx].height;
-        pushBatch(bk, t.x, t.y, t.w, t.h, src.sx / w, src.sy / h, src.sw / w, src.sh / h);
-        return true;
-      }
-      return false;
+    var loadedTiers = [tierH].concat(PER_IMAGE_TIERS.filter(function (h) { return h < tierH; }).reverse());
+    var tilesInBuffer = [];
+    for (var i = firstTileIndexAtOrBelow(bufferTop); i < lastTileRects.length; i++) {
+      if (lastTileRects[i].y > bufBot) break;
+      tilesInBuffer.push(lastTileRects[i]);
     }
 
-    // Build keepKeys for queue trimming: every tile in the buffer at the
-    // ideal tier is fair game to keep. Anything queued for a tile outside
-    // this set is stale (user scrolled past it) and gets dropped.
+    // Anything queued for a tile outside the buffer is stale (user scrolled past it).
     var keepKeys = new Set();
-    var fallbackSpriteIdxs = new Set();
-    var fallbackAtlas = spriteMeta.atlases['50'] || spriteMeta.atlases['10'] || spriteMeta.atlases['5'];
-    var fallbackKey = fallbackAtlas ? (spriteMeta.atlases['50'] ? '50' : (spriteMeta.atlases['10'] ? '10' : '5')) : null;
-    for (var ki = start; ki < n; ki++) {
-      if (lastTileRects[ki].y > bufBot) break;
-      keepKeys.add(lastTileRects[ki].name + '|' + tierH);
-      if (fallbackAtlas) {
-        var floc = spriteMeta.imageMap[lastTileRects[ki].name];
-        if (floc) fallbackSpriteIdxs.add(Math.floor(floc.idx / fallbackAtlas.cellsPerSprite));
-      }
-    }
+    for (var k = 0; k < tilesInBuffer.length; k++) keepKeys.add(tilesInBuffer[k].name + '|' + tierH);
     cancelPerImageLoadsExcept(keepKeys);
 
-    // Kick off atlas-fallback sprites for everything in the buffer. h50 (or
-    // smaller) gives every tile a placeholder while per-image loads in. Big
-    // sprite, single fetch, much faster than waiting on hundreds of per-image
-    // bitmaps. evictAtlasBitmaps trims sprites that fall out of the buffer.
-    if (fallbackKey) {
-      var fbAtlasH = parseInt(fallbackKey, 10);
-      fallbackSpriteIdxs.forEach(function (spIdx) {
-        var tk = fallbackKey + ':' + spIdx;
-        if (gridRenderer.hasTexture(tk)) return;
-        loadSpriteAt(fbAtlasH, spIdx).then(function (bm) {
-          if (!bm || !canvasEl) return;
-          if (!pendingReposition) {
-            pendingReposition = true;
-            requestAnimationFrame(function () {
-              pendingReposition = false;
-              drawCanvasForScroll();
-            });
-          }
-        }, function () {});
-      });
-      // Evict atlas sprites that aren't needed for the current buffer.
-      evictAtlasBitmaps(fbAtlasH, fallbackSpriteIdxs);
-      // And free every OTHER atlas tier's sprites — we're in per-image mode,
-      // only the fallback tier is in use.
-      evictAtlasTiersOtherThan(new Set([fallbackKey]));
-    } else {
-      // No fallback atlas at all (shouldn't happen for built galleries) —
-      // free every atlas tier.
-      evictAtlasTiersOtherThan(new Set());
-    }
+    requestFallbackAtlasSprites(tilesInBuffer);
 
+    var batchAccum = new Map();
     var warmNames = new Set();
-    for (var i = start; i < n; i++) {
-      var t = lastTileRects[i];
-      if (t.y > bufBot) break;
+    for (var ti = 0; ti < tilesInBuffer.length; ti++) {
+      var t = tilesInBuffer[ti];
       warmNames.add(t.name);
-      var keyFound = null;
-      for (var ti = 0; ti < tiers.length; ti++) {
-        var probe = 'img:' + t.name + '|' + tiers[ti];
-        if (gridRenderer.hasTexture(probe)) { keyFound = probe; break; }
-      }
-      if (keyFound) pushBatch(keyFound, t.x, t.y, t.w, t.h, 0, 0, 1, 1);
-      else pushAtlasFallback(t);
+      var loadedKey = bestLoadedPerImageKey(t.name, loadedTiers);
+      if (loadedKey) pushBatch(batchAccum, loadedKey, t.x, t.y, t.w, t.h, 0, 0, 1, 1);
+      else pushAtlasFallback(batchAccum, t);
       // Only chain a redraw if the IDEAL tier isn't already on GPU. Without
       // this, every redraw re-chains and an already-cached promise triggers
       // another redraw — infinite loop.
-      var idealKey = 'img:' + t.name + '|' + tierH;
-      if (!gridRenderer.hasTexture(idealKey)) {
+      if (!gridRenderer.hasTexture('img:' + t.name + '|' + tierH)) {
         loadPerImageBitmap(t.name, tierH).then(function (bm) {
-          // bm===null means the load was canceled — no new content arrived,
-          // so don't trigger a redraw (would just rebuild for nothing).
-          if (!bm || !canvasEl) return;
-          // Per-image arrival is an UPGRADE (atlas-fallback already shows
-          // content). Defer until scroll idles so the user doesn't see
-          // tiles refreshing as they scroll.
-          scheduleUpgradeRedraw();
+          // bm===null means the load was canceled — no new content arrived.
+          // A per-image arrival is an UPGRADE (the fallback already shows
+          // content), so defer the redraw until scrolling idles.
+          if (bm && canvasEl) scheduleUpgradeRedraw();
         }, function () {});
       }
     }
     warmPerImageNames = warmNames;
     evictPerImageBitmaps(warmNames);
 
-    var batches2 = [];
+    var batches = [];
     batchAccum.forEach(function (arr, key) {
-      batches2.push({ textureKey: key, instances: new Float32Array(arr) });
+      batches.push({ textureKey: key, instances: new Float32Array(arr) });
     });
-    gridRenderer.render(W, bufferH, dpr, bufferTop, batches2);
+    gridRenderer.render(W, bufferH, dpr, bufferTop, batches);
+  }
+
+  // Texture key of the best per-image tier already on the GPU, or null.
+  function bestLoadedPerImageKey(name, tiers) {
+    for (var i = 0; i < tiers.length; i++) {
+      var key = 'img:' + name + '|' + tiers[i];
+      if (gridRenderer.hasTexture(key)) return key;
+    }
+    return null;
+  }
+
+  // Kick off the small-atlas sprites covering the buffer so every tile has a
+  // placeholder while per-image bitmaps load; one sprite fetch beats hundreds
+  // of per-image ones. Sprites outside the buffer, and every other atlas
+  // tier, are evicted.
+  function requestFallbackAtlasSprites(tilesInBuffer) {
+    var fallbackKey = null;
+    var candidates = ['50', '10', '5'];
+    for (var c = 0; c < candidates.length && !fallbackKey; c++) {
+      if (spriteMeta.atlases[candidates[c]]) fallbackKey = candidates[c];
+    }
+    if (!fallbackKey) {
+      evictAtlasTiersOtherThan(new Set());
+      return;
+    }
+    var atlas = spriteMeta.atlases[fallbackKey];
+    var atlasH = parseInt(fallbackKey, 10);
+    var spriteIdxs = new Set();
+    for (var i = 0; i < tilesInBuffer.length; i++) {
+      var loc = spriteMeta.imageMap[tilesInBuffer[i].name];
+      if (loc) spriteIdxs.add(Math.floor(loc.idx / atlas.cellsPerSprite));
+    }
+    spriteIdxs.forEach(function (spIdx) {
+      if (gridRenderer.hasTexture(fallbackKey + ':' + spIdx)) return;
+      loadSpriteAt(atlasH, spIdx).then(function (bm) {
+        if (bm && canvasEl) scheduleGridRedraw();
+      }, function () {});
+    });
+    evictAtlasBitmaps(atlasH, spriteIdxs);
+    evictAtlasTiersOtherThan(new Set([fallbackKey]));
+  }
+
+  function pushBatch(batchAccum, key, x, y, w, h, u0, v0, du, dv) {
+    var arr = batchAccum.get(key);
+    if (!arr) { arr = []; batchAccum.set(key, arr); }
+    arr.push(x, y, w, h, u0, v0, du, dv);
+  }
+
+  // Draw a tile from whichever small-atlas sprite is already decoded, if any.
+  function pushAtlasFallback(batchAccum, t) {
+    var src = bestCachedAtlasSrc(t.name);
+    if (!src) return false;
+    var loc = spriteMeta.imageMap[t.name];
+    if (!loc) return false;
+    var heights = ['50', '10', '5'];
+    for (var i = 0; i < heights.length; i++) {
+      var hKey = heights[i];
+      var atlasMeta = spriteMeta.atlases[hKey];
+      if (!atlasMeta) continue;
+      var arr = atlasBitmapsSync[hKey];
+      if (!arr) continue;
+      var spIdx = Math.floor(loc.idx / atlasMeta.cellsPerSprite);
+      if (arr[spIdx] !== src.bitmap) continue;
+      var bk = hKey + ':' + spIdx;
+      if (!gridRenderer.hasTexture(bk)) return false;
+      var w = arr[spIdx].width, h = arr[spIdx].height;
+      pushBatch(batchAccum, bk, t.x, t.y, t.w, t.h, src.sx / w, src.sy / h, src.sw / w, src.sh / h);
+      return true;
+    }
+    return false;
   }
   // ---- focus mode: main image + filmstrip ------------------------------
   // Layout: #thumbs (overflow:hidden, full viewport) holds #focus-main on top
@@ -1629,7 +1619,7 @@
       'position:absolute; top:0; left:0; width:' + (filmPadL + filmTotalW + filmPadR) + 'px; height:1px;';
     filmstripEl.appendChild(filmSpacerEl);
 
-    filmstripEl.addEventListener('scroll', onFilmstripScroll, { passive: true });
+    filmstripEl.addEventListener('scroll', scheduleFilmstripRedraw, { passive: true });
     filmCanvasEl.addEventListener('click', onFilmstripClick);
     // Manual gesture cancels the chase, otherwise scroll + chase fight and
     // the strip rubber-bands.
@@ -1661,19 +1651,9 @@
     drawMainImage();
   }
 
-  function onFilmstripScroll() {
-    if (filmScrollPending) return;
-    filmScrollPending = true;
-    requestAnimationFrame(function () {
-      filmScrollPending = false;
-      drawFilmstrip();
-      drawMainImage();
-    });
-  }
-
-  // Used by sprite-arrival promise chains to redraw the filmstrip with the
-  // CURRENT scroll position (not whatever was captured when the load was
-  // queued). rAF-coalesced via the same flag as onFilmstripScroll.
+  // Redraw the filmstrip and main image on the next frame. Scroll events and
+  // sprite arrivals share this so a redraw always reads the CURRENT scroll
+  // position, not one captured when a load was queued.
   function scheduleFilmstripRedraw() {
     if (filmScrollPending) return;
     filmScrollPending = true;
@@ -1688,14 +1668,19 @@
     if (!filmstripEl || !filmTilePos) return;
     var rect = filmCanvasEl.getBoundingClientRect();
     var clickX = e.clientX - rect.left + filmstripEl.scrollLeft - filmPadL;
+    commandedIdx = filmTileIndexAtX(clickX) + 1;
+    startFocusChase();
+  }
+
+  // Index of the first filmstrip tile whose right edge is past x.
+  function filmTileIndexAtX(x) {
     var lo = 0, hi = filmTilePos.length - 1;
     while (lo < hi) {
       var mid = (lo + hi) >> 1;
-      if (filmTilePos[mid] + filmTileW[mid] <= clickX) lo = mid + 1;
+      if (filmTilePos[mid] + filmTileW[mid] <= x) lo = mid + 1;
       else hi = mid;
     }
-    commandedIdx = lo + 1;
-    startFocusChase();
+    return lo;
   }
 
   function drawFilmstrip() {
@@ -1709,121 +1694,85 @@
 
     var atlasH = 50;
     var atlas = spriteMeta.atlases && spriteMeta.atlases[String(atlasH)];
-    if (!atlas) return;
-    // Load only sprites covering visible tiles — bounds focus-entry memory.
-    (function () {
-      if (!filmTilePos || filmTilePos.length === 0) return;
-      var atlasMeta = spriteMeta && spriteMeta.atlases && spriteMeta.atlases[String(atlasH)];
-      if (!atlasMeta) return;
-      var fsl = filmstripEl.scrollLeft;
-      var leftE = fsl - filmPadL;
-      var rightE = leftE + W;
-      var fn = filmTilePos.length;
-      var flo = 0, fhi = fn - 1;
-      while (flo < fhi) {
-        var fmid = (flo + fhi) >> 1;
-        if (filmTilePos[fmid] + filmTileW[fmid] <= leftE) flo = fmid + 1; else fhi = fmid;
-      }
-      var ffirst = flo, flast = flo;
-      for (var fi = flo; fi < fn; fi++) {
-        if (filmTilePos[fi] > rightE) break;
-        flast = fi;
-      }
-      var firstSp = Math.floor(ffirst / atlasMeta.cellsPerSprite);
-      var lastSp = Math.floor(flast / atlasMeta.cellsPerSprite);
-      // Mirror the grid path: load only sprites covering the visible range
-      // (with a 1-sprite cushion so a small scrub doesn't thrash) and evict
-      // the rest. Without this, a fast filmstrip scrub through a 100k gallery
-      // accumulates every h50 sprite (~38 MB ImageBitmap each) because each
-      // becomes warm in atlasBitmapsSync and nothing ever frees it.
-      var BUF_SP = 1;
-      var keepLo = Math.max(0, firstSp - BUF_SP);
-      var keepHi = Math.min(atlasMeta.sprites.length - 1, lastSp + BUF_SP);
-      // Also keep the sprite for the centered focus image — drawMainImage uses
-      // the same h50 atlas as a fallback while per-image AVIF is still loading.
-      var keep = new Set();
-      for (var ks = keepLo; ks <= keepHi; ks++) keep.add(ks);
-      if (focusedIdx > 0) {
-        keep.add(Math.floor((focusedIdx - 1) / atlasMeta.cellsPerSprite));
-      }
-      evictAtlasBitmaps(atlasH, keep);
-      var bitmapsArr = atlasBitmapsSync[String(atlasH)] || [];
-      for (var fs = firstSp; fs <= lastSp; fs++) {
-        // Skip already-loaded sprites; chaining .then on a resolved promise
-        // would loop (resolves on microtask -> drawFilmstrip -> chain again).
-        if (bitmapsArr[fs]) continue;
-        loadSpriteAt(atlasH, fs).then(scheduleFilmstripRedraw, function () {});
-      }
-    })();
-    // Paint sync from atlasBitmapsSync; the arrival waiter repaints incrementally.
-    if (!filmCanvasEl) return;
-    var paintFilmstripTiles = function () {
-      if (!filmCanvasEl) return;
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.fillStyle = '#0a0a0a';
-      ctx.fillRect(0, 0, W, FILM_H);
-      var bitmaps = atlasBitmapsSync[String(atlasH)] || [];
-      var n = filmTilePos.length;
-      var lo2 = 0, hi2 = n - 1;
-      while (lo2 < hi2) {
-        var mid = (lo2 + hi2) >> 1;
-        if (filmTilePos[mid] + filmTileW[mid] <= leftEdge) lo2 = mid + 1;
-        else hi2 = mid;
-      }
-      var aCellW = atlas.cellW, aCellH = atlas.cellH;
-      var aPerSprite = atlas.cellsPerSprite, aAcross = atlas.across;
-      var srcScale = aCellH / FILM_TILE_H;
-      for (var ti = lo2; ti < n; ti++) {
-        var tx = filmTilePos[ti];
-        var tw = filmTileW[ti];
-        if (tx > rightEdge) break;
-        var screenX = tx - leftEdge;
-        var spriteIdx = Math.floor(ti / aPerSprite);
-        var posInSprite = ti % aPerSprite;
-        var row = Math.floor(posInSprite / aAcross);
-        var col = posInSprite % aAcross;
-        var bm = bitmaps[spriteIdx];
-        if (!bm) continue;
-        var srcW = Math.round(tw * srcScale);
-        ctx.drawImage(bm, col * aCellW, row * aCellH, srcW, aCellH, screenX, yPad, tw, FILM_TILE_H);
-        if (ti + 1 === focusedIdx) {
-          ctx.strokeStyle = '#fff';
-          ctx.lineWidth = 1.5;
-          ctx.strokeRect(screenX + 0.5, yPad + 0.5, tw - 1, FILM_TILE_H - 1);
-        }
-      }
-    };
-
+    if (!atlas || filmTilePos.length === 0) return;
     var scrollLeft = filmstripEl.scrollLeft;
     var leftEdge = scrollLeft - filmPadL;
     var rightEdge = leftEdge + W;
+
+    ensureFilmstripSprites(atlasH, atlas, leftEdge, rightEdge);
+    settleFocusFromFilmstripScroll(scrollLeft, W);
+    paintFilmstripTiles(ctx, atlasH, atlas, leftEdge, rightEdge);
+  }
+
+  // Load only the sprites covering the visible tiles (plus a one-sprite
+  // cushion so a small scrub doesn't thrash) and evict the rest. Without
+  // this, a fast scrub through a 100k gallery accumulates every h50 sprite
+  // (~38 MB ImageBitmap each). The centered image's sprite is kept too:
+  // drawMainImage uses it as a fallback while the per-image AVIF loads.
+  function ensureFilmstripSprites(atlasH, atlas, leftEdge, rightEdge) {
+    var first = filmTileIndexAtX(leftEdge);
+    var last = first;
+    for (var i = first; i < filmTilePos.length; i++) {
+      if (filmTilePos[i] > rightEdge) break;
+      last = i;
+    }
+    var firstSp = Math.floor(first / atlas.cellsPerSprite);
+    var lastSp = Math.floor(last / atlas.cellsPerSprite);
+    var keepLo = Math.max(0, firstSp - 1);
+    var keepHi = Math.min(atlas.sprites.length - 1, lastSp + 1);
+    var keep = new Set();
+    for (var sp = keepLo; sp <= keepHi; sp++) keep.add(sp);
+    if (focusedIdx > 0) keep.add(Math.floor((focusedIdx - 1) / atlas.cellsPerSprite));
+    evictAtlasBitmaps(atlasH, keep);
+    var bitmaps = atlasBitmapsSync[String(atlasH)] || [];
+    for (var s = firstSp; s <= lastSp; s++) {
+      // Skip already-loaded sprites; chaining .then on a resolved promise
+      // would loop (resolves on microtask -> drawFilmstrip -> chain again).
+      if (bitmaps[s]) continue;
+      loadSpriteAt(atlasH, s).then(scheduleFilmstripRedraw, function () {});
+    }
+  }
+
+  // When the scroll position has settled at the commanded tile's exact
+  // target (within ~1px), trust commandedIdx. filmCenteredIdx1 picks the
+  // tile whose center is closest to viewport center, which with a wide
+  // neighbor + browser-rounded scrollLeft can deterministically pick the
+  // wrong tile by a few pixels — causing focusedIdx to flicker and the
+  // main-image stable-focus timer to never fire.
+  function settleFocusFromFilmstripScroll(scrollLeft, W) {
+    var newCenterIdx = filmCenteredIdx1(scrollLeft, W);
+    if (commandedIdx > 0 && Math.abs(scrollLeft - filmScrollForIdx1(commandedIdx, W)) < 1.5) {
+      newCenterIdx = commandedIdx;
+    }
+    if (newCenterIdx === focusedIdx) return;
+    focusedIdx = newCenterIdx;
+    // Keep mainDrawSrc; drawMainImage installs the fresh source next.
+    scheduleHashUpdate('#' + encodeURIComponent(images[focusedIdx]));
+    hideControls();
+  }
+
+  function paintFilmstripTiles(ctx, atlasH, atlas, leftEdge, rightEdge) {
+    var bitmaps = atlasBitmapsSync[String(atlasH)] || [];
     var yPad = Math.round((FILM_H - FILM_TILE_H) / 2);
-
-    // When the scroll position has settled at the commanded tile's exact
-    // target (within ~1px), trust commandedIdx. filmCenteredIdx1 picks the
-    // tile whose center is closest to viewport center, which with a wide
-    // neighbor + browser-rounded scrollLeft can deterministically pick the
-    // wrong tile by a few pixels — causing focusedIdx to flicker and the
-    // main-image stable-focus timer to never fire.
-    var newCenterIdx;
-    if (commandedIdx > 0) {
-      var commandedTarget = filmScrollForIdx1(commandedIdx, W);
-      if (Math.abs(scrollLeft - commandedTarget) < 1.5) {
-        newCenterIdx = commandedIdx;
-      } else {
-        newCenterIdx = filmCenteredIdx1(scrollLeft, W);
+    var srcScale = atlas.cellH / FILM_TILE_H;
+    for (var ti = filmTileIndexAtX(leftEdge); ti < filmTilePos.length; ti++) {
+      var tx = filmTilePos[ti];
+      var tw = filmTileW[ti];
+      if (tx > rightEdge) break;
+      var bm = bitmaps[Math.floor(ti / atlas.cellsPerSprite)];
+      if (!bm) continue;
+      var posInSprite = ti % atlas.cellsPerSprite;
+      var row = Math.floor(posInSprite / atlas.across);
+      var col = posInSprite % atlas.across;
+      var screenX = tx - leftEdge;
+      var srcW = Math.round(tw * srcScale);
+      ctx.drawImage(bm, col * atlas.cellW, row * atlas.cellH, srcW, atlas.cellH, screenX, yPad, tw, FILM_TILE_H);
+      if (ti + 1 === focusedIdx) {
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(screenX + 0.5, yPad + 0.5, tw - 1, FILM_TILE_H - 1);
       }
-    } else {
-      newCenterIdx = filmCenteredIdx1(scrollLeft, W);
     }
-    if (newCenterIdx !== focusedIdx) {
-      focusedIdx = newCenterIdx;
-      // Keep mainDrawSrc; drawMainImage installs the fresh source next.
-      scheduleHashUpdate('#' + encodeURIComponent(images[focusedIdx]));
-      hideControls();
-    }
-
-    paintFilmstripTiles();
   }
 
   // Where + how big to draw the main image.
