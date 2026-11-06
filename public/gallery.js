@@ -500,8 +500,7 @@
       for (var i = 0; i < arr.length; i++) if (arr[i]) n++;
       return n;
     },
-    atlasBitmapsSync: atlasBitmapsSync,
-    perImageBitmapsSync: perImageBitmapsSync,
+    perImageBitmapCount: function () { return perImageBitmapsSync.size; },
   };
   // Per-image bitmaps for high-zoom views. Keyed by `${name}|${tierH}`.
   var perImageBitmaps = new Map();
