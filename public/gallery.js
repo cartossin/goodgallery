@@ -507,6 +507,31 @@
     perImageBitmapKeys: function () { return Array.from(perImageBitmapsSync.keys()); },
     // Per-image grid tiles with their ideal-tier texture ready, split into
     // on-screen and whole-buffer counts. Lets a harness time "visible done".
+    // On-screen tiles the current draw path would put content under (any
+    // per-image tier, or an atlas sprite on the GPU), vs the on-screen total.
+    // Lets a harness count black tiles while scrolling fast.
+    visibleCoverage: function () {
+      var thumbsEl = $('thumbs');
+      if (!thumbsEl || !canvasEl) return null;
+      var top = thumbsEl.scrollTop, bot = top + thumbsEl.clientHeight;
+      var targetH = currentRowHeight * devicePixelRatio();
+      var atlasH = pickAtlasHeight(targetH);
+      var r = { lit: 0, total: 0, mode: atlasH != null ? 'atlas' + atlasH : 'perimage' + pickPerImageTier(targetH) };
+      for (var i = firstTileIndexAtOrBelow(top); i < lastTileRects.length; i++) {
+        var t = lastTileRects[i];
+        if (t.y > bot) break;
+        r.total++;
+        var lit;
+        if (atlasH != null) {
+          var loc = spriteMeta.imageMap[t.name];
+          lit = !!loc && gridRenderer.hasTexture(atlasH + ':' + Math.floor(loc.idx / spriteMeta.atlases[String(atlasH)].cellsPerSprite));
+        } else {
+          lit = bestTexturedPerImageTier(t.name) > 0 || pushAtlasFallback(new Map(), t);
+        }
+        if (lit) r.lit++;
+      }
+      return r;
+    },
     perImageProgress: function () {
       var thumbsEl = $('thumbs');
       if (!thumbsEl || !canvasEl) return null;
@@ -1032,27 +1057,49 @@
   })();
 
   // Best already-loaded atlas source for `name` (h50 → h10 → h5).
+  // Where image `loc` sits in its sprite, in sprite pixels. The stored
+  // thumbnail fits within (cellW, cellH) at its own aspect, top-left aligned,
+  // leftover area black — the same rule as fitInCell() in the server's
+  // sprite_worker.js. Sampling outside the stored rect reads padding or the
+  // neighbouring cell, so every reader of a sprite goes through this.
+  function atlasCellRect(loc, atlas) {
+    var spIdx = Math.floor(loc.idx / atlas.cellsPerSprite);
+    var posInSprite = loc.idx % atlas.cellsPerSprite;
+    var aspect = loc.w / CANONICAL_H;
+    var naturalW = aspect * atlas.cellH;
+    var sw, sh;
+    if (naturalW > atlas.cellW) {
+      sw = atlas.cellW;
+      sh = Math.max(1, Math.round(atlas.cellW / aspect));
+    } else {
+      sw = Math.max(1, Math.round(naturalW));
+      sh = atlas.cellH;
+    }
+    return {
+      spIdx: spIdx,
+      sx: (posInSprite % atlas.across) * atlas.cellW,
+      sy: Math.floor(posInSprite / atlas.across) * atlas.cellH,
+      sw: sw,
+      sh: sh,
+      spriteW: atlas.across * atlas.cellW,
+      spriteH: Math.ceil(atlas.sprites[spIdx].count / atlas.across) * atlas.cellH,
+    };
+  }
+
+  // Best decoded sprite cell for `name` across the small atlas tiers, or null.
   function bestCachedAtlasSrc(name) {
     if (!window.spriteMeta || !spriteMeta.atlases) return null;
     var loc = spriteMeta.imageMap && spriteMeta.imageMap[name];
     if (!loc) return null;
     var heights = ['50', '10', '5'];
     for (var hi = 0; hi < heights.length; hi++) {
-      var key = heights[hi];
-      var atlas = spriteMeta.atlases[key];
-      if (!atlas) continue;
-      var bitmaps = atlasBitmapsSync[key];
-      if (!bitmaps) continue;
-      var idx = loc.idx;
-      var spriteIdx = Math.floor(idx / atlas.cellsPerSprite);
-      var bitmap = bitmaps[spriteIdx];
+      var atlas = spriteMeta.atlases[heights[hi]];
+      var bitmaps = atlasBitmapsSync[heights[hi]];
+      if (!atlas || !bitmaps) continue;
+      var cell = atlasCellRect(loc, atlas);
+      var bitmap = bitmaps[cell.spIdx];
       if (!bitmap) continue;
-      var posInSprite = idx % atlas.cellsPerSprite;
-      var row = Math.floor(posInSprite / atlas.across);
-      var col = posInSprite % atlas.across;
-      var canonicalH = 200;
-      var srcW = Math.round(loc.w * (atlas.cellH / canonicalH));
-      return { bitmap: bitmap, sx: col * atlas.cellW, sy: row * atlas.cellH, sw: srcW, sh: atlas.cellH };
+      return { bitmap: bitmap, sx: cell.sx, sy: cell.sy, sw: cell.sw, sh: cell.sh };
     }
     return null;
   }
@@ -1254,9 +1301,6 @@
     var atlas = spriteMeta && spriteMeta.atlases && spriteMeta.atlases[key];
     if (!atlas) return;
     var nSprites = atlas.sprites.length;
-    var aPerSprite = atlas.cellsPerSprite;
-    var aAcross = atlas.across;
-    var cellW = atlas.cellW, cellH = atlas.cellH;
     // Per-sprite instance arrays. Array growth is amortized; we know
     // approximate counts per sprite (cellsPerSprite-ish).
     var perSprite = new Array(nSprites);
@@ -1265,39 +1309,9 @@
       var t = lastTileRects[i];
       var loc = spriteMeta.imageMap[t.name];
       if (!loc) continue;
-      var spIdx = Math.floor(loc.idx / aPerSprite);
-      var posInSprite = loc.idx % aPerSprite;
-      var row = Math.floor(posInSprite / aAcross);
-      var col = posInSprite % aAcross;
-      // src in cell pixels; texture dims unknown until upload, so store
-      // pixel coords here and convert to UV at draw time? No — the sprite
-      // image dim is deterministic from atlas metadata (across*cellW × ceil(count/across)*cellH).
-      // We use that.
-      var spriteCells = atlas.sprites[spIdx].count;
-      var spriteRows = Math.ceil(spriteCells / aAcross);
-      var spriteW = aAcross * cellW;
-      var spriteH = spriteRows * cellH;
-      // The atlas cell stores the tile fit-within (cellW, cellH) preserving
-      // aspect (top-left, leftover area is zero). MUST match the server
-      // formula in sprite_worker.js fitInCell() exactly — UV sampling reads
-      // the stored bytes, mismatch = neighbor-cell bleed for wide tiles or
-      // black-padding bleed for tiny tiles.
-      var aspect = loc.w / 200;  // canonical aspect from imagemap
-      var naturalW = aspect * cellH;
-      var storedW, storedH;
-      if (naturalW > cellW) {
-        storedW = cellW;
-        storedH = Math.max(1, Math.round(cellW / aspect));
-      } else {
-        storedW = Math.max(1, Math.round(naturalW));
-        storedH = cellH;
-      }
-      var sx = col * cellW;
-      var sy = row * cellH;
-      var u0 = sx / spriteW, v0 = sy / spriteH;
-      var du = storedW / spriteW, dv = storedH / spriteH;
-      var arr = perSprite[spIdx];
-      arr.push(t.x, t.y, t.w, t.h, u0, v0, du, dv);
+      var cell = atlasCellRect(loc, atlas);
+      perSprite[cell.spIdx].push(t.x, t.y, t.w, t.h,
+        cell.sx / cell.spriteW, cell.sy / cell.spriteH, cell.sw / cell.spriteW, cell.sh / cell.spriteH);
     }
     // Drop any prior buffers for this atlas, then upload fresh.
     for (var s2 = 0; s2 < nSprites; s2++) {
@@ -1545,23 +1559,17 @@
 
   // Draw a tile from whichever small-atlas sprite is already decoded, if any.
   function pushAtlasFallback(batchAccum, t) {
-    var src = bestCachedAtlasSrc(t.name);
-    if (!src) return false;
     var loc = spriteMeta.imageMap[t.name];
     if (!loc) return false;
-    var heights = ['50', '10', '5'];
-    for (var i = 0; i < heights.length; i++) {
-      var hKey = heights[i];
-      var atlasMeta = spriteMeta.atlases[hKey];
-      if (!atlasMeta) continue;
-      var arr = atlasBitmapsSync[hKey];
-      if (!arr) continue;
-      var spIdx = Math.floor(loc.idx / atlasMeta.cellsPerSprite);
-      if (arr[spIdx] !== src.bitmap) continue;
-      var bk = hKey + ':' + spIdx;
-      if (!gridRenderer.hasTexture(bk)) return false;
-      var w = arr[spIdx].width, h = arr[spIdx].height;
-      pushBatch(batchAccum, bk, t.x, t.y, t.w, t.h, src.sx / w, src.sy / h, src.sw / w, src.sh / h);
+    var tiers = ['50', '10', '5'];
+    for (var i = 0; i < tiers.length; i++) {
+      var atlas = spriteMeta.atlases[tiers[i]];
+      if (!atlas) continue;
+      var cell = atlasCellRect(loc, atlas);
+      var textureKey = tiers[i] + ':' + cell.spIdx;
+      if (!gridRenderer.hasTexture(textureKey)) continue;
+      pushBatch(batchAccum, textureKey, t.x, t.y, t.w, t.h,
+        cell.sx / cell.spriteW, cell.sy / cell.spriteH, cell.sw / cell.spriteW, cell.sh / cell.spriteH);
       return true;
     }
     return false;
@@ -1853,19 +1861,17 @@
   function paintFilmstripTiles(ctx, atlasH, atlas, leftEdge, rightEdge) {
     var bitmaps = atlasBitmapsSync[String(atlasH)] || [];
     var yPad = Math.round((FILM_H - FILM_TILE_H) / 2);
-    var srcScale = atlas.cellH / FILM_TILE_H;
     for (var ti = filmTileIndexAtX(leftEdge); ti < filmTilePos.length; ti++) {
       var tx = filmTilePos[ti];
       var tw = filmTileW[ti];
       if (tx > rightEdge) break;
       var bm = bitmaps[Math.floor(ti / atlas.cellsPerSprite)];
       if (!bm) continue;
-      var posInSprite = ti % atlas.cellsPerSprite;
-      var row = Math.floor(posInSprite / atlas.across);
-      var col = posInSprite % atlas.across;
+      var loc = spriteMeta.imageMap[images[ti + 1]];
+      if (!loc) continue;
+      var cell = atlasCellRect(loc, atlas);
       var screenX = tx - leftEdge;
-      var srcW = Math.round(tw * srcScale);
-      ctx.drawImage(bm, col * atlas.cellW, row * atlas.cellH, srcW, atlas.cellH, screenX, yPad, tw, FILM_TILE_H);
+      ctx.drawImage(bm, cell.sx, cell.sy, cell.sw, cell.sh, screenX, yPad, tw, FILM_TILE_H);
       if (ti + 1 === focusedIdx) {
         ctx.strokeStyle = '#fff';
         ctx.lineWidth = 1.5;
@@ -2075,14 +2081,10 @@
     if (!name) return null;
     var loc = spriteMeta.imageMap[name];
     if (!loc) return null;
-    var spriteIdx = Math.floor(idx0 / atlas.cellsPerSprite);
-    var bitmap = bitmaps[spriteIdx];
+    var cell = atlasCellRect(loc, atlas);
+    var bitmap = bitmaps[cell.spIdx];
     if (!bitmap) return null;
-    var posInSprite = idx0 % atlas.cellsPerSprite;
-    var row = Math.floor(posInSprite / atlas.across);
-    var col = posInSprite % atlas.across;
-    var srcW = Math.round(loc.w * atlas.cellH / CANONICAL_H);
-    return { bitmap: bitmap, sx: col * atlas.cellW, sy: row * atlas.cellH, sw: srcW, sh: atlas.cellH, natW: loc.w, natH: CANONICAL_H };
+    return { bitmap: bitmap, sx: cell.sx, sy: cell.sy, sw: cell.sw, sh: cell.sh, natW: loc.w, natH: CANONICAL_H };
   }
 
   // 1-finger horizontal drag on the main image becomes a filmstrip scrub: we
