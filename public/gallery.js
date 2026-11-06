@@ -510,6 +510,30 @@
     // On-screen tiles the current draw path would put content under (any
     // per-image tier, or an atlas sprite on the GPU), vs the on-screen total.
     // Lets a harness count black tiles while scrolling fast.
+    // Histogram of the best source on the GPU per on-screen tile: per-image
+    // tier height, atlas tier height, or 0 for nothing. Times each rung of
+    // the quality ladder after a jump.
+    visibleTiers: function () {
+      var thumbsEl = $('thumbs');
+      if (!thumbsEl || !canvasEl) return null;
+      var top = thumbsEl.scrollTop, bot = top + thumbsEl.clientHeight;
+      var hist = {};
+      for (var i = firstTileIndexAtOrBelow(top); i < lastTileRects.length; i++) {
+        var t = lastTileRects[i];
+        if (t.y > bot) break;
+        var best = bestTexturedPerImageTier(t.name);
+        if (!best) {
+          var loc = spriteMeta.imageMap[t.name];
+          var tiers = ['100', '50', '10', '5'];
+          for (var k = 0; k < tiers.length && loc; k++) {
+            var atlas = spriteMeta.atlases[tiers[k]];
+            if (atlas && gridRenderer.hasTexture(tiers[k] + ':' + Math.floor(loc.idx / atlas.cellsPerSprite))) { best = parseInt(tiers[k], 10); break; }
+          }
+        }
+        hist[best] = (hist[best] || 0) + 1;
+      }
+      return hist;
+    },
     visibleCoverage: function () {
       var thumbsEl = $('thumbs');
       if (!thumbsEl || !canvasEl) return null;
@@ -1573,9 +1597,17 @@
       tilesInBuffer.push(lastTileRects[i]);
     }
 
+    // h800/h1600 tiles get a per-image h200 first: ~15 KB each, it lands
+    // long before the real tier, while the h50 sprite that stands in for
+    // smaller tiles (1.7 MB, 50 MB decoded, 1400 tiles) rarely beats it.
+    var stepTier = tierH >= 800 ? 200 : 0;
+
     // Anything queued for a tile outside the buffer is stale (user scrolled past it).
     var keepKeys = new Set();
-    for (var k = 0; k < tilesInBuffer.length; k++) keepKeys.add(tilesInBuffer[k].name + '|' + tierH);
+    for (var k = 0; k < tilesInBuffer.length; k++) {
+      keepKeys.add(tilesInBuffer[k].name + '|' + tierH);
+      if (stepTier) keepKeys.add(tilesInBuffer[k].name + '|' + stepTier);
+    }
     cancelPerImageLoadsExcept(keepKeys);
 
     requestFallbackAtlasSprites(tilesInBuffer);
@@ -1588,11 +1620,17 @@
       var loadedKey = bestLoadedPerImageKey(t.name, loadedTiers);
       if (loadedKey) pushBatch(batchAccum, loadedKey, t.x, t.y, t.w, t.h, 0, 0, 1, 1);
       else pushAtlasFallback(batchAccum, t, ['50', '10', '5']);
+      var distance = distanceFromViewport(t, scrollY, viewportH);
+      if (stepTier && !bestTexturedPerImageTier(t.name)) {
+        loadPerImageTexture(t.name, stepTier, distance).then(function (ok) {
+          if (ok && canvasEl) scheduleUpgradeRedraw();
+        }, function () {});
+      }
       // Only chain a redraw if the IDEAL tier isn't already on GPU. Without
       // this, every redraw re-chains and an already-cached promise triggers
       // another redraw — infinite loop.
       if (!gridRenderer.hasTexture('img:' + t.name + '|' + tierH)) {
-        loadPerImageTexture(t.name, tierH, distanceFromViewport(t, scrollY, viewportH)).then(function (ok) {
+        loadPerImageTexture(t.name, tierH, distance).then(function (ok) {
           // null means the load was canceled — no new content arrived.
           // A per-image arrival is an UPGRADE (the fallback already shows
           // content), so defer the redraw until scrolling idles.
