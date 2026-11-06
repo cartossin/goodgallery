@@ -508,8 +508,8 @@
   // Per-atlas-height ImageBitmap cache (h5/h10/h50, loaded lazily).
   // Sync mirror so drag-paint can blit prev/next without a microtask hop.
   var atlasBitmapsSync = {};
-  // DEBUG: expose for memory-leak repro harness. Counts non-null bitmap refs
-  // per atlas height. Cheap, harmless to leave in production.
+  // Test hook for the headless memory harness (counts live bitmap refs per
+  // atlas tier). A reference to existing state, no per-frame cost.
   window.__memdbg = {
     spriteRefCount: function (atlasH) {
       var arr = atlasBitmapsSync[String(atlasH)] || [];
@@ -832,8 +832,6 @@
       if (!available() || !bitmap) return;
       var existing = textures.get(key);
       if (existing) return;
-      window.__textureKeys = window.__textureKeys || new Set();
-      window.__textureKeys.add(key);
       var tex = gl.createTexture();
       gl.bindTexture(gl.TEXTURE_2D, tex);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
@@ -910,12 +908,6 @@
     // be rebuilt when the buffer window moves.
     function render(viewportW, viewportH, dpr, topOffset, batches) {
       if (!available()) return;
-      window.__lastDrawTopOffset = topOffset;
-      window.__lastDrawAt = performance.now();
-      window.__lastBatches = batches.map(function (b) {
-        return { textureKey: b.textureKey, n: (b.instances ? b.instances.length / 8 : 0) | 0,
-                 first: b.instances ? Array.from(b.instances.slice(0, 8)) : null };
-      });
       bindCommonState(viewportW, viewportH, dpr, topOffset);
       gl.bindBuffer(gl.ARRAY_BUFFER, dynInstVBO);
       gl.vertexAttribPointer(locDstRect, 4, gl.FLOAT, false, 32, 0);
@@ -938,8 +930,6 @@
     // work. This is the hot path for atlas mode at #size0/#fit on big sets.
     function renderStatic(viewportW, viewportH, dpr, topOffset, batches) {
       if (!available()) return;
-      window.__lastDrawTopOffset = topOffset;
-      window.__lastDrawAt = performance.now();
       bindCommonState(viewportW, viewportH, dpr, topOffset);
       for (var b = 0; b < batches.length; b++) {
         var batch = batches[b];
@@ -1119,7 +1109,6 @@
     bufferTop = Math.max(0, Math.min(maxBufferTop,
       Math.floor(scrollY - (bufferH - viewportH) / 2)));
     canvasEl.style.top = bufferTop + 'px';
-    window.__bufferTop = bufferTop;
   }
 
   function onCanvasClick(e) {
@@ -2244,7 +2233,6 @@
       thumbsEl.scrollTop = 0;
     }
 
-    window.__lastTileRects = lastTileRects;
     drawCanvasForScroll();
   }
 
