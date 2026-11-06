@@ -1,5 +1,4 @@
-/* Goodgallery 2.0 default stylesheet — dark, dense, mobile-first.
-   Place a `goodgallery.css` in the gallery root to override (TODO: wire up). */
+/* Goodgallery default stylesheet: dark, dense, mobile-first. */
 
 :root {
   --bg: #0a0a0a;
