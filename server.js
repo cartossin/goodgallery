@@ -1312,6 +1312,8 @@ var imagemapURL      = ${imagemapURL};
 
 // ---------- request handler ----------
 async function handle(req, res) {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   const method = req.method;
   let u, pathname;
   try {
