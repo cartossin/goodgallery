@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Goodgallery Admin</title>
+<link rel="icon" type="image/svg+xml" href="/_static/favicon.svg">
+<link rel="stylesheet" href="/_static/admin2.css">
+</head>
+<body>
+
+<header class="topbar">
+  <a class="brand" href="/">Goodgallery</a>
+  <span class="brand-sub">Admin</span>
+  <nav class="topbar-links" id="topbarLinks" hidden>
+    <a href="#access">Sign-ins</a>
+    <a href="/_admin/">Old admin</a>
+  </nav>
+</header>
+
+<!-- Server-wide state: the build queue and the two global actions. -->
+<section class="server-bar" id="serverBar" hidden aria-label="Build queue">
+  <p class="queue-status" id="queueStatus">Checking build queue…</p>
+  <div class="actions">
+    <button type="button" id="fullRescanButton" title="Walk every folder and pick up files added outside the uploader (rsync, mv). Unchanged folders are skipped.">Full rescan</button>
+    <button type="button" id="clearQueueButton" title="Drop queued image builds. Builds already running finish.">Clear queue</button>
+  </div>
+</section>
+
+<p class="notice" id="notice" role="status" hidden></p>
+
+<main>
+
+  <section class="card" id="signIn" hidden>
+    <h1 id="signInTitle">Sign in</h1>
+    <p id="signInText">Checking…</p>
+    <button type="button" class="primary" id="signInButton" disabled>Please wait…</button>
+    <p class="error" id="signInError"></p>
+    <p class="hint">Passkeys need HTTPS (or localhost).</p>
+  </section>
+
+  <div id="app" hidden>
+
+    <section class="card" id="folder" aria-labelledby="folderTitle">
+      <nav class="breadcrumb" id="breadcrumb" aria-label="Folder path"></nav>
+      <h1 id="folderTitle">Galleries</h1>
+      <p class="facts" id="folderFacts"></p>
+      <p class="warning" id="folderNotYetBuilt" hidden>
+        <span id="folderNotYetBuiltText"></span>
+        <button type="button" id="rescanChangedButton">Rescan this folder</button>
+      </p>
+      <div class="actions">
+        <a class="button" id="openInGallery" href="/" target="_blank" rel="noopener">Open in gallery</a>
+        <button type="button" id="rescanFolderButton" title="Pick up changes to this folder made outside the uploader.">Rescan folder</button>
+        <button type="button" id="rebuildFolderButton" title="Delete this folder's thumbnails and atlases and build them again.">Rebuild from scratch</button>
+        <button type="button" class="danger" id="trashFolderButton">Move folder to trash</button>
+      </div>
+    </section>
+
+    <section class="card" aria-labelledby="subfoldersTitle">
+      <h2 id="subfoldersTitle">Subfolders</h2>
+      <ul class="rows" id="subfolderList"></ul>
+      <form class="inline-form" id="newFolderForm">
+        <label for="newFolderName">New subfolder</label>
+        <input id="newFolderName" type="text" autocomplete="off" placeholder="Name" required>
+        <button type="submit">Create</button>
+      </form>
+    </section>
+
+    <section class="card" aria-labelledby="uploadTitle">
+      <h2 id="uploadTitle">Add images</h2>
+      <div class="drop-zone" id="dropZone">
+        <p>Drop images or folders here, or</p>
+        <div class="actions">
+          <button type="button" id="pickFilesButton">Choose files</button>
+          <button type="button" id="pickFolderButton">Choose a folder</button>
+        </div>
+        <input id="filePicker" type="file" multiple accept="image/*" hidden>
+        <input id="folderPicker" type="file" webkitdirectory hidden>
+      </div>
+      <ul class="rows uploads" id="uploadList"></ul>
+    </section>
+
+    <details class="card" id="imagesSection">
+      <summary><h2>Images <span class="count" id="imageCount"></span></h2></summary>
+      <input id="imageFilter" type="search" placeholder="Filter by name" autocomplete="off">
+      <ul class="rows" id="imageList"></ul>
+      <p class="hint" id="imageListNote"></p>
+    </details>
+
+    <details class="card" id="trashSection">
+      <summary><h2>Trash <span class="count" id="trashCount"></span></h2></summary>
+      <ul class="rows" id="trashList"></ul>
+      <div class="actions" id="trashActions">
+        <button type="button" id="restoreAllButton">Restore all</button>
+        <button type="button" class="danger" id="emptyTrashButton">Empty trash</button>
+      </div>
+    </details>
+
+    <section class="card" id="access" aria-labelledby="accessTitle">
+      <h2 id="accessTitle">Sign-ins</h2>
+      <ul class="rows" id="sessionList"></ul>
+      <div class="actions">
+        <button type="button" id="loginLinkButton" title="A one-time link that signs another browser in for 24 hours. Expires after 10 minutes.">Create login link</button>
+        <button type="button" class="danger" id="revokeOthersButton">Sign out all other sessions</button>
+        <button type="button" id="signOutButton">Sign out</button>
+      </div>
+      <p class="hint" id="accessHint"></p>
+    </section>
+
+  </div>
+</main>
+
+<dialog id="loginLinkDialog">
+  <h2>One-time login link</h2>
+  <p>Open this on the browser you want to sign in. It works once, expires in
+    10 minutes, and whoever opens it first is signed in, so don't post it anywhere public.</p>
+  <div class="inline-form">
+    <input id="loginLinkInput" type="text" readonly aria-label="Login link">
+    <button type="button" id="copyLoginLinkButton">Copy</button>
+  </div>
+  <form method="dialog" class="actions dialog-actions">
+    <button type="submit">Close</button>
+  </form>
+</dialog>
+
+<template id="subfolderRowTemplate">
+  <li class="row subfolder-row">
+    <a class="row-name" href="#"></a>
+    <span class="row-meta"></span>
+    <label class="hidden-toggle"><input type="checkbox"> Hidden</label>
+    <button type="button" class="small danger">Trash</button>
+  </li>
+</template>
+
+<template id="imageRowTemplate">
+  <li class="row">
+    <a class="row-name" target="_blank" rel="noopener"></a>
+    <button type="button" class="small">Trash</button>
+  </li>
+</template>
+
+<template id="trashRowTemplate">
+  <li class="row trash-row">
+    <span class="row-name"></span>
+    <span class="row-meta"></span>
+    <span class="row-buttons">
+      <button type="button" class="small" data-action="restore">Restore</button>
+      <button type="button" class="small danger" data-action="delete">Delete forever</button>
+    </span>
+  </li>
+</template>
+
+<template id="uploadRowTemplate">
+  <li class="row upload-row">
+    <span class="row-name"></span>
+    <span class="row-meta"></span>
+    <progress max="1" value="0"></progress>
+  </li>
+</template>
+
+<template id="sessionRowTemplate">
+  <li class="row session-row">
+    <span class="row-name"></span>
+    <span class="row-meta"></span>
+    <button type="button" class="small danger">Revoke</button>
+  </li>
+</template>
+
+<script src="/_static/admin2.js"></script>
+</body>
+</html>
