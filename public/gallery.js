@@ -502,6 +502,9 @@
     },
     perImageBitmapCount: function () { return perImageBitmapsSync.size; },
     perImageTextureCount: function () { return perImageTextures.size; },
+    mainSrcHeight: function () { return mainDrawSrc ? mainDrawSrc.sh : null; },
+    perImageTextureKeys: function () { return Array.from(perImageTextures); },
+    perImageBitmapKeys: function () { return Array.from(perImageBitmapsSync.keys()); },
     // Per-image grid tiles with their ideal-tier texture ready, split into
     // on-screen and whole-buffer counts. Lets a harness time "visible done".
     perImageProgress: function () {
@@ -1486,6 +1489,14 @@
     gridRenderer.render(W, bufferH, dpr, bufferTop, batches);
   }
 
+  // Largest per-image tier of `name` that the grid has as a texture, or 0.
+  function bestTexturedPerImageTier(name) {
+    for (var i = PER_IMAGE_TIERS.length - 1; i >= 0; i--) {
+      if (perImageTextures.has(name + '|' + PER_IMAGE_TIERS[i])) return PER_IMAGE_TIERS[i];
+    }
+    return 0;
+  }
+
   // Texture key of the best per-image tier already on the GPU, or null.
   function bestLoadedPerImageKey(name, tiers) {
     for (var i = 0; i < tiers.length; i++) {
@@ -1933,10 +1944,26 @@
     // by prefetchFilmstripVisible's stable-focus timer; nothing to do here.
     var capturedIdx = focusedIdx;
 
-    // If we didn't have any bitmap at all yet, kick off atlas load AND register
-    // a per-sprite waiter so we paint the instant OUR sprite arrives — rather than
-    // waiting for every sprite in the atlas to decode. With OI's 32 h50 sprites
-    // that turns ~1s of black canvas into <100ms.
+    // No per-image bitmap yet (nothing, or only the h50 atlas cell). If the
+    // grid already holds this image as a texture at a smaller tier, its
+    // bitmap was closed at upload — re-decoding that file from the HTTP
+    // cache takes a few ms and gives a far sharper placeholder than the
+    // atlas while the ideal tier downloads.
+    if (!src || src.tier === 0) {
+      var cachedTier = bestTexturedPerImageTier(images[capturedIdx]);
+      if (cachedTier) {
+        loadPerImageBitmap(images[capturedIdx], cachedTier).then(function (bm) {
+          if (!bm || !mainEl || focusedIdx !== capturedIdx) return;
+          if (mainDrawSrc && mainDrawSrc.forIdx === capturedIdx && mainDrawSrc.sh >= bm.height) return;
+          mainDrawSrc = { bitmap: bm, sx: 0, sy: 0, sw: bm.width, sh: bm.height, forIdx: capturedIdx };
+          paintMain();
+        });
+      }
+    }
+    // Kick off the atlas load too, with a per-sprite waiter so we paint the
+    // instant OUR sprite arrives — rather than waiting for every sprite in the
+    // atlas to decode. With OI's 32 h50 sprites that turns ~1s of black canvas
+    // into <100ms.
     if (!src) {
       var atlasH = 50;
       var atlas = spriteMeta.atlases && spriteMeta.atlases[String(atlasH)];
@@ -1978,6 +2005,10 @@
       if (!name) continue;
       warmNames.add(name);
       keepKeys.add(name + '|' + tier);
+      if (k === 0) {
+        // Any tier of the centered image may be in flight as its placeholder.
+        for (var ti = 0; ti < PER_IMAGE_TIERS.length; ti++) keepKeys.add(name + '|' + PER_IMAGE_TIERS[ti]);
+      }
     }
     // Abort any in-flight load that's no longer in the keep window — frees
     // sockets/decoder immediately for whatever's about to be requested next.
@@ -2014,7 +2045,8 @@
   }
 
   // Best already-cached source for `idx1` at `targetH`: walk per-image tiers
-  // (target then smaller), then fall back to atlas h50.
+  // (target then smaller), then fall back to atlas h50. `tier` is the
+  // per-image tier the source came from, 0 for the atlas.
   function getBestSrcForFocus(idx1, targetH) {
     if (idx1 < 1 || idx1 > lastimagevalue) return null;
     var name = images[idx1];
@@ -2024,9 +2056,11 @@
     for (var i = 0; i < ladder.length; i++) {
       var t = ladder[i];
       var bm = getPerImageBitmapSync(name, t);
-      if (bm) return { bitmap: bm, sx: 0, sy: 0, sw: bm.width, sh: bm.height };
+      if (bm) return { bitmap: bm, sx: 0, sy: 0, sw: bm.width, sh: bm.height, tier: t };
     }
-    return getAtlasSrcSync(idx1);
+    var atlasSrc = getAtlasSrcSync(idx1);
+    if (atlasSrc) atlasSrc.tier = 0;
+    return atlasSrc;
   }
 
   function getAtlasSrcSync(idx1) {
