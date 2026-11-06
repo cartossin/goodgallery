@@ -516,18 +516,23 @@
       var top = thumbsEl.scrollTop, bot = top + thumbsEl.clientHeight;
       var targetH = currentRowHeight * devicePixelRatio();
       var atlasH = pickAtlasHeight(targetH);
-      var r = { lit: 0, total: 0, mode: atlasH != null ? 'atlas' + atlasH : 'perimage' + pickPerImageTier(targetH) };
+      var tierH = pickPerImageTier(targetH);
+      var floorKey = floorAtlasKey();
+      var r = { lit: 0, sharp: 0, total: 0, mode: atlasH != null ? 'atlas' + atlasH : 'perimage' + tierH, floor: floorKey };
       for (var i = firstTileIndexAtOrBelow(top); i < lastTileRects.length; i++) {
         var t = lastTileRects[i];
         if (t.y > bot) break;
         r.total++;
-        var lit;
+        var sharp, lit;
         if (atlasH != null) {
           var loc = spriteMeta.imageMap[t.name];
-          lit = !!loc && gridRenderer.hasTexture(atlasH + ':' + Math.floor(loc.idx / spriteMeta.atlases[String(atlasH)].cellsPerSprite));
+          sharp = !!loc && gridRenderer.hasTexture(atlasH + ':' + Math.floor(loc.idx / spriteMeta.atlases[String(atlasH)].cellsPerSprite));
+          lit = sharp || (!!floorKey && pushAtlasFallback(new Map(), t, [floorKey]));
         } else {
-          lit = bestTexturedPerImageTier(t.name) > 0 || pushAtlasFallback(new Map(), t);
+          sharp = perImageTextures.has(t.name + '|' + tierH);
+          lit = bestTexturedPerImageTier(t.name) > 0 || pushAtlasFallback(new Map(), t, ['50', '10', '5']);
         }
+        if (sharp) r.sharp++;
         if (lit) r.lit++;
       }
       return r;
@@ -576,6 +581,83 @@
   // iOS Safari on large galleries.
   var spritePromises = {};
 
+  function fetchSpriteBitmap(atlas, spriteIdx) {
+    var url = folderURL + GG_DIR + '/' + atlas.sprites[spriteIdx].file;
+    return fetch(url, { credentials: 'same-origin' })
+      .then(function (r) { return r.blob(); })
+      .then(function (b) { return createImageBitmap(b); });
+  }
+
+  // ---- floor tier --------------------------------------------------------
+  // The smallest atlas tier stays on the GPU for the whole gallery, so a
+  // tile has something to draw the instant it scrolls into view however
+  // fast the scrollbar is flicked; the real tier lands on top of it. Its
+  // bitmaps are closed after upload (a context swap refetches from the HTTP
+  // cache). A tier whose cells are too wide to afford is skipped.
+  var FLOOR_MAX_BYTES = 32 * 1024 * 1024;
+  var floorTierKey;                       // undefined until decided; null = none affordable
+  var floorSpritesLoading = new Set();
+
+  function atlasDecodedBytes(atlas) {
+    var bytes = 0;
+    for (var i = 0; i < atlas.sprites.length; i++) {
+      bytes += atlas.across * atlas.cellW * Math.ceil(atlas.sprites[i].count / atlas.across) * atlas.cellH * 4;
+    }
+    return bytes;
+  }
+
+  function floorAtlasKey() {
+    if (floorTierKey !== undefined) return floorTierKey;
+    floorTierKey = null;
+    var keys = Object.keys(spriteMeta.atlases).sort(function (a, b) { return a - b; });
+    if (keys.length && atlasDecodedBytes(spriteMeta.atlases[keys[0]]) <= FLOOR_MAX_BYTES) floorTierKey = keys[0];
+    return floorTierKey;
+  }
+
+  function requestFloorSprites() {
+    var key = floorAtlasKey();
+    if (!key || !gridRenderer.available()) return;
+    var atlas = spriteMeta.atlases[key];
+    for (var i = 0; i < atlas.sprites.length; i++) {
+      if (gridRenderer.hasTexture(key + ':' + i) || floorSpritesLoading.has(i)) continue;
+      loadFloorSprite(key, atlas, i);
+    }
+  }
+
+  function loadFloorSprite(key, atlas, spriteIdx) {
+    floorSpritesLoading.add(spriteIdx);
+    fetchSpriteBitmap(atlas, spriteIdx).then(function (bm) {
+      floorSpritesLoading.delete(spriteIdx);
+      gridRenderer.uploadSprite(key + ':' + spriteIdx, bm);
+      closeBitmap(bm);
+      // First content for any tile that had nothing — redraw now. (Only if
+      // the upload took: a redraw with no texture would just refetch.)
+      if (canvasEl && gridRenderer.hasTexture(key + ':' + spriteIdx)) scheduleGridRedraw();
+    }, function () { floorSpritesLoading.delete(spriteIdx); });
+  }
+
+  // Dynamic batches drawing, from the floor tier, every buffered tile whose
+  // active-tier sprite is not on the GPU yet.
+  function floorBatchesForMissingSprites(aKey, needed) {
+    var floorKey = floorAtlasKey();
+    if (!floorKey || floorKey === aKey) return [];
+    var missing = new Set();
+    needed.forEach(function (spIdx) {
+      if (!gridRenderer.hasTexture(aKey + ':' + spIdx)) missing.add(spIdx);
+    });
+    if (!missing.size) return [];
+    var atlas = spriteMeta.atlases[aKey];
+    var batchAccum = new Map();
+    var bufBot = bufferTop + bufferH;
+    for (var i = firstTileIndexAtOrBelow(bufferTop); i < lastTileRects.length; i++) {
+      var t = lastTileRects[i];
+      if (t.y > bufBot) break;
+      var loc = spriteMeta.imageMap[t.name];
+      if (loc && missing.has(Math.floor(loc.idx / atlas.cellsPerSprite))) pushAtlasFallback(batchAccum, t, [floorKey]);
+    }
+    return batchesFromAccum(batchAccum);
+  }
+
   function loadSpriteAt(atlasH, spriteIdx) {
     var key = String(atlasH);
     if (!spritePromises[key]) spritePromises[key] = {};
@@ -583,10 +665,7 @@
     var atlas = window.spriteMeta && spriteMeta.atlases && spriteMeta.atlases[key];
     if (!atlas || !atlas.sprites[spriteIdx]) return Promise.resolve(null);
     if (!atlasBitmapsSync[key]) atlasBitmapsSync[key] = new Array(atlas.sprites.length).fill(null);
-    var url = folderURL + GG_DIR + '/' + atlas.sprites[spriteIdx].file;
-    spritePromises[key][spriteIdx] = fetch(url, { credentials: 'same-origin' })
-      .then(function (r) { return r.blob(); })
-      .then(function (b) { return createImageBitmap(b); })
+    spritePromises[key][spriteIdx] = fetchSpriteBitmap(atlas, spriteIdx)
       .then(function (bm) {
         atlasBitmapsSync[key][spriteIdx] = bm;
         gridRenderer.uploadSprite(key + ':' + spriteIdx, bm);
@@ -817,7 +896,9 @@
   //   gridRenderer.attach(canvas)        — bind to (possibly new) canvas
   //   gridRenderer.uploadSprite(key, bm) — upload an ImageBitmap to a texture
   //   gridRenderer.releaseAll()          — drop all textures (mode swap, etc.)
-  //   gridRenderer.render(opts)          — draw one frame
+  //   gridRenderer.beginFrame(...)       — clear + bind state; false if no GL
+  //   gridRenderer.drawStatic(batches)   — pre-uploaded instance buffers
+  //   gridRenderer.drawDynamic(batches)  — per-frame instance arrays
   //
   // The renderer is purely a draw layer; visibility, atlas selection, and
   // sprite-load orchestration stay in drawCanvasForScroll.
@@ -1003,15 +1084,17 @@
       gl.vertexAttribDivisor(locSrcRect, 1);
     }
 
-    // Dynamic batches: { textureKey, instances: Float32Array }. Used by
-    // per-image mode where the per-tile texture varies and instances must
-    // be rebuilt when the buffer window moves.
-    function render(viewportW, viewportH, dpr, topOffset, batches) {
-      if (!available()) return;
+    // A frame is beginFrame() followed by any mix of drawStatic()/drawDynamic().
+    function beginFrame(viewportW, viewportH, dpr, topOffset) {
+      if (!available()) return false;
       bindCommonState(viewportW, viewportH, dpr, topOffset);
-      gl.bindBuffer(gl.ARRAY_BUFFER, dynInstVBO);
-      gl.vertexAttribPointer(locDstRect, 4, gl.FLOAT, false, 32, 0);
-      gl.vertexAttribPointer(locSrcRect, 4, gl.FLOAT, false, 32, 16);
+      return true;
+    }
+
+    // Dynamic batches: { textureKey, instances: Float32Array }. Used where
+    // the per-tile texture varies and instances are rebuilt when the buffer
+    // window moves: per-image mode, and the floor under missing sprites.
+    function drawDynamic(batches) {
       for (var b = 0; b < batches.length; b++) {
         var batch = batches[b];
         var t = textures.get(batch.textureKey);
@@ -1028,9 +1111,7 @@
     // Static batches: { textureKey, instanceKey } — both pre-uploaded.
     // Per-frame work is one bind + one draw per batch; no JS-side per-tile
     // work. This is the hot path for atlas mode at #size0/#fit on big sets.
-    function renderStatic(viewportW, viewportH, dpr, topOffset, batches) {
-      if (!available()) return;
-      bindCommonState(viewportW, viewportH, dpr, topOffset);
+    function drawStatic(batches) {
       for (var b = 0; b < batches.length; b++) {
         var batch = batches[b];
         var t = textures.get(batch.textureKey);
@@ -1051,7 +1132,7 @@
       releaseAll: releaseAll, deleteTexture: deleteTexture,
       uploadStatic: uploadStatic, dropStatic: dropStatic,
       releaseAllStatic: releaseAllStatic, hasStatic: hasStatic,
-      render: render, renderStatic: renderStatic,
+      beginFrame: beginFrame, drawStatic: drawStatic, drawDynamic: drawDynamic,
       hasTexture: hasTexture,
     };
   })();
@@ -1168,7 +1249,8 @@
     // Mode swap creates a fresh canvas → fresh GL context → textures are gone.
     // Atlas sprites re-upload from their kept bitmaps. Per-image textures had
     // their bitmaps closed at upload, so forget them and let the grid fetch
-    // again (served from the HTTP cache). Static instance buffers are
+    // again (served from the HTTP cache); floor sprites refetch the same
+    // way, on the next draw. Static instance buffers are
     // per-context too — drop them so renderGallery rebuilds for the new context.
     if (gridRenderer.attach(canvasEl)) {
       Object.keys(atlasBitmapsSync).forEach(function (k) {
@@ -1361,6 +1443,7 @@
   // outside the buffer window. Bounded memory regardless of how far the user scrolls.
   function evictAtlasBitmaps(atlasH, neededIdxs) {
     var key = String(atlasH);
+    if (key === floorAtlasKey()) return;  // resident for the whole gallery
     var arr = atlasBitmapsSync[key];
     if (!arr) return;
     var promCache = spritePromises[key];
@@ -1404,6 +1487,7 @@
     var atlasH = pickAtlasHeight(currentRowHeight * dpr);
     if (atlasH != null) drawGridFromAtlas(atlasH, W, dpr);
     else drawGridPerImage(W, dpr, scrollY, viewportH);
+    requestFloorSprites();
   }
 
   // Atlas mode: every tile comes from one sprite tier. Instance buffers are
@@ -1421,16 +1505,19 @@
     // Lazy-load only sprites the buffer needs; evict the rest within this tier.
     var needed = spritesNeededForBuffer(atlasH);
     evictAtlasBitmaps(atlasH, needed);
-    needed.forEach(function (spIdx) {
-      // Already on GPU? Nothing to wait on, nothing to redraw for.
-      if (gridRenderer.hasTexture(aKey + ':' + spIdx)) return;
-      // Atlas arrival is FIRST content for those tiles — redraw immediately.
-      loadSpriteAt(atlasH, spIdx).then(function () {
-        if (canvasEl) scheduleGridRedraw();
-      }, function () {});
-    });
+    // (The floor tier is loaded whole by requestFloorSprites instead.)
+    if (aKey !== floorAtlasKey()) {
+      needed.forEach(function (spIdx) {
+        // Already on GPU? Nothing to wait on, nothing to redraw for.
+        if (gridRenderer.hasTexture(aKey + ':' + spIdx)) return;
+        // Atlas arrival is FIRST content for those tiles — redraw immediately.
+        loadSpriteAt(atlasH, spIdx).then(function () {
+          if (canvasEl) scheduleGridRedraw();
+        }, function () {});
+      });
+    }
 
-    // One batch per sprite. renderStatic skips sprites whose texture isn't loaded yet.
+    // One batch per sprite. drawStatic skips sprites whose texture isn't loaded yet.
     var atlas = spriteMeta.atlases[aKey];
     var batches = [];
     for (var b = 0; b < atlas.sprites.length; b++) {
@@ -1438,7 +1525,12 @@
       if (!gridRenderer.hasStatic(bk)) continue;
       batches.push({ textureKey: bk, instanceKey: bk });
     }
-    gridRenderer.renderStatic(W, bufferH, dpr, bufferTop, batches);
+    // Tiles whose sprite hasn't arrived draw from the floor tier meanwhile.
+    var floorBatches = floorBatchesForMissingSprites(aKey, needed);
+    if (gridRenderer.beginFrame(W, bufferH, dpr, bufferTop)) {
+      gridRenderer.drawStatic(batches);
+      gridRenderer.drawDynamic(floorBatches);
+    }
     // Atlas mode doesn't use per-image bitmaps — release any leftovers.
     warmPerImageNames = new Set();
     evictPerImage(new Set());
@@ -1480,7 +1572,7 @@
       warmNames.add(t.name);
       var loadedKey = bestLoadedPerImageKey(t.name, loadedTiers);
       if (loadedKey) pushBatch(batchAccum, loadedKey, t.x, t.y, t.w, t.h, 0, 0, 1, 1);
-      else pushAtlasFallback(batchAccum, t);
+      else pushAtlasFallback(batchAccum, t, ['50', '10', '5']);
       // Only chain a redraw if the IDEAL tier isn't already on GPU. Without
       // this, every redraw re-chains and an already-cached promise triggers
       // another redraw — infinite loop.
@@ -1496,11 +1588,7 @@
     warmPerImageNames = warmNames;
     evictPerImage(warmNames);
 
-    var batches = [];
-    batchAccum.forEach(function (arr, key) {
-      batches.push({ textureKey: key, instances: new Float32Array(arr) });
-    });
-    gridRenderer.render(W, bufferH, dpr, bufferTop, batches);
+    if (gridRenderer.beginFrame(W, bufferH, dpr, bufferTop)) gridRenderer.drawDynamic(batchesFromAccum(batchAccum));
   }
 
   // Largest per-image tier of `name` that the grid has as a texture, or 0.
@@ -1551,17 +1639,24 @@
     evictAtlasTiersOtherThan(new Set([fallbackKey]));
   }
 
+  function batchesFromAccum(batchAccum) {
+    var batches = [];
+    batchAccum.forEach(function (arr, key) {
+      batches.push({ textureKey: key, instances: new Float32Array(arr) });
+    });
+    return batches;
+  }
+
   function pushBatch(batchAccum, key, x, y, w, h, u0, v0, du, dv) {
     var arr = batchAccum.get(key);
     if (!arr) { arr = []; batchAccum.set(key, arr); }
     arr.push(x, y, w, h, u0, v0, du, dv);
   }
 
-  // Draw a tile from whichever small-atlas sprite is already decoded, if any.
-  function pushAtlasFallback(batchAccum, t) {
+  // Draw a tile from the first of `tiers` whose sprite is on the GPU, if any.
+  function pushAtlasFallback(batchAccum, t, tiers) {
     var loc = spriteMeta.imageMap[t.name];
     if (!loc) return false;
-    var tiers = ['50', '10', '5'];
     for (var i = 0; i < tiers.length; i++) {
       var atlas = spriteMeta.atlases[tiers[i]];
       if (!atlas) continue;
