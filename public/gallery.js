@@ -502,6 +502,23 @@
     },
     perImageBitmapCount: function () { return perImageBitmapsSync.size; },
     perImageTextureCount: function () { return perImageTextures.size; },
+    // Per-image grid tiles with their ideal-tier texture ready, split into
+    // on-screen and whole-buffer counts. Lets a harness time "visible done".
+    perImageProgress: function () {
+      var thumbsEl = $('thumbs');
+      if (!thumbsEl || !canvasEl) return null;
+      var top = thumbsEl.scrollTop, bot = top + thumbsEl.clientHeight;
+      var tierH = pickPerImageTier(currentRowHeight * devicePixelRatio());
+      var r = { visibleDone: 0, visibleTotal: 0, bufferDone: 0, bufferTotal: 0 };
+      for (var i = firstTileIndexAtOrBelow(bufferTop); i < lastTileRects.length; i++) {
+        var t = lastTileRects[i];
+        if (t.y > bufferTop + bufferH) break;
+        var done = perImageTextures.has(t.name + '|' + tierH) ? 1 : 0;
+        r.bufferTotal++; r.bufferDone += done;
+        if (t.y + t.h >= top && t.y <= bot) { r.visibleTotal++; r.visibleDone += done; }
+      }
+      return r;
+    },
   };
   // ---- per-image loads --------------------------------------------------
   // Tiles above the largest atlas tier are fetched one AVIF per image. Two
@@ -513,8 +530,8 @@
   // Both share one fetch/decode queue. Keys are `${name}|${tierH}`.
   var perImageTextures = new Set();       // keys whose texture is on the GPU
   var perImageBitmapsSync = new Map();    // key -> open ImageBitmap (focus)
-  var perImageTextureLoads = new Map();   // key -> Promise, in-progress only
-  var perImageBitmapLoads = new Map();    // key -> Promise, in-progress only
+  var perImageTextureLoads = new Map();   // key -> job, in-progress only
+  var perImageBitmapLoads = new Map();    // key -> job, in-progress only
   // Names currently considered "warm" by the visible-buffer / focus-prefetch
   // logic. Updated by drawGridPerImage (grid) and prefetchFilmstripVisible
   // (focus); checked when a load completes so a tile the user has already
@@ -584,22 +601,33 @@
     return PER_IMAGE_TIERS[PER_IMAGE_TIERS.length - 1];
   }
 
-  // Capped in-flight + pending queue so a size3 grid load (hundreds of tiles
-  // kicked off in one frame) doesn't trip Chrome's ERR_INSUFFICIENT_RESOURCES
-  // at the renderer-level fetch cap. HTTP/2 multiplexes well — 64 concurrent
-  // streams is fast but stays clear of the ~256-per-renderer ceiling. Each
-  // fetch has its own AbortController so a scroll that moves past the target
-  // cancels the in-flight download AND discards still-queued requests for it.
-  var PER_IMAGE_MAX_INFLIGHT = 64;
+  // Loads are queued and started in priority order (lowest number first):
+  // the grid passes each tile's distance from the viewport, so on-screen
+  // tiles are fetched and decoded before the rest of the buffer. The
+  // in-flight cap is what gives the ordering teeth — with everything in
+  // flight at once, bandwidth and decode time are shared evenly and the
+  // visible rows finish no sooner than the off-screen ones. It also keeps a
+  // size3 grid load (hundreds of tiles kicked off in one frame) clear of
+  // Chrome's ERR_INSUFFICIENT_RESOURCES fetch cap. Each fetch has its own
+  // AbortController so a scroll that moves past the target cancels the
+  // in-flight download AND discards still-queued requests for it.
+  var PER_IMAGE_MAX_INFLIGHT = 12;
   var perImageQueue = [];               // jobs waiting for an in-flight slot
   var perImageInFlight = new Set();     // jobs fetching/decoding right now
-  // job: { key, wantBitmap, url, ctrl, resolve }
+  var perImagePumpScheduled = false;
+  // job: { key, wantBitmap, priority, url, ctrl, resolve, promise }
 
   function imageNameOfKey(key) { return key.slice(0, key.lastIndexOf('|')); }
   function closeBitmap(bm) {
     try { if (bm && typeof bm.close === 'function') bm.close(); } catch (_) {}
   }
   function _perImageLoads(wantBitmap) { return wantBitmap ? perImageBitmapLoads : perImageTextureLoads; }
+  // Layout px between a tile and the viewport; 0 when any part is on screen.
+  function distanceFromViewport(t, scrollY, viewportH) {
+    if (t.y + t.h < scrollY) return scrollY - (t.y + t.h);
+    if (t.y > scrollY + viewportH) return t.y - (scrollY + viewportH);
+    return 0;
+  }
   function _installPerImageTexture(key, bm) {
     gridRenderer.uploadSprite('img:' + key, bm);
     perImageTextures.add(key);
@@ -613,7 +641,11 @@
       return;
     }
     perImageInFlight.add(job);
-    fetch(job.url, { credentials: 'same-origin', signal: job.ctrl ? job.ctrl.signal : undefined })
+    // Priority hint for the browser's own request queue (HTTP/1.1 connection
+    // limits, HTTP/2 stream weights); ignored where unsupported.
+    var fetchOpts = { credentials: 'same-origin', priority: job.priority === 0 ? 'high' : 'low' };
+    if (job.ctrl) fetchOpts.signal = job.ctrl.signal;
+    fetch(job.url, fetchOpts)
       .then(function (r) { return r.blob(); })
       .then(function (b) { return createImageBitmap(b); })
       .catch(function () { return null; })
@@ -640,9 +672,21 @@
       });
   }
   function _pumpPerImageQueue() {
+    if (!perImageQueue.length) return;
+    perImageQueue.sort(function (a, b) { return a.priority - b.priority; });
     while (perImageInFlight.size < PER_IMAGE_MAX_INFLIGHT && perImageQueue.length) {
       _runPerImageJob(perImageQueue.shift());
     }
+  }
+  // A grid redraw queues a whole buffer's worth of loads in one go; pumping
+  // once afterwards (microtask) lets them all sort together before any start.
+  function _schedulePerImagePump() {
+    if (perImagePumpScheduled) return;
+    perImagePumpScheduled = true;
+    Promise.resolve().then(function () {
+      perImagePumpScheduled = false;
+      _pumpPerImageQueue();
+    });
   }
   // Cancel both pending (queued) AND in-flight loads whose key isn't in
   // keepKeys. Walks the queue once so aborted entries don't sit consuming
@@ -662,23 +706,30 @@
     });
     _pumpPerImageQueue();
   }
-  function _startPerImageLoad(name, tierH, wantBitmap) {
+  function _startPerImageLoad(name, tierH, wantBitmap, priority) {
     var key = name + '|' + tierH;
     var loads = _perImageLoads(wantBitmap);
-    if (loads.has(key)) return loads.get(key);
-    var url = folderURL + GG_DIR + '/' + encodeURIComponent(name) + '.h' + tierH + '.avif';
-    var resolveFn;
-    var prom = new Promise(function (res) { resolveFn = res; });
-    loads.set(key, prom);
-    var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
-    var job = { key: key, wantBitmap: wantBitmap, url: url, ctrl: ctrl, resolve: resolveFn };
-    if (perImageInFlight.size < PER_IMAGE_MAX_INFLIGHT) _runPerImageJob(job);
-    else perImageQueue.push(job);
-    return prom;
+    var job = loads.get(key);
+    if (job) {
+      // Already queued or in flight; a closer request bumps its priority.
+      if (priority < job.priority) job.priority = priority;
+      return job.promise;
+    }
+    job = {
+      key: key, wantBitmap: wantBitmap, priority: priority, ctrl: null, resolve: null, promise: null,
+      url: folderURL + GG_DIR + '/' + encodeURIComponent(name) + '.h' + tierH + '.avif',
+    };
+    job.promise = new Promise(function (res) { job.resolve = res; });
+    if (typeof AbortController !== 'undefined') job.ctrl = new AbortController();
+    loads.set(key, job);
+    perImageQueue.push(job);
+    _schedulePerImagePump();
+    return job.promise;
   }
   // Grid: resolves true once `name` at `tierH` has a texture on the GPU,
-  // null if the load was cancelled or failed.
-  function loadPerImageTexture(name, tierH) {
+  // null if the load was cancelled or failed. `priority` is the tile's
+  // distance from the viewport in layout px (0 = on screen).
+  function loadPerImageTexture(name, tierH, priority) {
     var key = name + '|' + tierH;
     if (perImageTextures.has(key)) return Promise.resolve(true);
     var bm = perImageBitmapsSync.get(key);
@@ -687,14 +738,14 @@
       _installPerImageTexture(key, bm);
       return Promise.resolve(true);
     }
-    return _startPerImageLoad(name, tierH, false);
+    return _startPerImageLoad(name, tierH, false, priority);
   }
   // Focus: resolves with an open ImageBitmap that stays in perImageBitmapsSync
   // until evicted, null if the load was cancelled or failed.
   function loadPerImageBitmap(name, tierH) {
     var bm = perImageBitmapsSync.get(name + '|' + tierH);
     if (bm) return Promise.resolve(bm);
-    return _startPerImageLoad(name, tierH, true);
+    return _startPerImageLoad(name, tierH, true, 0);
   }
   function getPerImageBitmapSync(name, tierH) {
     return perImageBitmapsSync.get(name + '|' + tierH) || null;
@@ -1335,7 +1386,7 @@
 
     var atlasH = pickAtlasHeight(currentRowHeight * dpr);
     if (atlasH != null) drawGridFromAtlas(atlasH, W, dpr);
-    else drawGridPerImage(W, dpr);
+    else drawGridPerImage(W, dpr, scrollY, viewportH);
   }
 
   // Atlas mode: every tile comes from one sprite tier. Instance buffers are
@@ -1388,7 +1439,7 @@
   // Per-image mode: each tile in the buffer gets its own bitmap at the ideal
   // tier, with a small atlas as the instant placeholder. Batches are dynamic
   // and rebuilt only on edge crossings or bitmap arrivals, not per scroll event.
-  function drawGridPerImage(W, dpr) {
+  function drawGridPerImage(W, dpr, scrollY, viewportH) {
     var bufBot = bufferTop + bufferH;
     var tierH = pickPerImageTier(currentRowHeight * dpr);
     var loadedTiers = [tierH].concat(PER_IMAGE_TIERS.filter(function (h) { return h < tierH; }).reverse());
@@ -1417,7 +1468,7 @@
       // this, every redraw re-chains and an already-cached promise triggers
       // another redraw — infinite loop.
       if (!gridRenderer.hasTexture('img:' + t.name + '|' + tierH)) {
-        loadPerImageTexture(t.name, tierH).then(function (ok) {
+        loadPerImageTexture(t.name, tierH, distanceFromViewport(t, scrollY, viewportH)).then(function (ok) {
           // null means the load was canceled — no new content arrived.
           // A per-image arrival is an UPGRADE (the fallback already shows
           // content), so defer the redraw until scrolling idles.
