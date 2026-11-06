@@ -1479,6 +1479,7 @@ async function handle(req, res) {
 
 // ---------- admin actions on a folder ----------
 async function adminAction(req, res, fn) {
+  if (req.method !== 'POST') return sendText(res, 405, 'POST required');
   if (!isAdmin(req)) return sendText(res, 403, 'admin only');
   try { const out = await fn(); sendText(res, 200, out == null ? 'ok' : String(out)); }
   catch (e) { sendText(res, 500, 'error: ' + e.message); }
