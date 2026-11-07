@@ -600,6 +600,7 @@ const PARALLEL_FILES = 4;
 const RETRY_MAX_WAIT_MS = 8000;
 
 async function sha256Hex(buffer) {
+  if (!window.crypto || !window.crypto.subtle) return null;  // plain http: no hash, server skips the check
   var hb = await crypto.subtle.digest('SHA-256', buffer);
   return Array.from(new Uint8Array(hb)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
@@ -668,7 +669,7 @@ async function uploadOneFile(file, dir, ui) {
       try {
         var r = await fetch('/api/upload/chunk/' + id + '/' + idx, {
           method: 'POST',
-          headers: { 'X-Chunk-Hash': hash },
+          headers: hash ? { 'X-Chunk-Hash': hash } : {},
           body: buf,
         });
         if (!r.ok) {

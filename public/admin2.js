@@ -722,12 +722,13 @@ async function uploadOneFile({ file, folderSegments, row }) {
 // backing off up to UPLOAD_RETRY_MAX_WAIT_MS.
 async function sendChunkWithRetry(uploadId, index, bytes, row) {
   const hash = await sha256Hex(bytes);
+  const headers = hash ? { 'X-Chunk-Hash': hash } : {};
   for (let attempt = 1; ; attempt++) {
     try {
       const response = await fetch('/api/upload/chunk/' + uploadId + '/' + index, {
         method: 'POST',
         credentials: 'same-origin',
-        headers: { 'X-Chunk-Hash': hash },
+        headers,
         body: bytes,
       });
       if (response.status === 401) { showSignIn(); throw new SignedOutError('signed out'); }
@@ -743,7 +744,10 @@ async function sendChunkWithRetry(uploadId, index, bytes, row) {
   }
 }
 
+// Browsers only provide crypto.subtle on HTTPS or localhost. On plain http
+// the chunk goes without a hash and the server skips that check.
 async function sha256Hex(bytes) {
+  if (!window.crypto || !window.crypto.subtle) return null;
   const digest = await crypto.subtle.digest('SHA-256', bytes);
   return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
 }
