@@ -783,7 +783,7 @@ function accessHintText(canManage, passkeyExists) {
       : 'No passkey yet, and passkeys need HTTPS or localhost. Sign in with "node server.js login-link" on the server; only passkey sessions can create login links here.';
   }
   return canManage
-    ? 'Sessions last 24 hours from sign-in.'
+    ? 'A session lasts until it signs out, is signed out here, or its browser loses the cookie.'
     : 'This browser signed in with a one-time link, so it cannot create links or sign out other sessions. Use a browser with the passkey for that.';
 }
 

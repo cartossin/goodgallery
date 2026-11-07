@@ -51,9 +51,10 @@ To run it by hand instead: `node server.js`.
 
 1. On the server, run `node server.js login-link` (as root or as
    `goodgallery`, from `/opt/goodgallery`) and open the link it prints within
-   10 minutes. The browser that opens it is signed in for 24 hours. There is
-   no other way in on a fresh install, so nobody can claim the admin by
-   reaching the URL first.
+   10 minutes. The browser that opens it stays signed in until it signs out,
+   is signed out from the admin page, or loses the cookie. There is no other
+   way in on a fresh install, so nobody can claim the admin by reaching the
+   URL first.
 2. Optional, on HTTPS: open `/_admin2/` and press **Create passkey** in the
    Sign-ins card. From then on the passkey signs in directly, and only
    passkey sessions can create login links from the page. Without HTTPS,
@@ -76,7 +77,7 @@ resumable), creates folders, hides folders from public listings (they stay
 reachable by direct URL), moves images and folders to a per-folder trash,
 restores or empties that trash, clears a folder's derived cache, and runs a
 full rescan. **Generate login link** mints a one-time URL that signs in
-another browser for 24 hours; useful on a device that cannot use your
+another browser; useful on a device that cannot use your
 passkey. Only passkey sessions can mint links from the page;
 `node server.js login-link` on the server always can.
 

@@ -31,7 +31,7 @@ if (command === 'login-link') {
   console.log(`One-time admin login link, good for ${Math.round(LOGIN_LINK_TTL / 60000)} minutes:`);
   console.log(`  http://${os.hostname()}:${PORT}/#auth=${token}`);
   console.log('Use the address you normally open the gallery at if it differs.');
-  console.log('The browser that opens it is signed in for 24 hours.');
+  console.log('The browser that opens it stays signed in until it signs out or is signed out from the admin page.');
   process.exit(0);
 } else if (command) {
   console.error(`unknown command "${command}". Usage: node server.js [login-link]`);
