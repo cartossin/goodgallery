@@ -15,7 +15,9 @@ What makes it different:
 - **Folders are galleries.** Point it at a directory tree. Each folder is a
   gallery; subfolders show as cards. Add images with the built-in uploader
   or by copying files in and pressing Full rescan.
-- **Passkey admin.** One WebAuthn passkey, no passwords, no accounts table.
+- **No passwords.** Admin sign-in is a one-time link made on the server, or
+  an optional WebAuthn passkey once you have HTTPS. Nothing to choose badly,
+  nothing to leak, no accounts table.
 
 ## Requirements
 
@@ -63,7 +65,8 @@ To run it by hand instead: `node server.js`.
 3. Create a folder or upload images from the admin page, or copy a directory
    of images into the galleries root (owned by `goodgallery`) and press
    **Full rescan**.
-4. Open `https://your-host/`. The first visit to a folder builds its
+4. Open `http://your-host:3000/` (or whatever your proxy serves). The first
+   visit to a folder builds its
    renditions and atlases in the background and shows progress; later visits
    are served from the committed build.
 
@@ -72,14 +75,21 @@ read get a red placeholder tile instead of breaking the gallery.
 
 ## Admin page
 
-`/_admin/` lists folders and images, uploads files or whole folders (chunked,
-resumable), creates folders, hides folders from public listings (they stay
-reachable by direct URL), moves images and folders to a per-folder trash,
-restores or empties that trash, clears a folder's derived cache, and runs a
-full rescan. **Generate login link** mints a one-time URL that signs in
-another browser; useful on a device that cannot use your
-passkey. Only passkey sessions can mint links from the page;
-`node server.js login-link` on the server always can.
+`/_admin2/` is the admin panel (`/_admin/` is the older one; both work). It
+shows the build queue, and for the current folder: counts and build state,
+a notice when files on disk are not in the gallery yet, subfolders with
+hide toggles, uploads of files or whole folders (chunked, resumable, several
+files in flight), the image list, and the folder's trash. Folders can be
+created, hidden from public listings (they stay reachable by direct URL),
+trashed, restored, emptied, rebuilt from scratch, or rescanned, and the
+whole tree can be rescanned after copying files in.
+
+The Sign-ins card lists every signed-in browser. **Create login link** mints
+a one-time URL that signs in another browser; useful on a device that
+cannot use your passkey. Only passkey sessions can mint links from the
+page; `node server.js login-link` on the server always can. **Sign out all
+other sessions** ends every session but the current one. Sessions do not
+expire on their own.
 
 ## On-disk layout
 
@@ -110,12 +120,13 @@ Environment variables, all optional:
 | `PORT` | `3000` | Listen port |
 | `HOST` | `0.0.0.0` | Listen address |
 | `GALLERIES_ROOT` | `/var/lib/goodgallery/galleries` | Root of the gallery tree |
-| `STATE_DIR` | `/var/lib/goodgallery` | Passkey, sessions, in-progress uploads, placeholder tiles |
+| `STATE_DIR` | `/var/lib/goodgallery` | Passkey, sessions, server-made login links, in-progress uploads, placeholder tiles |
 | `SITE_TITLE` | `Goodgallery` | Shown in the page title and breadcrumb |
 | `BUILD_CONCURRENCY` | CPU count | Parallel vips processes during builds (each runs at nice 10) |
 | `MAX_SPRITE_BYTES` | 4 MiB | Target size of one atlas image |
 | `BYTES_PER_PIXEL` | `0.30` | Estimated AVIF bytes per pixel, used to size atlases |
 | `SPRITE_CELL_W_MAX` | `600` | Widest atlas cell, in pixels |
+| `SPRITE_ENCODE_PARALLEL` | `4` | Atlas images encoded at once while a folder bakes |
 | `AVIF_MAX_DIM` | `16384` | libheif per-axis limit; extreme panoramas are bounded to this width |
 | `CHUNK_SIZE` | 16 MiB | Upload chunk size |
 
@@ -129,3 +140,5 @@ Environment variables, all optional:
 - `lib/auth.js`, `lib/webauthn.js` and `lib/admin_api.js` handle the passkey
   admin; `lib/upload.js` the chunked uploader; `lib/trash.js` the trash.
 - `public/gallery.js` is the client: layout, WebGL grid, focus view.
+- `public/admin2.html`, `admin2.css`, `admin2.js` are the admin panel;
+  `public/admin.html` is the older single-file one.
