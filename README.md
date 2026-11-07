@@ -23,10 +23,11 @@ What makes it different:
 - libvips command-line tools with AVIF and SVG support. On Debian 13 that is
   `apt install libvips-tools`. The server refuses to start if `vips`,
   `vipsthumbnail` or `vipsheader` are missing.
-- HTTPS in front of it (nginx, Caddy, a tunnel). Browsers only offer passkeys
-  on secure origins, so the admin page needs HTTPS or `localhost`. The server
-  itself speaks plain HTTP and sets the `Secure` cookie flag when it sees
-  `X-Forwarded-Proto: https`.
+- Optional: HTTPS in front of it (nginx, Caddy, a tunnel). Browsers only
+  offer passkeys on secure origins, so passkey sign-in needs HTTPS or
+  `localhost`; without it you sign in with links made on the server. The
+  server itself speaks plain HTTP and sets the `Secure` cookie flag when it
+  sees `X-Forwarded-Proto: https`.
 
 ## Install
 
@@ -48,12 +49,20 @@ To run it by hand instead: `node server.js`.
 
 ## First run
 
-1. Open `https://your-host/_admin/` and register a passkey. The first
-   passkey registered becomes the admin; there is exactly one.
-2. Create a folder or upload images from the admin page, or copy a directory
+1. On the server, run `node server.js login-link` (as root or as
+   `goodgallery`, from `/opt/goodgallery`) and open the link it prints within
+   10 minutes. The browser that opens it is signed in for 24 hours. There is
+   no other way in on a fresh install, so nobody can claim the admin by
+   reaching the URL first.
+2. Optional, on HTTPS: open `/_admin2/` and press **Create passkey** in the
+   Sign-ins card. From then on the passkey signs in directly, and only
+   passkey sessions can create login links from the page. Without HTTPS,
+   keep using the server command. Lost the passkey? Delete `passkey.json`
+   in the state dir and enroll again from a server-made link.
+3. Create a folder or upload images from the admin page, or copy a directory
    of images into the galleries root (owned by `goodgallery`) and press
    **Full rescan**.
-3. Open `https://your-host/`. The first visit to a folder builds its
+4. Open `https://your-host/`. The first visit to a folder builds its
    renditions and atlases in the background and shows progress; later visits
    are served from the committed build.
 
@@ -68,7 +77,8 @@ reachable by direct URL), moves images and folders to a per-folder trash,
 restores or empties that trash, clears a folder's derived cache, and runs a
 full rescan. **Generate login link** mints a one-time URL that signs in
 another browser for 24 hours; useful on a device that cannot use your
-passkey. Only passkey sessions can mint links.
+passkey. Only passkey sessions can mint links from the page;
+`node server.js login-link` on the server always can.
 
 ## On-disk layout
 

@@ -34,9 +34,9 @@
   <section class="card" id="signIn" hidden>
     <h1 id="signInTitle">Sign in</h1>
     <p id="signInText">Checking…</p>
+    <pre class="command" id="signInCommand" hidden>node server.js login-link</pre>
     <button type="button" class="primary" id="signInButton" disabled>Please wait…</button>
     <p class="error" id="signInError"></p>
-    <p class="hint">Passkeys need HTTPS (or localhost).</p>
   </section>
 
   <div id="app" hidden>
@@ -101,6 +101,7 @@
       <h2 id="accessTitle">Sign-ins</h2>
       <ul class="rows" id="sessionList"></ul>
       <div class="actions">
+        <button type="button" class="primary" id="createPasskeyButton" hidden title="Needs HTTPS or localhost. After this, the passkey signs in directly and can create login links here.">Create passkey</button>
         <button type="button" id="loginLinkButton" title="A one-time link that signs another browser in for 24 hours. Expires after 10 minutes.">Create login link</button>
         <button type="button" class="danger" id="revokeOthersButton">Sign out all other sessions</button>
         <button type="button" id="signOutButton">Sign out</button>

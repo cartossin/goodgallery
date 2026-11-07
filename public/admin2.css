@@ -134,6 +134,7 @@ details.card[open] > summary { margin-bottom: 10px; }
 
 .error { color: var(--danger); min-height: 1.2em; margin: 8px 0 0; }
 .hint { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+.command { font: 14px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; margin: 12px 0; user-select: all; }
 
 /* ---------- controls ---------- */
 

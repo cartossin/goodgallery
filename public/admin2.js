@@ -753,16 +753,16 @@ async function sha256Hex(bytes) {
 // ======================================================================
 
 async function loadSessions() {
-  let data;
-  try { data = await getJson('/api/admin/sessions'); }
+  let data, status;
+  try { [data, status] = await Promise.all([getJson('/api/admin/sessions'), getJson('/api/admin/status')]); }
   catch (error) {
     if (!(error instanceof SignedOutError)) showNotice('Could not load sign-ins: ' + error.message, true);
     return;
   }
-  renderSessions(data.sessions);
+  renderSessions(data.sessions, status.passkeyExists);
 }
 
-function renderSessions(sessions) {
+function renderSessions(sessions, passkeyExists) {
   const list = byId('sessionList');
   list.replaceChildren();
   const canManage = state.sessionOrigin === 'passkey';
@@ -770,7 +770,19 @@ function renderSessions(sessions) {
   const others = sessions.filter(session => !session.current).length;
   byId('revokeOthersButton').disabled = !canManage || others === 0;
   byId('loginLinkButton').disabled = !canManage;
-  byId('accessHint').textContent = canManage
+  const createButton = byId('createPasskeyButton');
+  createButton.hidden = passkeyExists;
+  createButton.disabled = !window.PublicKeyCredential;
+  byId('accessHint').textContent = accessHintText(canManage, passkeyExists);
+}
+
+function accessHintText(canManage, passkeyExists) {
+  if (!passkeyExists) {
+    return window.PublicKeyCredential
+      ? 'No passkey yet. Create one to sign in without the server command. Only passkey sessions can create login links here; until then, make them on the server with "node server.js login-link".'
+      : 'No passkey yet, and passkeys need HTTPS or localhost. Sign in with "node server.js login-link" on the server; only passkey sessions can create login links here.';
+  }
+  return canManage
     ? 'Sessions last 24 hours from sign-in.'
     : 'This browser signed in with a one-time link, so it cannot create links or sign out other sessions. Use a browser with the passkey for that.';
 }
@@ -856,33 +868,42 @@ async function showSignIn() {
   byId('signIn').hidden = false;
   const title = byId('signInTitle');
   const text = byId('signInText');
+  const command = byId('signInCommand');
   const button = byId('signInButton');
   button.disabled = true;
 
-  if (!window.PublicKeyCredential) {
-    title.textContent = 'Passkeys unavailable';
-    text.textContent = 'Open this page over HTTPS or on localhost.';
+  const status = await fetch('/api/admin/status').then(response => response.json()).catch(() => null);
+  if (!status) { byId('signInError').textContent = 'Cannot reach the server.'; return; }
+  if (!status.passkeyExists) {
+    // A fresh install has no way in except a link made on the server. That
+    // is deliberate: an open "create passkey" button would make the first
+    // visitor the admin.
+    title.textContent = 'No admin yet';
+    text.textContent = 'On the server, run this command and open the link it prints. The browser that opens it is signed in, and can create a passkey from the Sign-ins card if this page is on HTTPS.';
+    command.hidden = false;
     button.hidden = true;
     return;
   }
-  const status = await fetch('/api/admin/status').then(response => response.json()).catch(() => null);
-  if (!status) { byId('signInError').textContent = 'Cannot reach the server.'; return; }
-  if (status.passkeyExists) {
-    title.textContent = 'Sign in';
-    text.textContent = 'Use your passkey to manage this gallery.';
-    button.textContent = 'Sign in with passkey';
-    button.onclick = signInWithPasskey;
-  } else {
-    title.textContent = 'First-time setup';
-    text.textContent = 'Create a passkey to claim admin access. Whoever does this first owns the gallery, so do it now.';
-    button.textContent = 'Create passkey';
-    button.onclick = registerPasskey;
+  if (!window.PublicKeyCredential) {
+    title.textContent = 'Passkeys unavailable here';
+    text.textContent = 'Passkeys need HTTPS or localhost. Open this page there, or make a login link on the server:';
+    command.hidden = false;
+    button.hidden = true;
+    return;
   }
+  title.textContent = 'Sign in';
+  text.textContent = 'Use your passkey to manage this gallery.';
+  command.hidden = true;
+  button.hidden = false;
+  button.textContent = 'Sign in with passkey';
+  button.onclick = signInWithPasskey;
   button.disabled = false;
 }
 
 async function signInWithPasskey() {
-  await passkeyCeremony(async () => {
+  const error = byId('signInError');
+  error.textContent = '';
+  await passkeyCeremony(byId('signInButton'), message => { error.textContent = message; }, async () => {
     const options = await postJson('/api/admin/login/start');
     options.challenge = base64urlToBuffer(options.challenge);
     options.allowCredentials = (options.allowCredentials || [])
@@ -903,7 +924,7 @@ async function signInWithPasskey() {
 }
 
 async function registerPasskey() {
-  await passkeyCeremony(async () => {
+  await passkeyCeremony(byId('createPasskeyButton'), message => showNotice('Create passkey failed: ' + message, true), async () => {
     const options = await postJson('/api/admin/register/start');
     options.challenge = base64urlToBuffer(options.challenge);
     options.user.id = base64urlToBuffer(options.user.id);
@@ -920,16 +941,13 @@ async function registerPasskey() {
   });
 }
 
-async function passkeyCeremony(ceremony) {
-  const button = byId('signInButton');
-  const error = byId('signInError');
+async function passkeyCeremony(button, reportError, ceremony) {
   button.disabled = true;
-  error.textContent = '';
   try {
     await ceremony();
     startAuth();  // the server set the session cookie
   } catch (failure) {
-    error.textContent = failure.message || 'Sign-in failed.';
+    reportError(failure.message || 'Sign-in failed.');
   } finally {
     button.disabled = false;
   }
@@ -966,6 +984,7 @@ function wireControls() {
   });
   byId('restoreAllButton').addEventListener('click', restoreAllFromTrash);
   byId('emptyTrashButton').addEventListener('click', emptyTrash);
+  byId('createPasskeyButton').addEventListener('click', registerPasskey);
   byId('loginLinkButton').addEventListener('click', createLoginLink);
   byId('copyLoginLinkButton').addEventListener('click', copyLoginLink);
   byId('revokeOthersButton').addEventListener('click', revokeOtherSessions);

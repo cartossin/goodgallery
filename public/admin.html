@@ -196,11 +196,9 @@ async function checkAuth() {
   var status = await fetch('/api/admin/status').then(r => r.json()).catch(() => null);
   if (!status) { err.textContent = 'Cannot reach server.'; return; }
   if (!status.passkeyExists) {
-    t.textContent = 'First-time setup';
-    d.textContent = 'Create a passkey to claim admin access. Anyone who beats you to this loses you the gallery, so do this immediately.';
-    b.textContent = 'Create passkey';
-    b.disabled = false;
-    b.onclick = registerPasskey;
+    t.textContent = 'No admin yet';
+    d.textContent = 'On the server, run "node server.js login-link" and open the link it prints. The passkey is then created from /_admin2/.';
+    b.hidden = true;
   } else {
     t.textContent = 'Sign in';
     d.textContent = 'Authenticate with your passkey.';
