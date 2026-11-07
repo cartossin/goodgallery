@@ -21,10 +21,10 @@ What makes it different:
 
 ## Requirements
 
-- Node.js 20 or newer
-- libvips command-line tools with AVIF and SVG support. On Debian 13 that is
-  `apt install libvips-tools`. The server refuses to start if `vips`,
-  `vipsthumbnail` or `vipsheader` are missing.
+- Node.js 18 or newer. The packages in Debian 13 (20.19) and Ubuntu 24.04
+  (18.19) both work.
+- libvips command-line tools with AVIF and SVG support. The server refuses
+  to start if `vips`, `vipsthumbnail` or `vipsheader` are missing.
 - Optional: HTTPS in front of it (nginx, Caddy, a tunnel). Browsers only
   offer passkeys on secure origins, so passkey sign-in needs HTTPS or
   `localhost`; without it you sign in with links made on the server. The
@@ -33,8 +33,10 @@ What makes it different:
 
 ## Install
 
+Debian 13 or Ubuntu 24.04:
+
 ```sh
-apt install -y nodejs libvips-tools
+apt update && apt install -y git nodejs libvips-tools
 useradd -r -s /usr/sbin/nologin -d /var/lib/goodgallery goodgallery
 git clone <this repo> /opt/goodgallery
 mkdir -p /var/lib/goodgallery/galleries
@@ -42,6 +44,22 @@ chown -R goodgallery:goodgallery /var/lib/goodgallery
 install -m 644 /opt/goodgallery/goodgallery.service /etc/systemd/system/
 systemctl enable --now goodgallery
 ```
+
+Rocky Linux or RHEL 9: the default Node stream is 16 and libvips is not in
+EPEL, so the first line becomes
+
+```sh
+dnf module enable -y nodejs:22
+dnf install -y git nodejs epel-release
+dnf install -y https://rpms.remirepo.net/enterprise/remi-release-9.rpm
+dnf install -y vips-tools vips-heif
+```
+
+and the rest is the same. `vips-heif` is the AVIF support; the server
+needs it.
+
+Each of these was run on a fresh container of that distro, followed by the
+first-run steps below.
 
 The unit runs as the `goodgallery` user on port 3000 with galleries under
 `/var/lib/goodgallery/galleries` and state under `/var/lib/goodgallery`.
