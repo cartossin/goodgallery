@@ -2638,6 +2638,7 @@
     if (window.isadmin) { showAdminBar(); return; }
     fetch('/api/admin/probe', { credentials: 'same-origin' })
       .then(function (r) {
+        r.text().catch(function () {});  // drain it: an unread body keeps the request open in the browser
         if (r.ok) { window.isadmin = 1; showAdminBar(); }
       })
       .catch(function () {});

@@ -37,11 +37,13 @@ const byId = id => document.getElementById(id);
 
 class SignedOutError extends Error {}
 
+// The body is read before the status is judged: a response whose body is
+// never read stays open in the browser's network stack.
 async function requestJson(url, options) {
   const response = await fetch(url, Object.assign({ credentials: 'same-origin' }, options));
-  if (response.status === 401) { showSignIn(); throw new SignedOutError('signed out'); }
   let data = null;
   try { data = await response.json(); } catch {}
+  if (response.status === 401) { showSignIn(); throw new SignedOutError('signed out'); }
   if (!response.ok) throw new Error((data && data.error) || ('HTTP ' + response.status));
   return data;
 }
@@ -818,9 +820,9 @@ async function sendChunkWithRetry(uploadId, index, bytes, row) {
         headers,
         body: bytes,
       });
+      const data = await response.json().catch(() => ({}));
       if (response.status === 401) { showSignIn(); throw new SignedOutError('signed out'); }
       if (response.ok) return;
-      const data = await response.json().catch(() => ({}));
       throw new Error(data.error || ('HTTP ' + response.status));
     } catch (error) {
       if (error instanceof SignedOutError) throw error;
@@ -947,8 +949,8 @@ function bufferToBase64url(buffer) {
 
 async function startAuth() {
   const probe = await fetch('/api/admin/probe', { credentials: 'same-origin' }).catch(() => null);
+  const data = probe ? await probe.json().catch(() => ({})) : null;  // read even on 401, see requestJson
   if (probe && probe.ok) {
-    const data = await probe.json().catch(() => ({}));
     state.sessionOrigin = data.origin || 'passkey';
     showApp();
     return;
