@@ -9,23 +9,22 @@
 </head>
 <body>
 
+<!-- Brand, the server-wide build queue with its two actions, and links. -->
 <header class="topbar">
-  <a class="brand" href="/">Goodgallery</a>
-  <span class="brand-sub">Admin</span>
+  <span class="brand-group">
+    <a class="brand" href="/">Goodgallery</a>
+    <span class="brand-sub">Admin</span>
+  </span>
+  <div class="queue" id="serverBar" hidden aria-label="Build queue">
+    <p class="queue-status" id="queueStatus">Checking build queue…</p>
+    <button type="button" class="quiet small" id="fullRescanButton" title="Walk every folder and pick up files added outside the uploader (rsync, mv). Unchanged folders are skipped.">Full rescan</button>
+    <button type="button" class="quiet small" id="clearQueueButton" title="Drop queued image builds. Builds already running finish.">Clear queue</button>
+  </div>
   <nav class="topbar-links" id="topbarLinks" hidden>
-    <a href="#access">Sign-ins</a>
+    <a href="#access" id="signInsLink">Sign-ins</a>
     <a href="/_admin/">Old admin</a>
   </nav>
 </header>
-
-<!-- Server-wide state: the build queue and the two global actions. -->
-<section class="server-bar" id="serverBar" hidden aria-label="Build queue">
-  <p class="queue-status" id="queueStatus">Checking build queue…</p>
-  <div class="actions">
-    <button type="button" id="fullRescanButton" title="Walk every folder and pick up files added outside the uploader (rsync, mv). Unchanged folders are skipped.">Full rescan</button>
-    <button type="button" id="clearQueueButton" title="Drop queued image builds. Builds already running finish.">Clear queue</button>
-  </div>
-</section>
 
 <p class="notice" id="notice" role="status" hidden></p>
 
@@ -47,34 +46,37 @@
       <p class="facts" id="folderFacts"></p>
       <p class="warning" id="folderNotYetBuilt" hidden>
         <span id="folderNotYetBuiltText"></span>
-        <button type="button" id="rescanChangedButton">Rescan this folder</button>
+        <button type="button" class="small" id="rescanChangedButton">Rescan now</button>
       </p>
       <div class="actions">
-        <a class="button" id="openInGallery" href="/" target="_blank" rel="noopener">Open in gallery</a>
-        <button type="button" id="rescanFolderButton" title="Pick up changes to this folder made outside the uploader.">Rescan folder</button>
-        <button type="button" id="rebuildFolderButton" title="Delete this folder's thumbnails and atlases and build them again.">Rebuild from scratch</button>
-        <button type="button" class="danger" id="trashFolderButton">Move folder to trash</button>
+        <a class="button" id="openInGallery" href="/" target="_blank" rel="noopener">Open in gallery <span aria-hidden="true">↗</span></a>
+        <button type="button" class="quiet" id="rescanFolderButton" title="Pick up changes to this folder made outside the uploader.">Rescan</button>
+        <button type="button" class="quiet" id="rebuildFolderButton" title="Delete this folder's thumbnails and atlases and build them again.">Rebuild from scratch</button>
+        <button type="button" class="quiet danger push-right" id="trashFolderButton">Move to trash</button>
       </div>
     </section>
 
     <section class="card" aria-labelledby="subfoldersTitle">
-      <h2 id="subfoldersTitle">Subfolders</h2>
+      <div class="card-head">
+        <h2 id="subfoldersTitle">Subfolders</h2>
+        <button type="button" class="quiet small" id="newFolderButton">+ New subfolder</button>
+      </div>
       <ul class="rows" id="subfolderList"></ul>
-      <form class="inline-form" id="newFolderForm">
-        <label for="newFolderName">New subfolder</label>
-        <input id="newFolderName" type="text" autocomplete="off" placeholder="Name" required>
+      <form class="inline-form" id="newFolderForm" hidden>
+        <input id="newFolderName" type="text" autocomplete="off" placeholder="Folder name" aria-label="New subfolder name" required>
         <button type="submit">Create</button>
+        <button type="button" class="quiet" id="cancelNewFolderButton">Cancel</button>
       </form>
     </section>
 
     <section class="card" aria-labelledby="uploadTitle">
-      <h2 id="uploadTitle">Add images <span class="count" id="uploadCount"></span></h2>
+      <div class="card-head">
+        <h2 id="uploadTitle">Add images <span class="count" id="uploadCount"></span></h2>
+      </div>
       <div class="drop-zone" id="dropZone">
-        <p>Drop images or folders here, or</p>
-        <div class="actions">
-          <button type="button" id="pickFilesButton">Choose files</button>
-          <button type="button" id="pickFolderButton">Choose a folder</button>
-        </div>
+        <span>Drop images or folders anywhere on this page, or</span>
+        <button type="button" class="small" id="pickFilesButton">Choose files</button>
+        <button type="button" class="small" id="pickFolderButton">Choose a folder</button>
         <input id="filePicker" type="file" multiple accept="image/*" hidden>
         <input id="folderPicker" type="file" webkitdirectory hidden>
       </div>
@@ -97,17 +99,17 @@
       </div>
     </details>
 
-    <section class="card" id="access" aria-labelledby="accessTitle">
-      <h2 id="accessTitle">Sign-ins</h2>
+    <details class="card" id="access">
+      <summary><h2 id="accessTitle">Sign-ins <span class="count" id="sessionCount"></span></h2></summary>
       <ul class="rows" id="sessionList"></ul>
       <div class="actions">
         <button type="button" class="primary" id="createPasskeyButton" hidden title="Needs HTTPS or localhost. After this, the passkey signs in directly and can create login links here.">Create passkey</button>
         <button type="button" id="loginLinkButton" title="A one-time link that signs another browser in. Expires after 10 minutes.">Create login link</button>
-        <button type="button" class="danger" id="revokeOthersButton">Sign out all other sessions</button>
-        <button type="button" id="signOutButton">Sign out</button>
+        <button type="button" class="quiet" id="signOutButton">Sign out</button>
+        <button type="button" class="quiet danger push-right" id="revokeOthersButton">Sign out all other sessions</button>
       </div>
       <p class="hint" id="accessHint"></p>
-    </section>
+    </details>
 
   </div>
 </main>
@@ -130,14 +132,14 @@
     <a class="row-name" href="#"></a>
     <span class="row-meta"></span>
     <label class="hidden-toggle"><input type="checkbox"> Hidden</label>
-    <button type="button" class="small danger">Trash</button>
+    <button type="button" class="quiet small">Trash</button>
   </li>
 </template>
 
 <template id="imageRowTemplate">
   <li class="row">
     <a class="row-name" target="_blank" rel="noopener"></a>
-    <button type="button" class="small">Trash</button>
+    <button type="button" class="quiet small">Trash</button>
   </li>
 </template>
 
@@ -146,8 +148,8 @@
     <span class="row-name"></span>
     <span class="row-meta"></span>
     <span class="row-buttons">
-      <button type="button" class="small" data-action="restore">Restore</button>
-      <button type="button" class="small danger" data-action="delete">Delete forever</button>
+      <button type="button" class="quiet small" data-action="restore">Restore</button>
+      <button type="button" class="quiet small danger" data-action="delete">Delete forever</button>
     </span>
   </li>
 </template>

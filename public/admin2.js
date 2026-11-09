@@ -1,9 +1,9 @@
 // Goodgallery admin panel (/_admin2/).
 //
 // Three scopes, kept apart on the page:
-//   server bar  : the build queue and the two tree-wide actions
+//   header      : the build queue and the two tree-wide actions
 //   folder cards: everything about the folder you are looking at
-//   sign-ins    : sessions, login links, sign out
+//   sign-ins    : sessions, login links, sign out (a collapsed card)
 //
 // The session is an HttpOnly cookie; this script never sees the token.
 'use strict';
@@ -13,6 +13,7 @@ const FOLDER_REFRESH_WHILE_BUILDING_MS = 10000;
 const IMAGE_LIST_LIMIT = 200;
 const PARALLEL_UPLOADS = 4;
 const UPLOAD_RETRY_MAX_WAIT_MS = 8000;
+const NOTICE_MS = 6000;
 
 const state = {
   folderSegments: [],      // current folder, e.g. ['trips', '2024']
@@ -78,11 +79,16 @@ async function runAction(description, action) {
   }
 }
 
+// A toast at the bottom of the window. Confirmations fade out on their own;
+// errors stay until clicked or replaced.
+let noticeTimer = null;
 function showNotice(message, isError) {
   const notice = byId('notice');
   notice.textContent = message;
   notice.classList.toggle('is-error', !!isError);
   notice.hidden = false;
+  clearTimeout(noticeTimer);
+  if (!isError) noticeTimer = setTimeout(() => { notice.hidden = true; }, NOTICE_MS);
 }
 
 // ======================================================================
@@ -176,6 +182,7 @@ function showFolder(segments) {
   byId('uploadList').replaceChildren();
   state.uploadBatch = newUploadBatch();
   renderUploadCount();
+  showNewFolderForm(false);
   renderBreadcrumb();
   loadFolder();
 }
@@ -232,8 +239,8 @@ async function loadFolder() {
   state.lastFolderRefreshAt = Date.now();
   renderFolderSummary(info);
   renderSubfolders(info);
-  byId('trashCount').textContent = '(' + numberFormat.format(info.trashCount) + ')';
-  byId('imageCount').textContent = '(' + numberFormat.format(info.imageCount) + ')';
+  byId('trashCount').textContent = numberFormat.format(info.trashCount);
+  byId('imageCount').textContent = numberFormat.format(info.imageCount);
   if (byId('trashSection').open) loadTrash();
 }
 
@@ -287,7 +294,7 @@ function renderNotYetBuilt(notYetBuilt) {
   }
   byId('folderNotYetBuilt').hidden = parts.length === 0;
   byId('folderNotYetBuiltText').textContent = 'Not in the gallery yet: ' + parts.join(', ') +
-    '. This clears when the folder\'s next build finishes. If nothing is building, rescan it.';
+    '. It shows up when the folder\'s next build finishes. If nothing is building, rescan.';
 }
 
 function renderSubfolders(info) {
@@ -375,6 +382,14 @@ async function rebuildCurrentFolder() {
   loadFolder();
 }
 
+// The create form stays out of the way until "+ New subfolder" is clicked.
+function showNewFolderForm(show) {
+  byId('newFolderForm').hidden = !show;
+  byId('newFolderButton').hidden = show;
+  if (show) byId('newFolderName').focus();
+  else byId('newFolderName').value = '';
+}
+
 async function createSubfolder(event) {
   event.preventDefault();
   const input = byId('newFolderName');
@@ -382,7 +397,7 @@ async function createSubfolder(event) {
   if (!name) return;
   await runAction('Create folder', async () => {
     await postFolderAction(folderUrl(state.folderSegments) + '?mkdir=' + encodeURIComponent(name));
-    input.value = '';
+    showNewFolderForm(false);
     return 'Created "' + name + '".';
   });
   loadFolder();
@@ -469,7 +484,7 @@ function renderTrash(items) {
   const list = byId('trashList');
   list.replaceChildren();
   list.classList.add('scroll');
-  byId('trashCount').textContent = '(' + numberFormat.format(items.length) + ')';
+  byId('trashCount').textContent = numberFormat.format(items.length);
   byId('trashActions').hidden = items.length === 0;
   if (!items.length) { list.append(emptyRow('The trash is empty.')); return; }
   for (const item of items) list.append(trashRow(item));
@@ -546,7 +561,7 @@ function renderQueue(queue) {
     parts.push(text);
   }
   if (queue.fullrescanRunning) parts.push('Full rescan is walking the folders');
-  status.textContent = busy ? parts.join(' · ') : 'Idle. Nothing is queued.';
+  status.textContent = busy ? parts.join(' · ') : 'Idle';
   status.className = 'queue-status ' + (busy ? 'busy' : 'idle');
   byId('fullRescanButton').disabled = queue.fullrescanRunning;
   byId('clearQueueButton').disabled = queue.remaining === 0;
@@ -591,18 +606,44 @@ async function pollQueueOnce() {
 // ======================================================================
 
 function setUpUploads() {
-  const dropZone = byId('dropZone');
-  for (const type of ['dragenter', 'dragover']) {
-    dropZone.addEventListener(type, event => { event.preventDefault(); dropZone.classList.add('is-over'); });
-  }
-  for (const type of ['dragleave', 'drop']) {
-    dropZone.addEventListener(type, () => dropZone.classList.remove('is-over'));
-  }
-  dropZone.addEventListener('drop', handleDrop);
+  setUpPageDrop();
   byId('pickFilesButton').addEventListener('click', () => byId('filePicker').click());
   byId('pickFolderButton').addEventListener('click', () => byId('folderPicker').click());
   byId('filePicker').addEventListener('change', handlePickedFiles);
   byId('folderPicker').addEventListener('change', handlePickedFolder);
+}
+
+// Files dropped anywhere on the page upload into the current folder; the
+// drop zone only lights up to say so. dragenter and dragleave fire for every
+// element the pointer crosses, so count them rather than trusting one leave.
+let dragDepth = 0;
+
+function dragHasFiles(event) {
+  return Array.from((event.dataTransfer && event.dataTransfer.types) || []).includes('Files');
+}
+
+function setUpPageDrop() {
+  document.addEventListener('dragenter', event => {
+    if (!dragHasFiles(event)) return;
+    event.preventDefault();
+    dragDepth++;
+    document.body.classList.add('is-dragging');
+  });
+  document.addEventListener('dragover', event => {
+    if (dragHasFiles(event)) event.preventDefault();
+  });
+  document.addEventListener('dragleave', event => {
+    if (!dragHasFiles(event)) return;
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) document.body.classList.remove('is-dragging');
+  });
+  document.addEventListener('drop', event => {
+    dragDepth = 0;
+    document.body.classList.remove('is-dragging');
+    if (!dragHasFiles(event)) return;
+    if (byId('app').hidden) { event.preventDefault(); return; }  // signed out: don't open the file
+    handleDrop(event);
+  });
 }
 
 // Whatever is dropped or picked is listed first and then sent through one
@@ -736,6 +777,7 @@ function renderUploadCount() {
 }
 
 function setUploadRowState(row, stateName, text, fraction) {
+  row.classList.toggle('done', stateName === 'done');
   row.classList.toggle('failed', stateName === 'failed');
   row.classList.toggle('retrying', stateName === 'retrying');
   row.querySelector('.row-meta').textContent = text;
@@ -812,6 +854,10 @@ function renderSessions(sessions, passkeyExists) {
   list.replaceChildren();
   const canManage = state.sessionOrigin === 'passkey';
   for (const session of sessions) list.append(sessionRow(session, canManage));
+  byId('sessionCount').textContent = numberFormat.format(sessions.length);
+  // The card is collapsed by default; a fresh install opens it so the
+  // passkey offer and the server-command hint are seen.
+  if (!passkeyExists) byId('access').open = true;
   const others = sessions.filter(session => !session.current).length;
   byId('revokeOthersButton').disabled = !canManage || others === 0;
   byId('loginLinkButton').disabled = !canManage;
@@ -1020,6 +1066,10 @@ function wireControls() {
   byId('rebuildFolderButton').addEventListener('click', rebuildCurrentFolder);
   byId('trashFolderButton').addEventListener('click', () => trashFolder(state.folderSegments));
   byId('newFolderForm').addEventListener('submit', createSubfolder);
+  byId('newFolderButton').addEventListener('click', () => showNewFolderForm(true));
+  byId('cancelNewFolderButton').addEventListener('click', () => showNewFolderForm(false));
+  byId('notice').addEventListener('click', () => { byId('notice').hidden = true; });
+  byId('signInsLink').addEventListener('click', () => { byId('access').open = true; });
   byId('imagesSection').addEventListener('toggle', () => {
     if (byId('imagesSection').open && !state.imageNames) loadImages();
   });
