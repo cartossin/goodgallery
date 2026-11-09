@@ -75,7 +75,7 @@ To run it by hand instead: `node server.js`.
    is signed out from the admin page, or loses the cookie. There is no other
    way in on a fresh install, so nobody can claim the admin by reaching the
    URL first.
-2. Optional, on HTTPS: open `/_admin2/` and press **Create passkey** in the
+2. Optional, on HTTPS: open `/_admin/` and press **Create passkey** in the
    Sign-ins card. From then on the passkey signs in directly, and only
    passkey sessions can create login links from the page. Without HTTPS,
    keep using the server command. Lost the passkey? Delete `passkey.json`
@@ -93,7 +93,7 @@ read get a red placeholder tile instead of breaking the gallery.
 
 ## Admin page
 
-`/_admin2/` is the admin panel (`/_admin/` is the older one; both work). It
+`/_admin/` is the admin panel. It
 shows the build queue, and for the current folder: counts and build state,
 a notice when files on disk are not in the gallery yet, subfolders with
 hide toggles, uploads of files or whole folders (chunked, resumable, several
@@ -158,5 +158,4 @@ Environment variables, all optional:
 - `lib/auth.js`, `lib/webauthn.js` and `lib/admin_api.js` handle the passkey
   admin; `lib/upload.js` the chunked uploader; `lib/trash.js` the trash.
 - `public/gallery.js` is the client: layout, WebGL grid, focus view.
-- `public/admin2.html`, `admin2.css`, `admin2.js` are the admin panel;
-  `public/admin.html` is the older single-file one.
+- `public/admin.html`, `admin.css`, `admin.js` are the admin panel.

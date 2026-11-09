@@ -1,4 +1,4 @@
-// Goodgallery admin panel (/_admin2/).
+// Goodgallery admin panel (/_admin/).
 //
 // Three scopes, kept apart on the page:
 //   header      : the build queue and Clear queue
@@ -158,7 +158,7 @@ function folderDisplayName(segments) {
 }
 
 // This page's own URL for a folder. Uses location.pathname so the panel works
-// both at /_admin2/ and at /_static/admin2.html.
+// both at /_admin/ and at /_static/admin.html.
 function adminUrlFor(segments) {
   return location.pathname + '?p=' + encodeURIComponent(folderUrl(segments));
 }
