@@ -128,9 +128,9 @@ main { max-width: 860px; margin: 0 auto; padding: 6px 20px 72px; }
 .card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
 .card-head h2 { display: block; }
 
-details.card > summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: 10px; }
-details.card > summary::-webkit-details-marker { display: none; }
-details.card > summary::before {
+details > summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: 10px; }
+details > summary::-webkit-details-marker { display: none; }
+details > summary::before {
   content: "";
   width: 6px;
   height: 6px;
@@ -139,8 +139,14 @@ details.card > summary::before {
   transform: rotate(-45deg);
   transition: transform 0.15s;
 }
-details.card[open] > summary::before { transform: rotate(45deg); }
-details.card[open] > summary { margin-bottom: 10px; }
+details[open] > summary::before { transform: rotate(45deg); }
+details[open] > summary { margin-bottom: 10px; }
+
+/* A troubleshooting step is kept out of the routine actions: collapsed, explained, red. */
+.troubleshooting { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--line); }
+.troubleshooting > summary { font-size: 13px; color: var(--muted); }
+.troubleshooting > summary:hover { color: var(--fg); }
+.troubleshooting p { color: var(--muted); font-size: 13px; margin: 0 0 12px; max-width: 64ch; }
 
 #signIn { max-width: 440px; margin: 12vh auto 0; }
 #signIn h1 { font-size: 22px; margin-bottom: 6px; }

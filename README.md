@@ -14,7 +14,7 @@ What makes it different:
   matches the current zoom and viewport.
 - **Folders are galleries.** Point it at a directory tree. Each folder is a
   gallery; subfolders show as cards. Add images with the built-in uploader
-  or by copying files in and pressing Full rescan.
+  or by copying files in and pressing Rescan all folders.
 - **No passwords.** Admin sign-in is a one-time link made on the server, or
   an optional WebAuthn passkey once you have HTTPS. Nothing to choose badly,
   nothing to leak, no accounts table.
@@ -82,7 +82,7 @@ To run it by hand instead: `node server.js`.
    in the state dir and enroll again from a server-made link.
 3. Create a folder or upload images from the admin page, or copy a directory
    of images into the galleries root (owned by `goodgallery`) and press
-   **Full rescan**.
+   **Rescan all folders**.
 4. Open `http://your-host:3000/` (or whatever your proxy serves). The first
    visit to a folder builds its
    renditions and atlases in the background and shows progress; later visits

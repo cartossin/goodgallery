@@ -17,7 +17,7 @@
   </span>
   <div class="queue" id="serverBar" hidden aria-label="Build queue">
     <p class="queue-status" id="queueStatus">Checking build queue…</p>
-    <button type="button" class="quiet small" id="fullRescanButton" title="Walk every folder and pick up files added outside the uploader (rsync, mv). Unchanged folders are skipped.">Full rescan</button>
+    <button type="button" class="quiet small" id="fullRescanButton" title="Walk every folder and subfolder and pick up files added or removed outside the uploader (rsync, mv). Unchanged folders are skipped.">Rescan all folders</button>
     <button type="button" class="quiet small" id="clearQueueButton" title="Drop queued image builds. Builds already running finish.">Clear queue</button>
   </div>
   <nav class="topbar-links" id="topbarLinks" hidden>
@@ -50,10 +50,14 @@
       </p>
       <div class="actions">
         <a class="button" id="openInGallery" href="/" target="_blank" rel="noopener">Open in gallery <span aria-hidden="true">↗</span></a>
-        <button type="button" class="quiet" id="rescanFolderButton" title="Pick up changes to this folder made outside the uploader.">Rescan</button>
-        <button type="button" class="quiet" id="rebuildFolderButton" title="Delete this folder's thumbnails and atlases and build them again.">Rebuild from scratch</button>
+        <button type="button" class="quiet" id="rescanFolderButton" title="Pick up files added or removed outside the uploader. This folder only; subfolders are not included.">Rescan this folder</button>
         <button type="button" class="quiet danger push-right" id="trashFolderButton">Move to trash</button>
       </div>
+      <details class="troubleshooting" id="troubleshooting">
+        <summary>Troubleshooting</summary>
+        <p>Not needed in normal use. If thumbnails look wrong or stale after a rescan, a rebuild deletes this folder's thumbnails and atlases and builds them all again from the originals. This folder only; subfolders are not touched. Large folders take a long time.</p>
+        <button type="button" class="danger" id="rebuildFolderButton">Rebuild from scratch</button>
+      </details>
     </section>
 
     <section class="card" aria-labelledby="subfoldersTitle">

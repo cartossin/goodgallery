@@ -294,7 +294,7 @@ function renderNotYetBuilt(notYetBuilt) {
   }
   byId('folderNotYetBuilt').hidden = parts.length === 0;
   byId('folderNotYetBuiltText').textContent = 'Not in the gallery yet: ' + parts.join(', ') +
-    '. It shows up when the folder\'s next build finishes. If nothing is building, rescan.';
+    '. It shows up when the folder\'s next build finishes. If nothing is building, rescan this folder.';
 }
 
 function renderSubfolders(info) {
@@ -377,7 +377,7 @@ async function rescanCurrentFolder() {
 
 async function rebuildCurrentFolder() {
   const where = folderUrl(state.folderSegments);
-  if (!confirm('Delete every thumbnail and atlas in ' + where + ' and build them again?\n\nThe folder shows "Building" until it finishes. Large folders take a long time.')) return;
+  if (!confirm('Delete every thumbnail and atlas in ' + where + ' and build them again from the originals?\n\nThis is a troubleshooting step, not routine maintenance. Subfolders are not touched. The folder shows "Building" until it finishes; large folders take a long time.')) return;
   await runAction('Rebuild', () => postFolderAction(where + '?clearcache=1'));
   loadFolder();
 }
@@ -560,7 +560,7 @@ function renderQueue(queue) {
     if (queue.etaSeconds != null) text += ', ' + durationText(queue.etaSeconds) + ' left';
     parts.push(text);
   }
-  if (queue.fullrescanRunning) parts.push('Full rescan is walking the folders');
+  if (queue.fullrescanRunning) parts.push('Rescanning all folders');
   status.textContent = busy ? parts.join(' · ') : 'Idle';
   status.className = 'queue-status ' + (busy ? 'busy' : 'idle');
   byId('fullRescanButton').disabled = queue.fullrescanRunning;
@@ -581,9 +581,9 @@ function refreshFolderIfBuildMoved(remaining) {
 }
 
 async function startFullRescan() {
-  await runAction('Full rescan', async () => {
+  await runAction('Rescan all folders', async () => {
     await postJson('/api/admin/fullrescan');
-    return 'Full rescan started. Progress shows in the bar above.';
+    return 'Rescanning all folders. Progress shows in the bar above.';
   });
   pollQueueOnce();
 }
