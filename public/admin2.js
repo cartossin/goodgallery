@@ -1,7 +1,7 @@
 // Goodgallery admin panel (/_admin2/).
 //
 // Three scopes, kept apart on the page:
-//   header      : the build queue and the two tree-wide actions
+//   header      : the build queue and Clear queue
 //   folder cards: everything about the folder you are looking at
 //   sign-ins    : sessions, login links, sign out (a collapsed card)
 //
@@ -279,7 +279,7 @@ function renderFolderSummary(info) {
   renderNotYetBuilt(info.notYetBuilt);
   byId('openInGallery').href = folderUrl(segments);
   byId('trashFolderButton').hidden = info.isRoot;
-  byId('rescanTreeBlock').hidden = info.isRoot;  // at the root it is "Rescan all folders" in the header
+  byId('rescanTreeButton').textContent = info.isRoot ? 'Rescan all folders' : 'Rescan this folder and all subfolders';
 }
 
 // The gallery serves the last committed build. Say what it does not show yet,
@@ -377,10 +377,11 @@ async function rescanCurrentFolder() {
 }
 
 async function rescanCurrentTree() {
-  const where = folderUrl(state.folderSegments);
+  const isRoot = state.folderSegments.length === 0;
+  const where = isRoot ? 'all folders' : folderUrl(state.folderSegments) + ' and everything below it';
   await runAction('Rescan with subfolders', async () => {
     await postJson('/api/admin/rescanfolder', { folder: folderRelativePath(state.folderSegments), recursive: true });
-    return 'Rescanning ' + where + ' and everything below it. Progress shows in the bar above.';
+    return 'Rescanning ' + where + '. Progress shows in the bar above.';
   });
   pollQueueOnce();
 }
@@ -575,7 +576,6 @@ function renderQueue(queue) {
   }
   status.textContent = busy ? parts.join(' · ') : 'Idle';
   status.className = 'queue-status ' + (busy ? 'busy' : 'idle');
-  byId('fullRescanButton').disabled = queue.rescanning.includes('');
   byId('clearQueueButton').disabled = queue.remaining === 0;
   refreshFolderIfBuildMoved(queue.remaining);
 }
@@ -590,14 +590,6 @@ function refreshFolderIfBuildMoved(remaining) {
   const drained = remaining === 0;
   const due = Date.now() - state.lastFolderRefreshAt > FOLDER_REFRESH_WHILE_BUILDING_MS;
   if (drained || due) loadFolder();
-}
-
-async function startFullRescan() {
-  await runAction('Rescan all folders', async () => {
-    await postJson('/api/admin/fullrescan');
-    return 'Rescanning all folders. Progress shows in the bar above.';
-  });
-  pollQueueOnce();
 }
 
 async function clearQueue() {
@@ -1071,7 +1063,6 @@ function showApp() {
 }
 
 function wireControls() {
-  byId('fullRescanButton').addEventListener('click', startFullRescan);
   byId('clearQueueButton').addEventListener('click', clearQueue);
   byId('rescanFolderButton').addEventListener('click', rescanCurrentFolder);
   byId('rescanChangedButton').addEventListener('click', rescanCurrentFolder);

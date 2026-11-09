@@ -17,7 +17,6 @@
   </span>
   <div class="queue" id="serverBar" hidden aria-label="Build queue">
     <p class="queue-status" id="queueStatus">Checking build queue…</p>
-    <button type="button" class="quiet small" id="fullRescanButton" title="Walk every folder and subfolder and pick up files added or removed outside the uploader (rsync, mv). Unchanged folders are skipped.">Rescan all folders</button>
     <button type="button" class="quiet small" id="clearQueueButton" title="Drop queued image builds. Builds already running finish.">Clear queue</button>
   </div>
   <nav class="topbar-links" id="topbarLinks" hidden>
@@ -56,7 +55,7 @@
       <details class="troubleshooting" id="troubleshooting">
         <summary>Troubleshooting</summary>
         <div id="rescanTreeBlock">
-          <p>Build everything below this folder now instead of when each folder is first viewed. Useful after copying in many folders at once. Folders already up to date are skipped.</p>
+          <p>Walk this folder and everything below it, picking up files added or removed outside the uploader and building folders now instead of when each is first viewed. Useful after copying in many folders at once. Folders already up to date are skipped.</p>
           <button type="button" id="rescanTreeButton">Rescan this folder and all subfolders</button>
         </div>
         <p>Not needed in normal use. If thumbnails look wrong or stale after a rescan, a rebuild deletes this folder's thumbnails and atlases and builds them all again from the originals. This folder only; subfolders are not touched. Large folders take a long time.</p>
