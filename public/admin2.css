@@ -147,6 +147,7 @@ details[open] > summary { margin-bottom: 10px; }
 .troubleshooting > summary { font-size: 13px; color: var(--muted); }
 .troubleshooting > summary:hover { color: var(--fg); }
 .troubleshooting p { color: var(--muted); font-size: 13px; margin: 0 0 12px; max-width: 64ch; }
+.troubleshooting #rescanTreeBlock { margin-bottom: 20px; }
 
 #signIn { max-width: 440px; margin: 12vh auto 0; }
 #signIn h1 { font-size: 22px; margin-bottom: 6px; }

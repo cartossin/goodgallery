@@ -279,6 +279,7 @@ function renderFolderSummary(info) {
   renderNotYetBuilt(info.notYetBuilt);
   byId('openInGallery').href = folderUrl(segments);
   byId('trashFolderButton').hidden = info.isRoot;
+  byId('rescanTreeBlock').hidden = info.isRoot;  // at the root it is "Rescan all folders" in the header
 }
 
 // The gallery serves the last committed build. Say what it does not show yet,
@@ -373,6 +374,15 @@ async function rescanCurrentFolder() {
     return 'Rescanning ' + folderUrl(state.folderSegments) + '. Changes show up here as they build.';
   });
   setTimeout(loadFolder, 1500);
+}
+
+async function rescanCurrentTree() {
+  const where = folderUrl(state.folderSegments);
+  await runAction('Rescan with subfolders', async () => {
+    await postJson('/api/admin/rescanfolder', { folder: folderRelativePath(state.folderSegments), recursive: true });
+    return 'Rescanning ' + where + ' and everything below it. Progress shows in the bar above.';
+  });
+  pollQueueOnce();
 }
 
 async function rebuildCurrentFolder() {
@@ -553,17 +563,19 @@ async function pollQueue() {
 
 function renderQueue(queue) {
   const status = byId('queueStatus');
-  const busy = queue.remaining > 0 || queue.fullrescanRunning;
+  const busy = queue.remaining > 0 || queue.rescanning.length > 0;
   const parts = [];
   if (queue.remaining > 0) {
     let text = 'Building ' + plural(queue.remaining, 'image');
     if (queue.etaSeconds != null) text += ', ' + durationText(queue.etaSeconds) + ' left';
     parts.push(text);
   }
-  if (queue.fullrescanRunning) parts.push('Rescanning all folders');
+  for (const folder of queue.rescanning) {
+    parts.push(folder === '' ? 'Rescanning all folders' : 'Rescanning ' + folder + '/ with subfolders');
+  }
   status.textContent = busy ? parts.join(' · ') : 'Idle';
   status.className = 'queue-status ' + (busy ? 'busy' : 'idle');
-  byId('fullRescanButton').disabled = queue.fullrescanRunning;
+  byId('fullRescanButton').disabled = queue.rescanning.includes('');
   byId('clearQueueButton').disabled = queue.remaining === 0;
   refreshFolderIfBuildMoved(queue.remaining);
 }
@@ -1064,6 +1076,7 @@ function wireControls() {
   byId('rescanFolderButton').addEventListener('click', rescanCurrentFolder);
   byId('rescanChangedButton').addEventListener('click', rescanCurrentFolder);
   byId('rebuildFolderButton').addEventListener('click', rebuildCurrentFolder);
+  byId('rescanTreeButton').addEventListener('click', rescanCurrentTree);
   byId('trashFolderButton').addEventListener('click', () => trashFolder(state.folderSegments));
   byId('newFolderForm').addEventListener('submit', createSubfolder);
   byId('newFolderButton').addEventListener('click', () => showNewFolderForm(true));

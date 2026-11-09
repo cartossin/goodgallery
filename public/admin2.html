@@ -55,6 +55,10 @@
       </div>
       <details class="troubleshooting" id="troubleshooting">
         <summary>Troubleshooting</summary>
+        <div id="rescanTreeBlock">
+          <p>Build everything below this folder now instead of when each folder is first viewed. Useful after copying in many folders at once. Folders already up to date are skipped.</p>
+          <button type="button" id="rescanTreeButton">Rescan this folder and all subfolders</button>
+        </div>
         <p>Not needed in normal use. If thumbnails look wrong or stale after a rescan, a rebuild deletes this folder's thumbnails and atlases and builds them all again from the originals. This folder only; subfolders are not touched. Large folders take a long time.</p>
         <button type="button" class="danger" id="rebuildFolderButton">Rebuild from scratch</button>
       </details>
