@@ -11,6 +11,7 @@ ExecStart=/usr/bin/node /opt/goodgallery/server.js
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
+UMask=0077
 Restart=on-failure
 RestartSec=2
 Environment=NODE_ENV=production
