@@ -21,7 +21,12 @@ const state = {
   sessionOrigin: null,     // 'passkey' | 'link'
   lastQueueRemaining: null,
   lastFolderRefreshAt: 0,
+  uploadBatch: newUploadBatch(),  // counter for the upload list in this folder
 };
+
+function newUploadBatch() {
+  return { total: 0, uploaded: 0, failed: 0 };
+}
 
 const byId = id => document.getElementById(id);
 
@@ -169,6 +174,8 @@ function showFolder(segments) {
   byId('trashSection').open = false;
   byId('imageFilter').value = '';
   byId('uploadList').replaceChildren();
+  state.uploadBatch = newUploadBatch();
+  renderUploadCount();
   renderBreadcrumb();
   loadFolder();
 }
@@ -598,23 +605,30 @@ function setUpUploads() {
   byId('folderPicker').addEventListener('change', handlePickedFolder);
 }
 
+// Whatever is dropped or picked is listed first and then sent through one
+// queue, so a folder tree uploads PARALLEL_UPLOADS files at a time just like a
+// flat pick does, and the counter knows the total from the start.
 async function handleDrop(event) {
   event.preventDefault();
   const targetSegments = state.folderSegments;
   const entries = Array.from(event.dataTransfer.items || [])
     .map(item => item.webkitGetAsEntry && item.webkitGetAsEntry())
     .filter(Boolean);
+  const items = [];
   if (entries.length) {
-    for (const entry of entries) await uploadEntry(entry, targetSegments);
+    byId('uploadCount').textContent = 'Listing files';
+    for (const entry of entries) await collectEntry(entry, targetSegments, items);
   } else {
-    await uploadFiles(Array.from(event.dataTransfer.files || []), targetSegments);
+    for (const file of event.dataTransfer.files || []) items.push({ file, folderSegments: targetSegments });
   }
+  await uploadItems(items);
   finishUploads(targetSegments);
 }
 
 async function handlePickedFiles(event) {
   const targetSegments = state.folderSegments;
-  await uploadFiles(Array.from(event.target.files), targetSegments);
+  const items = Array.from(event.target.files, file => ({ file, folderSegments: targetSegments }));
+  await uploadItems(items);
   event.target.value = '';
   finishUploads(targetSegments);
 }
@@ -629,10 +643,12 @@ async function handlePickedFolder(event) {
     if (!filesByFolder.has(key)) filesByFolder.set(key, { subfolders, files: [] });
     filesByFolder.get(key).files.push(file);
   }
+  const items = [];
   for (const { subfolders, files } of filesByFolder.values()) {
     const folderSegments = await createFolderChain(targetSegments, subfolders);
-    await uploadFiles(files, folderSegments);
+    for (const file of files) items.push({ file, folderSegments });
   }
+  await uploadItems(items);
   event.target.value = '';
   finishUploads(targetSegments);
 }
@@ -648,10 +664,12 @@ async function createFolderChain(parentSegments, subfolders) {
   return segments;
 }
 
-async function uploadEntry(entry, parentSegments) {
+// Walk a dropped file or directory entry, creating folders as it goes, and
+// add every file found to items.
+async function collectEntry(entry, parentSegments, items) {
   if (entry.isFile) {
     const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
-    await uploadFiles([file], parentSegments);
+    items.push({ file, folderSegments: parentSegments });
     return;
   }
   if (!entry.isDirectory) return;
@@ -660,7 +678,7 @@ async function uploadEntry(entry, parentSegments) {
   while (true) {
     const batch = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
     if (!batch.length) break;
-    for (const child of batch) await uploadEntry(child, folderSegments);
+    for (const child of batch) await collectEntry(child, folderSegments, items);
   }
 }
 
@@ -668,29 +686,53 @@ function finishUploads(targetSegments) {
   if (targetSegments === state.folderSegments) loadFolder();
 }
 
-async function uploadFiles(files, folderSegments) {
-  const images = files.filter(file => file.type && file.type.startsWith('image/'));
-  const skipped = files.length - images.length;
+async function uploadItems(items) {
+  const images = items.filter(({ file }) => file.type && file.type.startsWith('image/'));
+  const skipped = items.length - images.length;
   if (skipped) showNotice('Skipped ' + plural(skipped, 'file') + ' that ' + (skipped === 1 ? 'is' : 'are') + ' not an image.', true);
-  const jobs = images.map(file => ({ file, folderSegments, row: uploadRow(file, folderSegments) }));
+  const batch = state.uploadBatch;
+  batch.total += images.length;
+  renderUploadCount();
   let next = 0;
   async function worker() {
-    while (next < jobs.length) {
-      const job = jobs[next++];
-      try { await uploadOneFile(job); }
-      catch (error) { setUploadRowState(job.row, 'failed', 'Failed: ' + error.message); }
+    while (next < images.length) {
+      const item = images[next++];
+      const row = addUploadRow(item.file, item.folderSegments);
+      try {
+        await uploadOneFile(item, row);
+        batch.uploaded++;
+      } catch (error) {
+        setUploadRowState(row, 'failed', 'Failed: ' + error.message);
+        batch.failed++;
+      }
+      renderUploadCount();
     }
   }
   await Promise.all(Array.from({ length: PARALLEL_UPLOADS }, worker));
 }
 
-function uploadRow(file, folderSegments) {
+// A row appears when its file starts, so the list reads top-down in upload
+// order with the files in flight at the bottom. The list follows the newest
+// row unless the user has scrolled up to look at an earlier one.
+function addUploadRow(file, folderSegments) {
+  const list = byId('uploadList');
   const row = byId('uploadRowTemplate').content.firstElementChild.cloneNode(true);
   const relativeFolder = folderSegments.slice(state.folderSegments.length).join('/');
   row.querySelector('.row-name').textContent = (relativeFolder ? relativeFolder + '/' : '') + file.name;
-  row.querySelector('.row-meta').textContent = 'Waiting';
-  byId('uploadList').prepend(row);
+  row.querySelector('.row-meta').textContent = 'Starting';
+  const wasAtBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 8;
+  list.append(row);
+  if (wasAtBottom) list.scrollTop = list.scrollHeight;
   return row;
+}
+
+// "12 of 300" in the card title, plus ", 2 failed" when any did. The
+// numbers belong to the folder shown; opening another folder starts over.
+function renderUploadCount() {
+  const { total, uploaded, failed } = state.uploadBatch;
+  let text = total ? uploaded + ' of ' + total : '';
+  if (failed) text += ', ' + plural(failed, 'file') + ' failed';
+  byId('uploadCount').textContent = text;
 }
 
 function setUploadRowState(row, stateName, text, fraction) {
@@ -700,8 +742,7 @@ function setUploadRowState(row, stateName, text, fraction) {
   if (fraction != null) row.querySelector('progress').value = fraction;
 }
 
-async function uploadOneFile({ file, folderSegments, row }) {
-  setUploadRowState(row, 'active', 'Starting');
+async function uploadOneFile({ file, folderSegments }, row) {
   const upload = await postJson('/api/upload/create', {
     filename: file.name,
     size: file.size,
