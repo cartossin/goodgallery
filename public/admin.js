@@ -968,6 +968,7 @@ async function startAuth() {
   const data = probe ? await probe.json().catch(() => ({})) : null;  // read even on 401, see requestJson
   if (probe && probe.ok) {
     state.sessionOrigin = data.origin || 'passkey';
+    byId('version').textContent = data.version ? 'v' + data.version : '';
     showApp();
     return;
   }

@@ -73,6 +73,7 @@ main { max-width: 860px; margin: 0 auto; padding: 6px 20px 72px; }
 .brand { font-size: 15px; font-weight: 600; }
 .brand:hover { text-decoration: none; }
 .brand-sub { color: var(--muted); font-size: 14px; }
+.brand-version { color: var(--muted); font-size: 12px; }
 
 .queue { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; flex: 1 1 auto; }
 .queue-status { margin: 0 8px 0 0; font-size: 13px; color: var(--muted); }

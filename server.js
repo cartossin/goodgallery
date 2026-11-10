@@ -16,7 +16,7 @@ import http from 'http';
 import os from 'os';
 import { getPasskey, mintCliLoginLink, sessions } from './lib/auth.js';
 import { brokenTilesReady } from './lib/build.js';
-import { GALLERIES_ROOT, HOST, LOGIN_LINK_TTL, PORT, STATE_DIR } from './lib/config.js';
+import { GALLERIES_ROOT, HOST, LOGIN_LINK_TTL, PORT, STATE_DIR, VERSION } from './lib/config.js';
 import { sendText } from './lib/http.js';
 import { rebuildTreeIfNeeded } from './lib/rebuild.js';
 import { handle } from './lib/router.js';
@@ -56,7 +56,7 @@ const server = http.createServer((req, res) => {
     .then(n => console.log('[startup rescan] folders=' + n))
     .catch(e => console.warn('[startup rescan]', e.message));
   server.listen(PORT, HOST, () => {
-    console.log(`Goodgallery listening on http://${HOST}:${PORT}`);
+    console.log(`Goodgallery ${VERSION} listening on http://${HOST}:${PORT}`);
     console.log(`  galleries root: ${GALLERIES_ROOT}`);
     console.log(`  state dir:      ${STATE_DIR}`);
     if (!getPasskey() && sessions.size === 0) {
