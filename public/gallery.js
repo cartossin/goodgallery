@@ -2463,9 +2463,16 @@
   }
 
   // ---------- hash routing ----------
+  // The URL fragment as text. A fragment with a malformed escape ("#%")
+  // cannot be decoded; it is treated as no fragment, so the grid still loads.
+  function hashText() {
+    try { return decodeURIComponent(location.hash.slice(1) || ''); }
+    catch (_) { return ''; }
+  }
+
   function refreshfromhash() {
     showAdminBar();
-    var raw = decodeURIComponent(location.hash.slice(1) || '');
+    var raw = hashText();
     // #fit and #sizeN → ZOOM_LEVELS entries; bare names → focus.
     var levels = availableLevels();
     var matchedIdx = -1;
@@ -2592,7 +2599,7 @@
     // Initial route after the binary imagemap loads (or fails — renderGallery
     // has its own placeholder for spriteMeta=null).
     function runInitialRoute() {
-      var raw = decodeURIComponent(location.hash.slice(1) || '');
+      var raw = hashText();
       if (raw && (raw === 'fit' || raw.match(/^size\d+$/))) {
         refreshfromhash();
       } else if (!raw || raw.charAt(0) === ':') {
