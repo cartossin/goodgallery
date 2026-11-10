@@ -333,12 +333,11 @@
     lastGridLevelIdx = idx;
     levelTargetH = lv.h;
     var newHash = '#' + lv.hash;
-    if (focusedIdx > 0) {
+    if (location.hash !== newHash) {
+      // Each zoom step is a history entry, so Back retraces the steps the
+      // same way it does for focus. The hashchange handler renders it.
       location.hash = newHash;
       return;
-    }
-    if (location.hash !== newHash) {
-      try { history.replaceState(null, '', newHash); } catch (_) {}
     }
     scheduleRender();
     renderZoomControl();
