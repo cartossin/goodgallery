@@ -148,6 +148,10 @@ details[open] > summary { margin-bottom: 10px; }
 .troubleshooting > summary:hover { color: var(--fg); }
 .troubleshooting p { color: var(--muted); font-size: 13px; margin: 0 0 12px; max-width: 64ch; }
 .troubleshooting #rescanTreeBlock { margin-bottom: 20px; }
+/* The recursive rebuild sits one more disclosure down, and is red before it is opened. */
+.nuclear { margin-top: 20px; }
+.nuclear > summary { font-size: 13px; font-weight: 600; letter-spacing: 0.04em; color: var(--danger); }
+.nuclear p { margin-top: 12px; }
 
 #signIn { max-width: 440px; margin: 12vh auto 0; }
 #signIn h1 { font-size: 22px; margin-bottom: 6px; }

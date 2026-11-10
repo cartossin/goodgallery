@@ -282,6 +282,7 @@ function renderFolderSummary(info) {
   byId('openInGallery').href = folderUrl(segments);
   byId('trashFolderButton').hidden = info.isRoot;
   byId('rescanTreeButton').textContent = info.isRoot ? 'Rescan all folders' : 'Rescan this folder and all subfolders';
+  byId('rebuildTreeButton').textContent = info.isRoot ? 'Rebuild every folder from scratch' : 'Rebuild this folder and all subfolders from scratch';
 }
 
 // The gallery serves the last committed build. Say what it does not show yet,
@@ -386,6 +387,18 @@ async function rescanCurrentTree() {
     return 'Rescanning ' + where + '. Progress shows in the bar above.';
   });
   pollQueueOnce();
+}
+
+async function rebuildCurrentTree() {
+  const isRoot = state.folderSegments.length === 0;
+  const where = isRoot ? 'every folder' : folderUrl(state.folderSegments) + ' and everything below it';
+  if (!confirm('Delete every thumbnail and atlas in ' + where + ' and build them all again from the originals?\n\nThis is the recursive rebuild. Folders are rebuilt one at a time and each shows "Building" until it finishes. On a large tree this takes hours.')) return;
+  await runAction('Rebuild with subfolders', async () => {
+    await postJson('/api/admin/rebuildtree', { folder: folderRelativePath(state.folderSegments) });
+    return 'Rebuilding ' + where + ' from scratch. Progress shows in the bar above.';
+  });
+  pollQueueOnce();
+  loadFolder();
 }
 
 async function rebuildCurrentFolder() {
@@ -566,7 +579,7 @@ async function pollQueue() {
 
 function renderQueue(queue) {
   const status = byId('queueStatus');
-  const busy = queue.remaining > 0 || queue.rescanning.length > 0;
+  const busy = queue.remaining > 0 || queue.rescanning.length > 0 || queue.rebuilding.length > 0;
   const parts = [];
   if (queue.remaining > 0) {
     let text = 'Building ' + plural(queue.remaining, 'image');
@@ -575,6 +588,9 @@ function renderQueue(queue) {
   }
   for (const folder of queue.rescanning) {
     parts.push(folder === '' ? 'Rescanning all folders' : 'Rescanning ' + folder + '/ with subfolders');
+  }
+  for (const folder of queue.rebuilding) {
+    parts.push(folder === '' ? 'Rebuilding every folder from scratch' : 'Rebuilding ' + folder + '/ with subfolders from scratch');
   }
   status.textContent = busy ? parts.join(' · ') : 'Idle';
   status.className = 'queue-status ' + (busy ? 'busy' : 'idle');
@@ -1070,6 +1086,7 @@ function wireControls() {
   byId('rescanChangedButton').addEventListener('click', rescanCurrentFolder);
   byId('rebuildFolderButton').addEventListener('click', rebuildCurrentFolder);
   byId('rescanTreeButton').addEventListener('click', rescanCurrentTree);
+  byId('rebuildTreeButton').addEventListener('click', rebuildCurrentTree);
   byId('trashFolderButton').addEventListener('click', () => trashFolder(state.folderSegments));
   byId('newFolderForm').addEventListener('submit', createSubfolder);
   byId('newFolderButton').addEventListener('click', () => showNewFolderForm(true));

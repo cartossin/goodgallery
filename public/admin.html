@@ -59,6 +59,11 @@
         </div>
         <p>Not needed in normal use. If thumbnails look wrong or stale after a rescan, a rebuild deletes this folder's thumbnails and atlases and builds them all again from the originals. This folder only; subfolders are not touched. Large folders take a long time.</p>
         <button type="button" class="danger" id="rebuildFolderButton">Rebuild from scratch</button>
+        <details class="nuclear" id="nuclear">
+          <summary>NUCLEAR OPTION</summary>
+          <p>Deletes the thumbnails and atlases of this folder and of every folder below it, then builds all of them again from the originals. Originals, trash and hidden settings are not touched. Folders are done one at a time; each shows "Building" from the moment its turn comes until it finishes. On a large tree this takes hours, and there is almost never a reason to do it.</p>
+          <button type="button" class="danger" id="rebuildTreeButton">Rebuild this folder and all subfolders from scratch</button>
+        </details>
       </details>
     </section>
 
