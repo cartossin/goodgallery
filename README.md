@@ -159,3 +159,10 @@ Environment variables, all optional:
   admin; `lib/upload.js` the chunked uploader; `lib/trash.js` the trash.
 - `public/gallery.js` is the client: layout, WebGL grid, focus view.
 - `public/admin.html`, `admin.css`, `admin.js` are the admin panel.
+
+## How it was written
+
+Designed and directed by Cory Salvesen, who wrote the original PHP
+Goodgallery. Most of the code in this rewrite was written with Claude
+(Anthropic) as a coding collaborator, which is why the commits carry a
+co-author line.
