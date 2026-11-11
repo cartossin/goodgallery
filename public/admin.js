@@ -965,8 +965,8 @@ function bufferToBase64url(buffer) {
 
 async function startAuth() {
   const probe = await fetch('/api/admin/probe', { credentials: 'same-origin' }).catch(() => null);
-  const data = probe ? await probe.json().catch(() => ({})) : null;  // read even on 401, see requestJson
-  if (probe && probe.ok) {
+  const data = probe ? await probe.json().catch(() => ({})) : null;
+  if (data && data.admin) {
     state.sessionOrigin = data.origin || 'passkey';
     byId('version').textContent = data.version ? 'v' + data.version : '';
     showApp();
