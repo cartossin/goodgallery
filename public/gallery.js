@@ -772,6 +772,9 @@
   // AbortController so a scroll that moves past the target cancels the
   // in-flight download AND discards still-queued requests for it.
   var PER_IMAGE_MAX_INFLIGHT = 12;
+  // Per-photo tiles are cached forever by URL. The server changes tileVersion
+  // when a photo's name may mean different pixels, which makes these new URLs.
+  var tileQuery = window.tileVersion ? '?v=' + window.tileVersion : '';
   var perImageQueue = [];               // jobs waiting for an in-flight slot
   var perImageInFlight = new Set();     // jobs fetching/decoding right now
   var perImagePumpScheduled = false;
@@ -878,7 +881,7 @@
     }
     job = {
       key: key, wantBitmap: wantBitmap, priority: priority, ctrl: null, resolve: null, promise: null,
-      url: folderURL + GG_DIR + '/' + encodeURIComponent(name) + '.h' + tierH + '.avif',
+      url: folderURL + GG_DIR + '/' + encodeURIComponent(name) + '.h' + tierH + '.avif' + tileQuery,
     };
     job.promise = new Promise(function (res) { job.resolve = res; });
     if (typeof AbortController !== 'undefined') job.ctrl = new AbortController();
