@@ -21,6 +21,9 @@ What makes it different:
 
 ## Requirements
 
+- Linux. That is where it is developed and tested. On Windows or macOS, run
+  it in a Linux VM, a container, or WSL 2 with the galleries on the Linux
+  filesystem. Running it natively on Windows is not supported yet.
 - Node.js 18 or newer. The packages in Debian 13 (20.19) and Ubuntu 24.04
   (18.19) both work.
 - libvips command-line tools with AVIF and SVG support. The server refuses
