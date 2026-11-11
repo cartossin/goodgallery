@@ -38,7 +38,7 @@ Debian 13 or Ubuntu 24.04:
 ```sh
 apt update && apt install -y git nodejs libvips-tools
 useradd -r -s /usr/sbin/nologin -d /var/lib/goodgallery goodgallery
-git clone <this repo> /opt/goodgallery
+git clone https://github.com/cartossin/goodgallery.git /opt/goodgallery
 mkdir -p /var/lib/goodgallery/galleries
 chown -R goodgallery:goodgallery /var/lib/goodgallery
 install -m 644 /opt/goodgallery/goodgallery.service /etc/systemd/system/
