@@ -9,5 +9,7 @@
     "dev": "node --watch server.js"
   },
   "license": "MIT",
+  "author": "Cory Salvesen",
+  "repository": { "type": "git", "url": "https://github.com/cartossin/goodgallery.git" },
   "dependencies": {}
 }
