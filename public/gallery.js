@@ -263,7 +263,7 @@
       }
       natRowW += natW; count++;
     }
-    if (count > 0) totalH += H + rowGap(H);
+    if (count > 0) totalH += H * lastRowScale(W - rowGap(H) * (count - 1), natRowW) + rowGap(H);
     return totalH;
   }
 
@@ -441,9 +441,16 @@
     return rows;
   }
 
+  // The last row keeps its natural size (stretching a half-empty row would
+  // blow it up), except that it shrinks to fit when its photos are wider than
+  // the window: one wide photo at the largest zoom on a phone.
+  function lastRowScale(contentW, natRowW) {
+    return Math.min(1, contentW / Math.max(1, natRowW));
+  }
+
   function finalizeRow(items, natRowW, H, W, isLast) {
     var contentW = W - rowGap(H) * Math.max(0, items.length - 1);
-    var rowScale = isLast ? 1 : Math.min(1.5, contentW / Math.max(1, natRowW));
+    var rowScale = isLast ? lastRowScale(contentW, natRowW) : Math.min(1.5, contentW / Math.max(1, natRowW));
     var h = H * rowScale;
     // Float widths: rounding each tile to an integer drifts the row total down
     // by ~Math.round-error × tile-count, which at #fit on 100k images
@@ -499,6 +506,10 @@
     // for the navigation checks.
     viewer: function () {
       return { focusedIdx: focusedIdx, commandedIdx: commandedIdx, chasing: focusChaseRaf !== null };
+    },
+    // Grid layout: the tile rects in layout coordinates.
+    tiles: function () {
+      return lastTileRects.map(function (t) { return { x: t.x, y: t.y, w: t.w, h: t.h, name: t.name }; });
     },
     // Per-image grid tiles with their ideal-tier texture ready, split into
     // on-screen and whole-buffer counts. Lets a harness time "visible done".
