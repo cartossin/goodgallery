@@ -568,8 +568,7 @@
     layout: function () {
       var thumbsEl = $('thumbs');
       var top = thumbsEl ? viewTop(thumbsEl) : 0;
-      var i = firstTileIndexAtOrBelow(top);
-      var t = lastTileRects[i];
+      var t = tileAtTop(top);
       return { totalLayoutH: totalLayoutH, spacerH: spacerEl ? parseFloat(spacerEl.style.height) : 0,
         scrollRatio: scrollRatio, scaled: scrollScaled, viewTop: top, topTile: t ? t.name : null };
     },
@@ -1598,17 +1597,19 @@
     if (!thumbsEl || !lastTileRects.length) { cachedAnchorName = null; persistAnchor(); return; }
     var scrollY = viewTop(thumbsEl);
     if (scrollY <= 0) { cachedAnchorName = null; persistAnchor(); return; }
-    // Row-major tile order → first tile whose y-range spans scrollY is the
-    // leftmost image of the topmost visible row.
-    for (var i = 0; i < lastTileRects.length; i++) {
-      var t = lastTileRects[i];
-      if (t.y <= scrollY && scrollY < t.y + t.h) { cachedAnchorName = t.name; persistAnchor(); return; }
-    }
-    // Past the last row → use the last row's leftmost tile.
-    for (var j = lastTileRects.length - 1; j >= 0; j--) {
-      if (lastTileRects[j].x === 0) { cachedAnchorName = lastTileRects[j].name; persistAnchor(); return; }
-    }
-    cachedAnchorName = null; persistAnchor();
+    var t = tileAtTop(scrollY);
+    cachedAnchorName = t ? t.name : null;
+    persistAnchor();
+  }
+
+  // The leftmost tile of the topmost row that is at least partly below
+  // layout y `top`: the row spanning `top`, or the next row when `top` falls
+  // in the gap between two rows. Past the last row, the last row.
+  function tileAtTop(top) {
+    if (!lastTileRects.length) return null;
+    var i = Math.min(firstTileIndexAtOrBelow(top), lastTileRects.length - 1);
+    while (i > 0 && lastTileRects[i - 1].y === lastTileRects[i].y) i--;
+    return lastTileRects[i];
   }
   function persistAnchor() {
     try {
