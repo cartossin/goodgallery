@@ -201,7 +201,9 @@ the originals:
 built from the photos. Deleting all of it at once is safe: the next visit
 rebuilds the folder. Deleting only part of it is repaired too: a missing
 `atlas_` directory on the next visit, missing renditions at the next rescan
-or restart. To rebuild a folder completely, delete all of it but `trash/`
+or restart. One caution: `_sources.json` is how a photo replaced by an older
+file of the same name is noticed, so if it is lost, rebuild the folder from
+scratch after such a replacement. To rebuild a folder completely, delete all of it but `trash/`
 and `hidden`, or use **Rebuild from scratch** on the admin page.
 
 A manifest is only written after every file it references exists, so an
