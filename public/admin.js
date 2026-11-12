@@ -920,10 +920,11 @@ function sessionRow(session, canManage) {
 }
 
 async function revokeOtherSessions() {
-  if (!confirm('Sign out every other browser? Only this one stays signed in.')) return;
+  if (!confirm('Sign out every other browser? Only this one stays signed in, and login links not used yet stop working.')) return;
   await runAction('Sign out others', async () => {
     const result = await postJson('/api/admin/sessions/revoke-others');
-    return 'Signed out ' + plural(result.revoked, 'other session') + '.';
+    const links = result.cancelledLinks ? ' and cancelled ' + plural(result.cancelledLinks, 'unused login link') : '';
+    return 'Signed out ' + plural(result.revoked, 'other session') + links + '.';
   });
   loadSessions();
 }
