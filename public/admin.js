@@ -343,7 +343,9 @@ function renderFolderSummary(info) {
     plural(info.imageCount, 'image') + ' · ' + plural(info.subfolders.length, 'subfolder') + ' · ',
     buildSpan,
   );
-  if (info.build.lastError) facts.append(': ' + info.build.lastError);
+  // The reason belongs to "Built, with problems" and "Build failed"; while
+  // the folder is building, "Building, N images left" says what is going on.
+  if (info.build.lastError && build.className === 'status-error') facts.append(': ' + info.build.lastError);
   if (info.hidden) {
     const badge = document.createElement('span');
     badge.className = 'badge';
@@ -801,6 +803,10 @@ async function clearQueue() {
     return 'Dropped ' + plural(result.dropped, 'queued build') + '.';
   });
   pollQueueOnce();
+  // Builds already running still count in the queue, so it may not look
+  // drained, and the timed refresh can be seconds away: read the folder now,
+  // so the card stops counting the dropped builds.
+  loadFolder();
 }
 
 async function pollQueueOnce() {
