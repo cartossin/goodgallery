@@ -175,8 +175,12 @@
   var buildPoll = {
     timer: null,                   // the next poll, when one is scheduled
     inFlight: false,               // a request is waiting for its answer
-    finished: false,               // a final answer came (failed); nothing more to ask
+    finished: false,               // a final answer came (failed, gone, unreachable); nothing more to ask
+    failures: 0,                   // requests in a row that got no answer
   };
+  // A request that gets no answer (network down, server restarting, an HTTP
+  // error) is asked again after these delays; then the page says so and stops.
+  var BUILD_STATUS_RETRY_DELAYS_MS = [2000, 4000, 8000, 16000];
 
   function formatEta(s) {
     if (s < 60) return s + 's';
@@ -212,18 +216,42 @@
     buildPoll.timer = null;
     buildPoll.inFlight = true;
     fetch(folderURL + '?build-status', { credentials: 'same-origin' })
-      .then(function (r) { return r.json(); })
+      .then(readBuildStatus)
       .then(function (status) {
         buildPoll.inFlight = false;
+        buildPoll.failures = 0;
         onBuildStatus(status);
       }, function () {
         buildPoll.inFlight = false;
+        onBuildStatusUnanswered();
       });
   }
 
-  // status.state is this folder's own: 'building', 'failed' or 'built'.
+  // The server answers 404 when the folder itself is gone (deleted, or moved
+  // to the trash with its parent).
+  function readBuildStatus(response) {
+    if (response.status === 404) return { state: 'gone' };
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    return response.json();
+  }
+
+  function onBuildStatusUnanswered() {
+    if (buildPoll.failures >= BUILD_STATUS_RETRY_DELAYS_MS.length) {
+      buildPoll.finished = true;
+      setBuildMessage('The server cannot be reached. Reload the page to try again.');
+      return;
+    }
+    scheduleBuildStatusPoll(BUILD_STATUS_RETRY_DELAYS_MS[buildPoll.failures]);
+    buildPoll.failures++;
+  }
+
+  // status.state is this folder's own: 'building', 'failed' or 'built', or
+  // 'gone' when the folder no longer exists.
   function onBuildStatus(status) {
-    if (status.state === 'failed') {
+    if (status.state === 'gone') {
+      buildPoll.finished = true;
+      setBuildMessage('This folder no longer exists.');
+    } else if (status.state === 'failed') {
       // Stop waiting. A page that shows an earlier build keeps showing it.
       buildPoll.finished = true;
       setBuildMessage(waitingForFirstBuild ? 'This folder could not be built.' + (status.error ? ' ' + status.error : '') : '');
