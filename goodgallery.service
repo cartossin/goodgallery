@@ -20,6 +20,9 @@ RestartSec=2
 # makes the file optional: without it the defaults apply (port 3000, state
 # in /var/lib/goodgallery, galleries in /var/lib/goodgallery/galleries).
 EnvironmentFile=-/etc/goodgallery.env
+# File and folder names are UTF-8. The server runs its vips tools under C.UTF-8
+# itself; this keeps every other child process and log line consistent.
+Environment=LANG=C.UTF-8
 
 [Install]
 WantedBy=multi-user.target
