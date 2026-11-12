@@ -23,6 +23,7 @@ const state = {
   canCreatePasskey: false, // only a session from a server-made link, while no passkey exists
   lastQueueRemaining: null,
   lastFolderRefreshAt: 0,
+  folderLoadFailed: false, // the folder on screen could not be read; retried when the server answers
   uploadBatch: newUploadBatch(),  // counter for the upload list in this folder
 };
 
@@ -38,6 +39,15 @@ const byId = id => document.getElementById(id);
 
 class SignedOutError extends Error {}
 
+// A refusal from the server, with its HTTP status. A request that got no
+// answer at all (server down, network gone) throws fetch's TypeError instead.
+class HttpError extends Error {
+  constructor(message, status) {
+    super(message);
+    this.status = status;
+  }
+}
+
 // The body is read before the status is judged: a response whose body is
 // never read stays open in the browser's network stack.
 async function requestJson(url, options) {
@@ -45,7 +55,7 @@ async function requestJson(url, options) {
   let data = null;
   try { data = await response.json(); } catch {}
   if (response.status === 401) { showSignIn(); throw new SignedOutError('signed out'); }
-  if (!response.ok) throw new Error((data && data.error) || ('HTTP ' + response.status));
+  if (!response.ok) throw new HttpError((data && data.error) || ('HTTP ' + response.status), response.status);
   return data;
 }
 
@@ -237,16 +247,25 @@ async function loadFolder() {
     info = await getJson('/api/admin/folder?path=' + encodeURIComponent(folderRelativePath(segments)));
   } catch (error) {
     if (error instanceof SignedOutError) return;
-    if (segments.length) {
+    if (segments !== state.folderSegments) return;  // navigated away meanwhile
+    // Only a folder that is really gone sends the panel to the top level.
+    if (error.status === 404 && segments.length) {
       showNotice('Could not open ' + folderPathText(segments) + ': ' + error.message + '. Showing the top level instead.', true);
       history.replaceState(null, '', adminUrlFor([]));
       showFolder([]);
-    } else {
-      showNotice('Could not load folders: ' + error.message, true);
+      return;
     }
+    // Anything else (the server restarting, the network) leaves the panel on
+    // this folder, with nothing on screen from the previous one. The queue
+    // poll loads it again once the server answers.
+    state.folderLoadFailed = true;
+    renderFolderUnavailable(segments);
+    const reason = error instanceof HttpError ? error.message : 'the server did not answer';
+    showNotice('Could not load ' + folderPathText(segments) + ': ' + reason + '.', true);
     return;
   }
   if (segments !== state.folderSegments) return;  // navigated away meanwhile
+  state.folderLoadFailed = false;
   state.folderInfo = info;
   state.lastFolderRefreshAt = Date.now();
   renderFolderSummary(info);
@@ -254,6 +273,18 @@ async function loadFolder() {
   byId('trashCount').textContent = numberFormat.format(info.trashCount);
   byId('imageCount').textContent = numberFormat.format(info.imageCount);
   if (byId('trashSection').open) loadTrash();
+}
+
+// The folder card when the folder could not be read: its own name and
+// buttons, no facts or rows that belong to another folder.
+function renderFolderUnavailable(segments) {
+  state.folderInfo = null;
+  byId('folderTitle').textContent = folderDisplayName(segments);
+  document.title = folderDisplayName(segments) + ' · Goodgallery Admin';
+  byId('folderFacts').textContent = 'Could not load this folder.';
+  byId('folderNotYetBuilt').hidden = true;
+  renderFolderButtons(segments);
+  byId('subfolderList').replaceChildren(emptyRow('Not loaded.'));
 }
 
 // One line for a folder's build state, with a CSS class for its colour.
@@ -289,10 +320,16 @@ function renderFolderSummary(info) {
   }
 
   renderNotYetBuilt(info.notYetBuilt);
+  renderFolderButtons(segments);
+}
+
+// The folder card's links and the labels that differ for the top level.
+function renderFolderButtons(segments) {
+  const isRoot = segments.length === 0;
   byId('openInGallery').href = folderUrl(segments);
-  byId('trashFolderButton').hidden = info.isRoot;
-  byId('rescanTreeButton').textContent = info.isRoot ? 'Rescan all folders' : 'Rescan this folder and all subfolders';
-  byId('rebuildTreeButton').textContent = info.isRoot ? 'Rebuild every folder from scratch' : 'Rebuild this folder and all subfolders from scratch';
+  byId('trashFolderButton').hidden = isRoot;
+  byId('rescanTreeButton').textContent = isRoot ? 'Rescan all folders' : 'Rescan this folder and all subfolders';
+  byId('rebuildTreeButton').textContent = isRoot ? 'Rebuild every folder from scratch' : 'Rebuild this folder and all subfolders from scratch';
 }
 
 // The gallery serves the last committed build. Say what it does not show yet,
@@ -624,7 +661,8 @@ function renderQueue(queue) {
   status.textContent = busy ? parts.join(' · ') : 'Idle';
   status.className = 'queue-status ' + (busy ? 'busy' : 'idle');
   byId('clearQueueButton').disabled = queue.remaining === 0;
-  refreshFolderIfBuildMoved(queue.remaining);
+  if (state.folderLoadFailed) loadFolder();
+  else refreshFolderIfBuildMoved(queue.remaining);
 }
 
 // Keep the folder's build labels current without re-reading it on every poll:
