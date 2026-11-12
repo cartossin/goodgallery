@@ -64,12 +64,7 @@ async function startServer() {
     .then(n => console.log('[startup rescan] folders=' + n))
     .catch(e => console.warn('[startup rescan]', e.message));
   server.listen(config.PORT, config.HOST, () => {
-    console.log(`Goodgallery ${config.VERSION} listening on http://${config.HOST}:${config.PORT}`);
-    console.log(`  galleries root: ${config.GALLERIES_ROOT}`);
-    console.log(`  state dir:      ${config.STATE_DIR}`);
-    if (!getPasskey() && sessions.size === 0) {
-      console.log('  no admin yet: run `node server.js login-link` and open the link it prints');
-    }
+    printStartupLines(config, !getPasskey() && sessions.size === 0);
   });
 }
 
@@ -79,4 +74,17 @@ function listenErrorText(error) {
   if (error.code === 'EADDRNOTAVAIL') return 'this machine has no such address. Set HOST to one of its addresses, or 0.0.0.0 for all.';
   if (error.code === 'ENOTFOUND' || error.code === 'EAI_AGAIN') return 'HOST is not an address or a name that resolves. Set HOST to an IP address, or 0.0.0.0 for all.';
   return error.message;
+}
+
+function printStartupLines(config, noAdminYet) {
+  const addresses = config.addressesToOpen();
+  console.log(`Goodgallery ${config.VERSION} listening on ${config.HOST} port ${config.PORT}`);
+  if (addresses.fromElsewhere) console.log(`  open:           ${addresses.fromElsewhere} (or the address your proxy serves)`);
+  if (addresses.onThisMachine) console.log(`  on this machine: ${addresses.onThisMachine}`);
+  console.log(`  galleries root: ${config.GALLERIES_ROOT}`);
+  console.log(`  state dir:      ${config.STATE_DIR}`);
+  if (noAdminYet) {
+    console.log(`  no admin yet: on this machine run \`node ${process.argv[1]} login-link\` (as root or as this server's user) and open the link it prints.`);
+    console.log('  Passkeys work only over HTTPS or on localhost; at any other address, an IP address included, sign in with such links.');
+  }
 }

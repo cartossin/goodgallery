@@ -1086,8 +1086,16 @@ function renderSessions(sessions, passkeyExists) {
   byId('loginLinkButton').disabled = !canManage;
   const createButton = byId('createPasskeyButton');
   createButton.hidden = passkeyExists || !state.canCreatePasskey;
-  createButton.disabled = !window.PublicKeyCredential;
+  createButton.disabled = !passkeysWorkHere();
   byId('accessHint').textContent = accessHintText(canManage, passkeyExists);
+}
+
+// Browsers offer WebAuthn on HTTPS and on localhost, but refuse a passkey for
+// an IP address ("This is an invalid domain"), http://127.0.0.1 included.
+function passkeysWorkHere() {
+  const host = location.hostname;
+  const isIpAddress = /^\d+\.\d+\.\d+\.\d+$/.test(host) || host.startsWith('[');
+  return Boolean(window.PublicKeyCredential) && !isIpAddress;
 }
 
 function accessHintText(canManage, passkeyExists) {
@@ -1095,9 +1103,9 @@ function accessHintText(canManage, passkeyExists) {
     return 'No passkey yet. Only a browser signed in with a link made on the server ("node server.js login-link") can create it.';
   }
   if (!passkeyExists) {
-    return window.PublicKeyCredential
+    return passkeysWorkHere()
       ? 'No passkey yet. Create one to sign in without the server command. Only passkey sessions can create login links here; until then, make them on the server with "node server.js login-link".'
-      : 'No passkey yet, and passkeys need HTTPS or localhost. Sign in with "node server.js login-link" on the server; only passkey sessions can create login links here.';
+      : 'No passkey yet, and passkeys need HTTPS or localhost (not an IP address). Sign in with "node server.js login-link" on the server; only passkey sessions can create login links here.';
   }
   return canManage
     ? 'A session lasts until it signs out, is signed out here, or its browser loses the cookie.'
@@ -1209,9 +1217,9 @@ async function showSignIn() {
     button.hidden = true;
     return;
   }
-  if (!window.PublicKeyCredential) {
+  if (!passkeysWorkHere()) {
     title.textContent = 'Passkeys unavailable here';
-    text.textContent = 'Passkeys need HTTPS or localhost. Open this page there, or make a login link on the server:';
+    text.textContent = 'Passkeys need HTTPS or localhost (not an IP address). Open this page there, or make a login link on the server:';
     command.hidden = false;
     button.hidden = true;
     return;
