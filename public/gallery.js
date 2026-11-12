@@ -180,12 +180,16 @@
     fetch(folderURL + '?build-status')
       .then(function (r) { return r.json(); })
       .then(function (p) {
-        if (p.remaining > 0) {
+        // p.state is this folder's own: 'building', 'failed' or 'built'.
+        if (p.state === 'failed') {
+          // Stop waiting. A page that shows an earlier build keeps showing it.
+          setBuildMessage(reloadOnComplete ? 'This folder could not be built.' + (p.error ? ' ' + p.error : '') : '');
+        } else if (p.state === 'building' && p.remaining > 0) {
           var eta = p.etaSeconds != null ? ' — ETA ' + formatEta(p.etaSeconds) : '';
           setBuildMessage('Building ' + p.remaining + ' image' + (p.remaining === 1 ? '' : 's') + eta);
           statusTimer = setTimeout(function () { pollBuildStatus({ reloadOnComplete: reloadOnComplete }); }, 5000);
-        } else if (reloadOnComplete && !p.spriteUpToDate) {
-          // Queue drained; sprite still baking (debounce + bake itself).
+        } else if (reloadOnComplete && p.state === 'building') {
+          // Its photos are done; the atlas is being made.
           setBuildMessage('Finalizing…');
           statusTimer = setTimeout(function () { pollBuildStatus({ reloadOnComplete: reloadOnComplete }); }, 2000);
         } else if (reloadOnComplete) {

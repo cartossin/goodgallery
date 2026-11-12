@@ -300,9 +300,12 @@ function renderFolderUnavailable(segments) {
 // A folder inside a running tree rescan or rebuild that has no build at
 // that moment is the walk's work in progress (its old build was deleted
 // when its turn came, or its atlas is being packed), so it says "Building".
+// build.lastError is what is wrong with the folder's build now (a failed
+// build, or photos shown as placeholders), null when nothing is.
 function describeBuild(build, imageCount, segments) {
   if (build.queued > 0) return { text: 'Building, ' + plural(build.queued, 'image') + ' left', className: 'status-busy' };
   if (!build.built && insideTreeWalk(segments)) return { text: 'Building', className: 'status-busy' };
+  if (build.lastError) return { text: build.built ? 'Built, with problems' : 'Build failed', className: 'status-error' };
   if (!build.built) return { text: 'Not built yet', className: 'status-none' };
   if (imageCount === 0) return { text: 'Built', className: 'status-built' };
   return { text: 'Built ' + (build.builtAt ? timeAgo(build.builtAt) : ''), className: 'status-built' };
@@ -319,11 +322,11 @@ function renderFolderSummary(info) {
   const buildSpan = document.createElement('span');
   buildSpan.className = build.className;
   buildSpan.textContent = build.text;
-  if (info.build.lastError) buildSpan.title = 'Last build error: ' + info.build.lastError;
   facts.append(
     plural(info.imageCount, 'image') + ' · ' + plural(info.subfolders.length, 'subfolder') + ' · ',
     buildSpan,
   );
+  if (info.build.lastError) facts.append(': ' + info.build.lastError);
   if (info.hidden) {
     const badge = document.createElement('span');
     badge.className = 'badge';

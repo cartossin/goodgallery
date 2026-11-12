@@ -179,6 +179,7 @@ details[open] > summary { margin-bottom: 10px; }
 .status-built { color: var(--ok); }
 .status-busy { color: var(--busy); }
 .status-none { color: var(--muted); }
+.status-error { color: var(--danger); }
 
 .warning {
   display: flex;
