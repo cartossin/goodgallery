@@ -152,16 +152,31 @@
     });
   }
 
-  // A plain message at the bottom of the window, shown once, when a photo or
-  // an atlas sheet could not be loaded after all retries. A file of a
-  // replaced build is not a load problem: the page moves to the new build,
-  // and says so through giveUpOnReplacedBuild() if it cannot.
-  var loadProblemShown = false;
-  function showLoadProblem(error) {
+  // A plain message at the bottom of the window while some load the viewer
+  // still wants has given up after all its retries. Each given-up load is
+  // remembered by key ('sheet <tier>:<index>', 'tile <name>|<tier>'); it is
+  // forgotten when the same load later succeeds, or when the viewer no
+  // longer wants it (its sheet or photo was evicted after a scroll or zoom),
+  // and the message goes with the last one. A file of a replaced build is not
+  // a load problem: the page moves to the new build, and says so through
+  // giveUpOnReplacedBuild() if it cannot.
+  var givenUpLoads = new Set();
+  function noteLoadGivenUp(key, error) {
     if (error && error.buildReplaced) return;
-    if (loadProblemShown) return;
-    loadProblemShown = true;
-    var box = document.createElement('div');
+    givenUpLoads.add(key);
+    updateLoadProblem();
+  }
+  function forgetGivenUpLoad(key) {
+    if (givenUpLoads.delete(key)) updateLoadProblem();
+  }
+  function updateLoadProblem() {
+    var box = $('loadproblem');
+    if (givenUpLoads.size === 0) {
+      if (box) box.remove();
+      return;
+    }
+    if (box) return;
+    box = document.createElement('div');
     box.id = 'loadproblem';
     box.setAttribute('role', 'status');
     box.textContent = 'Some photos could not be loaded. Reload the page to try again.';
@@ -362,7 +377,8 @@
   }
 
   function giveUpOnReplacedBuild() {
-    showLoadProblem();
+    // Its missing files stay missing until the visitor reloads.
+    noteLoadGivenUp('replaced build');
     if (afterReplacedBuildGivenUp) afterReplacedBuildGivenUp();
     afterReplacedBuildGivenUp = null;
   }
@@ -939,6 +955,7 @@
     floorSpritesLoading.add(spriteIdx);
     fetchSpriteBitmap(atlas, spriteIdx).then(function (bm) {
       floorSpritesLoading.delete(spriteIdx);
+      forgetGivenUpLoad(sheetLoadKey(key, spriteIdx));
       gridRenderer.uploadSprite(key + ':' + spriteIdx, bm);
       closeBitmap(bm);
       // First content for any tile that had nothing — redraw now. (Only if
@@ -946,7 +963,7 @@
       if (canvasEl && gridRenderer.hasTexture(key + ':' + spriteIdx)) scheduleGridRedraw();
     }, function (err) {
       floorSpritesLoading.delete(spriteIdx);
-      showLoadProblem(err);
+      noteLoadGivenUp(sheetLoadKey(key, spriteIdx), err);
     });
   }
 
@@ -972,6 +989,10 @@
     return batchesFromAccum(batchAccum);
   }
 
+  // Keys of given-up loads (noteLoadGivenUp).
+  function sheetLoadKey(tierKey, spriteIdx) { return 'sheet ' + tierKey + ':' + spriteIdx; }
+  function tileLoadKey(perImageKey) { return 'tile ' + perImageKey; }
+
   function loadSpriteAt(atlasH, spriteIdx) {
     var key = String(atlasH);
     if (!spriteLoads[key]) spriteLoads[key] = {};
@@ -984,6 +1005,7 @@
     job = { ctrl: ctrl, promise: null };
     job.promise = fetchSpriteBitmap(atlas, spriteIdx, ctrl.signal).then(function (bm) {
       if (!bm) return null;  // evicted before it arrived
+      forgetGivenUpLoad(sheetLoadKey(key, spriteIdx));
       atlasBitmapsSync[key][spriteIdx] = bm;
       gridRenderer.uploadSprite(key + ':' + spriteIdx, bm);
       return bm;
@@ -991,7 +1013,7 @@
       // Given up after the retries: forget the job, so a later redraw the
       // visitor causes (a scroll, a zoom) can try the sheet again.
       if (spriteLoads[key][spriteIdx] === job) delete spriteLoads[key][spriteIdx];
-      showLoadProblem(err);
+      noteLoadGivenUp(sheetLoadKey(key, spriteIdx), err);
       throw err;
     });
     spriteLoads[key][spriteIdx] = job;
@@ -1092,10 +1114,11 @@
         // Cancelled after the bytes arrived: skip the decode, it's the expensive part.
         .then(function (b) { return job.ctrl && job.ctrl.signal.aborted ? null : createImageBitmap(b); });
     }, job.ctrl && job.ctrl.signal)
-      .catch(function (err) { showLoadProblem(err); return null; })
+      .catch(function (err) { noteLoadGivenUp(tileLoadKey(job.key), err); return null; })
       .then(function (bm) {
         perImageInFlight.delete(job);
         _perImageLoads(job.wantBitmap).delete(job.key);
+        if (bm) forgetGivenUpLoad(tileLoadKey(job.key));
         if (bm && !warmPerImageNames.has(imageNameOfKey(job.key))) {
           // User moved on during the load — drop it here rather than leaving
           // it for the next eviction pass.
@@ -1218,6 +1241,12 @@
     deadKeys.forEach(function (key) {
       gridRenderer.deleteTexture('img:' + key);
       perImageTextures.delete(key);
+    });
+    // A tile that gave up is no longer a problem once its photo is not wanted.
+    givenUpLoads.forEach(function (loadKey) {
+      var tilePrefix = tileLoadKey('');
+      if (loadKey.indexOf(tilePrefix) !== 0) return;
+      if (!warmNames.has(imageNameOfKey(loadKey.slice(tilePrefix.length)))) forgetGivenUpLoad(loadKey);
     });
   }
 
@@ -1882,6 +1911,7 @@
     var jobs = spriteLoads[key];
     for (var i = 0; i < arr.length; i++) {
       if (neededIdxs.has(i)) continue;
+      forgetGivenUpLoad(sheetLoadKey(key, i));
       closeBitmap(arr[i]);
       arr[i] = null;
       gridRenderer.deleteTexture(key + ':' + i);
