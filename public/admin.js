@@ -67,12 +67,21 @@ function postJson(url, body) {
 }
 
 // The per-folder query actions (?mkdir, ?sethidden, ?movetotrash, ...) answer
-// in plain text, not JSON.
+// in plain text, or JSON with an "error" field when they refuse; either way
+// the notice shows the server's reason.
 async function postFolderAction(url) {
   const response = await fetch(url, { method: 'POST', credentials: 'same-origin' });
   const text = await response.text();
   if (response.status === 401 || response.status === 403) { showSignIn(); throw new SignedOutError('signed out'); }
-  if (!response.ok) throw new HttpError(text || ('HTTP ' + response.status), response.status);
+  if (!response.ok) throw new HttpError(reasonFromBody(text) || ('HTTP ' + response.status), response.status);
+  return text;
+}
+
+function reasonFromBody(text) {
+  try {
+    const data = JSON.parse(text);
+    if (data && typeof data.error === 'string') return data.error;
+  } catch {}
   return text;
 }
 
@@ -523,13 +532,22 @@ function imageRow(name) {
 }
 
 async function trashImage(name, row) {
-  row.querySelector('button').disabled = true;
+  const button = row.querySelector('button');
+  button.disabled = true;
+  let trashed = false;
   await runAction('Move to trash', async () => {
     const message = await postFolderAction(folderUrl(state.folderSegments) + '?movetotrash=' + encodeURIComponent(name));
+    trashed = true;
     state.imageNames = state.imageNames.filter(other => other !== name);
     renderImages();
     return message;
   });
+  if (!trashed) {
+    // The list may be out of date (the photo removed on disk meanwhile):
+    // read it again rather than leave a row whose button does nothing.
+    button.disabled = false;
+    loadImages();
+  }
   loadFolder();
 }
 
