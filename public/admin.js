@@ -24,12 +24,7 @@ const state = {
   lastQueueRemaining: null,
   lastFolderRefreshAt: 0,
   folderLoadFailed: false, // the folder on screen could not be read; retried when the server answers
-  uploadBatch: newUploadBatch(),  // counter for the upload list in this folder
 };
-
-function newUploadBatch() {
-  return { total: 0, uploaded: 0, failed: 0 };
-}
 
 const byId = id => document.getElementById(id);
 
@@ -201,8 +196,10 @@ function showFolder(segments) {
   byId('imagesSection').open = false;
   byId('trashSection').open = false;
   byId('imageFilter').value = '';
-  byId('uploadList').replaceChildren();
-  state.uploadBatch = newUploadBatch();
+  // A loop, not a spread: a folder upload can hold tens of thousands of rows.
+  const uploadList = byId('uploadList');
+  uploadList.replaceChildren();
+  for (const row of uploadsFor(segments).rows) uploadList.append(row);
   renderUploadCount();
   showNewFolderForm(false);
   renderBreadcrumb();
@@ -759,14 +756,14 @@ async function handleDrop(event) {
     for (const file of event.dataTransfer.files || []) items.push({ file, folderSegments: targetSegments });
   }
   if (refused.size) problems.push(refusedFoldersText(refused, 0));
-  await uploadItems(items, problems);
+  await uploadItems(targetSegments, items, problems);
   finishUploads(targetSegments);
 }
 
 async function handlePickedFiles(event) {
   const targetSegments = state.folderSegments;
   const items = Array.from(event.target.files, file => ({ file, folderSegments: targetSegments }));
-  await uploadItems(items);
+  await uploadItems(targetSegments, items);
   event.target.value = '';
   finishUploads(targetSegments);
 }
@@ -794,7 +791,7 @@ async function handlePickedFolder(event) {
     if (error instanceof SignedOutError) return;
     throw error;
   }
-  await uploadItems(items, refused.size ? [refusedFoldersText(refused, skippedFiles)] : []);
+  await uploadItems(targetSegments, items, refused.size ? [refusedFoldersText(refused, skippedFiles)] : []);
   event.target.value = '';
   finishUploads(targetSegments);
 }
@@ -853,31 +850,47 @@ async function collectEntry(entry, parentSegments, items, refused) {
 }
 
 function finishUploads(targetSegments) {
-  if (targetSegments === state.folderSegments) loadFolder();
+  if (folderRelativePath(targetSegments) === folderRelativePath(state.folderSegments)) loadFolder();
 }
 
-// problems: sentences about what was left out before this point (folders
-// the server refused), shown in the same notice as skipped non-images.
-async function uploadItems(items, problems = []) {
+// Uploads are listed under the folder they were started in, not whichever
+// folder is on screen when they run. Each folder keeps its rows and counts
+// while the page is open; the list on screen is the current folder's.
+const uploadsByFolder = new Map();  // folderRelativePath -> { segments, rows, total, uploaded, failed }
+
+function uploadsFor(segments) {
+  const key = folderRelativePath(segments);
+  if (!uploadsByFolder.has(key)) uploadsByFolder.set(key, { segments, rows: [], total: 0, uploaded: 0, failed: 0 });
+  return uploadsByFolder.get(key);
+}
+
+function uploadsAreOnScreen(uploads) {
+  return uploadsFor(state.folderSegments) === uploads;
+}
+
+// targetSegments: the folder the upload was started in. problems: sentences
+// about what was left out before this point (folders the server refused),
+// shown in the same notice as skipped non-images.
+async function uploadItems(targetSegments, items, problems = []) {
   const images = items.filter(({ file }) => file.type && file.type.startsWith('image/'));
   const skipped = items.length - images.length;
   const notes = problems.slice();
   if (skipped) notes.push('Skipped ' + plural(skipped, 'file') + ' that ' + (skipped === 1 ? 'is' : 'are') + ' not an image.');
   if (notes.length) showNotice(notes.join(' '), true);
-  const batch = state.uploadBatch;
-  batch.total += images.length;
+  const uploads = uploadsFor(targetSegments);
+  uploads.total += images.length;
   renderUploadCount();
   let next = 0;
   async function worker() {
     while (next < images.length) {
       const item = images[next++];
-      const row = addUploadRow(item.file, item.folderSegments);
+      const row = addUploadRow(uploads, item.file, item.folderSegments);
       try {
         await uploadOneFile(item, row);
-        batch.uploaded++;
+        uploads.uploaded++;
       } catch (error) {
         setUploadRowState(row, 'failed', 'Failed: ' + error.message);
-        batch.failed++;
+        uploads.failed++;
       }
       renderUploadCount();
     }
@@ -888,22 +901,25 @@ async function uploadItems(items, problems = []) {
 // A row appears when its file starts, so the list reads top-down in upload
 // order with the files in flight at the bottom. The list follows the newest
 // row unless the user has scrolled up to look at an earlier one.
-function addUploadRow(file, folderSegments) {
-  const list = byId('uploadList');
+function addUploadRow(uploads, file, folderSegments) {
   const row = byId('uploadRowTemplate').content.firstElementChild.cloneNode(true);
-  const relativeFolder = folderSegments.slice(state.folderSegments.length).join('/');
+  const relativeFolder = folderSegments.slice(uploads.segments.length).join('/');
   row.querySelector('.row-name').textContent = (relativeFolder ? relativeFolder + '/' : '') + file.name;
   row.querySelector('.row-meta').textContent = 'Starting';
-  const wasAtBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 8;
-  list.append(row);
-  if (wasAtBottom) list.scrollTop = list.scrollHeight;
+  uploads.rows.push(row);
+  if (uploadsAreOnScreen(uploads)) {
+    const list = byId('uploadList');
+    const wasAtBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 8;
+    list.append(row);
+    if (wasAtBottom) list.scrollTop = list.scrollHeight;
+  }
   return row;
 }
 
 // "12 of 300" in the card title, plus ", 2 failed" when any did. The
-// numbers belong to the folder shown; opening another folder starts over.
+// numbers belong to the folder shown.
 function renderUploadCount() {
-  const { total, uploaded, failed } = state.uploadBatch;
+  const { total, uploaded, failed } = uploadsFor(state.folderSegments);
   let text = total ? uploaded + ' of ' + total : '';
   if (failed) text += ', ' + plural(failed, 'file') + ' failed';
   byId('uploadCount').textContent = text;
