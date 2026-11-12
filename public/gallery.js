@@ -177,13 +177,6 @@
     if (!rt) return;
     rt.textContent = msg || '';
   }
-  function gghttp(method, qs, onText) {
-    var url = folderURL + (qs ? '?' + qs : '');
-    fetch(url, { method: method, credentials: 'same-origin' })
-      .then(function (r) { return r.text(); })
-      .then(function (t) { onText(t); })
-      .catch(function () { onText(''); });
-  }
 
   // ---------- build status ----------
   // The page watches the folder's build state on the server (?build-status);
@@ -194,8 +187,9 @@
   //
   // A page rendered before the folder was built (no atlas yet) waits for the
   // build and reloads when it is done; so does a page whose build was
-  // replaced (buildReplaced). Any other page only shows a build in progress
-  // in the status line.
+  // replaced (buildReplaced), and one that just moved a photo to the trash
+  // (pendingTrash). Any other page only shows a build in progress in the
+  // status line.
   var DEFAULT_BUILD_MESSAGE = 'Building LoD cache…';
   var waitingForFirstBuild = !window.spriteMeta && lastimagevalue > 0;
   var buildReplaced = false;       // a file of the page's build answered 404
@@ -212,7 +206,7 @@
   // before it could show anything (its photo list was the file that 404'd).
   var afterReplacedBuildGivenUp = null;
 
-  function reloadIsAwaited() { return waitingForFirstBuild || buildReplaced; }
+  function reloadIsAwaited() { return waitingForFirstBuild || buildReplaced || trashAwaitsBuild(); }
   // A request that gets no answer (network down, server restarting, an HTTP
   // error) is asked again after these delays; then the page says so and stops.
   var BUILD_STATUS_RETRY_DELAYS_MS = [2000, 4000, 8000, 16000];
@@ -303,15 +297,26 @@
     } else if (status.state === 'failed') {
       // Stop waiting. A page that shows an earlier build keeps showing it.
       buildPoll.finished = true;
-      setBuildMessage(waitingForFirstBuild ? 'This folder could not be built.' + (status.error ? ' ' + status.error : '') : '');
+      if (waitingForFirstBuild) setBuildMessage('This folder could not be built.' + (status.error ? ' ' + status.error : ''));
+      else if (pendingTrash) setBuildMessage(pendingTrash.name + ' was moved to the trash, but the folder could not be rebuilt.');
+      else setBuildMessage('');
       if (buildReplaced) giveUpOnReplacedBuild();
+    } else if (status.state === 'built' && pendingTrash) {
+      // Built after the trash was accepted (watchBuildStatusAfterChange
+      // ignores older answers), so this build no longer has the photo.
+      buildPoll.finished = true;
+      reloadAfterTrash();
+    } else if (pendingTrash && !trashAwaitsBuild()) {
+      // Still building after the longest wait: say so and stop.
+      buildPoll.finished = true;
+      setBuildMessage(trashMessage());
     } else if (status.state === 'building' && status.remaining > 0) {
       var eta = status.etaSeconds != null ? ' — ETA ' + formatEta(status.etaSeconds) : '';
-      setBuildMessage('Building ' + status.remaining + ' image' + (status.remaining === 1 ? '' : 's') + eta);
+      setBuildMessage(pendingTrash ? trashMessage() : 'Building ' + status.remaining + ' image' + (status.remaining === 1 ? '' : 's') + eta);
       scheduleBuildStatusPoll(5000);
     } else if (reloadIsAwaited() && status.state === 'building') {
       // Its photos are done; the atlas is being made.
-      setBuildMessage('Finalizing…');
+      setBuildMessage(pendingTrash ? trashMessage() : 'Finalizing…');
       scheduleBuildStatusPoll(2000);
     } else if (waitingForFirstBuild) {
       buildPoll.finished = true;
@@ -3015,6 +3020,7 @@
     if (focusedIdx > 0) {
       var trashButton = document.createElement('button');
       trashButton.textContent = 'Move to trash';
+      trashButton.disabled = trashInProgress;
       trashButton.addEventListener('click', moveFocusedToTrash);
       bar.appendChild(trashButton);
     }
@@ -3025,15 +3031,70 @@
     bar.appendChild(adminLink);
   }
   // ---------- admin actions ----------
+  // "Move to trash" on the photo shown. No confirm: trash is reversible via
+  // the admin panel's per-folder trash. The server moves the file at once
+  // and rebuilds the folder afterwards; a page loaded before that build
+  // commits still lists the photo, and trashing it again fails. So once the
+  // server has accepted, the page waits (through the build-status poller)
+  // until the folder is built without the photo, then reloads onto the next
+  // photo. One trash at a time: the button is disabled from the click on.
+  var TRASH_WAIT_MS = 10 * 60 * 1000;
+  var trashInProgress = false;
+  var pendingTrash = null;  // { name, nextHash, waitUntil } once the server accepted
+
   function moveFocusedToTrash() {
-    // No confirm — trash is reversible via the admin panel's per-folder trash.
-    if (focusedIdx <= 0) return;
-    var name = images[focusedIdx];
+    if (focusedIdx <= 0 || trashInProgress) return;
+    var idx = focusedIdx;
+    var name = images[idx];
+    trashInProgress = true;
+    showAdminBar();
     note('Moving ' + name + ' to trash…');
-    gghttp('POST', 'movetotrash=' + encodeURIComponent(name), function (t) {
-      note(t || 'moved to trash');
-      setTimeout(function () { location.reload(); }, 600);
-    });
+    fetch(folderURL + '?movetotrash=' + encodeURIComponent(name), { method: 'POST', credentials: 'same-origin' })
+      .then(function (response) {
+        return response.text().then(function (text) {
+          if (!response.ok) throw new Error(text || 'HTTP ' + response.status);
+        });
+      })
+      .then(function () {
+        pendingTrash = { name: name, nextHash: hashAfterTrashing(idx), waitUntil: Date.now() + TRASH_WAIT_MS };
+        setBuildMessage(trashMessage());
+        watchBuildStatusAfterChange();
+      }, function (error) {
+        trashInProgress = false;
+        showAdminBar();
+        note(name + ' could not be moved to trash: ' + error.message);
+      });
+  }
+
+  // Where the page opens after the trash: the next photo, else the previous
+  // one, else the grid.
+  function hashAfterTrashing(idx) {
+    var neighbour = images[idx + 1] || images[idx - 1];
+    if (neighbour) return '#' + encodeURIComponent(neighbour);
+    var lv = availableLevels()[lastGridLevelIdx];
+    return '#' + (lv && lv.hash ? lv.hash : 'fit');
+  }
+
+  // The wait is bounded: a folder of tens of thousands of photos can take a
+  // long time to re-bake its atlas, and the visitor is told instead.
+  function trashAwaitsBuild() {
+    return pendingTrash !== null && Date.now() < pendingTrash.waitUntil;
+  }
+
+  function trashMessage() {
+    return trashAwaitsBuild()
+      ? pendingTrash.name + ' moved to trash. Updating the folder…'
+      : pendingTrash.name + ' is in the trash. The folder is still being updated; reload the page later to see the change.';
+  }
+
+  // Unless the visitor has moved on to another photo meanwhile, the
+  // reloaded page opens on the photo after the trashed one.
+  function reloadAfterTrash() {
+    applyPendingHashUpdate();
+    if (hashText() === pendingTrash.name) {
+      try { history.replaceState(null, '', pendingTrash.nextHash); } catch (_) {}
+    }
+    location.reload();
   }
 
   // Image whose tile-center is closest to the viewport center.
