@@ -449,9 +449,16 @@ async function setSubfolderHidden(parentSegments, name, checkbox) {
 async function trashFolder(segments) {
   const name = folderDisplayName(segments);
   if (!confirm('Move the folder "' + name + '" and everything in it to the trash?\n\nYou can restore it from the trash of its parent folder.')) return;
-  await runAction('Move to trash', () => postFolderAction(folderUrl(segments) + '?deletefolder=1'));
-  const isCurrentFolder = segments.length === state.folderSegments.length;
-  if (isCurrentFolder) openFolder(segments.slice(0, -1));
+  let trashed = false;
+  await runAction('Move to trash', async () => {
+    const message = await postFolderAction(folderUrl(segments) + '?deletefolder=1');
+    trashed = true;
+    return message;
+  });
+  // The panel leaves the folder only if it is gone and still on screen: the
+  // owner may have opened another folder while the request ran.
+  const stillOnIt = folderRelativePath(segments) === folderRelativePath(state.folderSegments);
+  if (trashed && stillOnIt) openFolder(segments.slice(0, -1));
   else loadFolder();
 }
 
