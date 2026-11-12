@@ -146,9 +146,18 @@ function describeUserAgent(userAgent) {
 // Folder paths
 // ======================================================================
 
-// Gallery URL of a folder: "/" or "/trips/2024/".
+// A folder is held as its list of names, e.g. ['trips', 'a b'], and turned
+// into text only at the edge: percent-encoded once for a URL, plain for
+// people. Names never contain "/", so joining and splitting on it is exact.
+
+// Gallery URL of a folder: "/" or "/trips/a%20b/".
 function folderUrl(segments) {
   return '/' + segments.map(encodeURIComponent).join('/') + (segments.length ? '/' : '');
+}
+
+// The same folder for messages: "/" or "/trips/a b/".
+function folderPathText(segments) {
+  return '/' + segments.join('/') + (segments.length ? '/' : '');
 }
 
 // The form the JSON APIs take: "trips/2024" ("" for the root).
@@ -160,10 +169,10 @@ function folderDisplayName(segments) {
   return segments.length ? segments[segments.length - 1] : 'Galleries';
 }
 
-// This page's own URL for a folder. Uses location.pathname so the panel works
-// both at /_admin/ and at /_static/admin.html.
+// This page's own URL for a folder: ?p= carries the plain path, encoded
+// once here and decoded once by URLSearchParams below.
 function adminUrlFor(segments) {
-  return location.pathname + '?p=' + encodeURIComponent(folderUrl(segments));
+  return location.pathname + '?p=' + encodeURIComponent(folderPathText(segments));
 }
 
 function segmentsFromLocation() {
@@ -229,7 +238,7 @@ async function loadFolder() {
   } catch (error) {
     if (error instanceof SignedOutError) return;
     if (segments.length) {
-      showNotice('Could not open ' + folderUrl(segments) + ': ' + error.message + '. Showing the top level instead.', true);
+      showNotice('Could not open ' + folderPathText(segments) + ': ' + error.message + '. Showing the top level instead.', true);
       history.replaceState(null, '', adminUrlFor([]));
       showFolder([]);
     } else {
@@ -375,14 +384,14 @@ async function trashFolder(segments) {
 async function rescanCurrentFolder() {
   await runAction('Rescan', async () => {
     await postJson('/api/admin/rescanfolder', { folder: folderRelativePath(state.folderSegments) });
-    return 'Rescanning ' + folderUrl(state.folderSegments) + '. Changes show up here as they build.';
+    return 'Rescanning ' + folderPathText(state.folderSegments) + '. Changes show up here as they build.';
   });
   setTimeout(loadFolder, 1500);
 }
 
 async function rescanCurrentTree() {
   const isRoot = state.folderSegments.length === 0;
-  const where = isRoot ? 'all folders' : folderUrl(state.folderSegments) + ' and everything below it';
+  const where = isRoot ? 'all folders' : folderPathText(state.folderSegments) + ' and everything below it';
   await runAction('Rescan with subfolders', async () => {
     await postJson('/api/admin/rescanfolder', { folder: folderRelativePath(state.folderSegments), recursive: true });
     return 'Rescanning ' + where + '. Progress shows in the bar above.';
@@ -392,7 +401,7 @@ async function rescanCurrentTree() {
 
 async function rebuildCurrentTree() {
   const isRoot = state.folderSegments.length === 0;
-  const where = isRoot ? 'every folder' : folderUrl(state.folderSegments) + ' and everything below it';
+  const where = isRoot ? 'every folder' : folderPathText(state.folderSegments) + ' and everything below it';
   if (!confirm('Delete every thumbnail and atlas in ' + where + ' and build them all again from the originals?\n\nThis is the recursive rebuild. Folders are rebuilt one at a time and each shows "Building" until it finishes. On a large tree this takes hours.')) return;
   await runAction('Rebuild with subfolders', async () => {
     await postJson('/api/admin/rebuildtree', { folder: folderRelativePath(state.folderSegments) });
@@ -403,9 +412,9 @@ async function rebuildCurrentTree() {
 }
 
 async function rebuildCurrentFolder() {
-  const where = folderUrl(state.folderSegments);
+  const where = folderPathText(state.folderSegments);
   if (!confirm('Delete every thumbnail and atlas in ' + where + ' and build them again from the originals?\n\nThis is a troubleshooting step, not routine maintenance. Subfolders are not touched. The folder shows "Building" until it finishes; large folders take a long time.')) return;
-  await runAction('Rebuild', () => postFolderAction(where + '?clearcache=1'));
+  await runAction('Rebuild', () => postFolderAction(folderUrl(state.folderSegments) + '?clearcache=1'));
   loadFolder();
 }
 
@@ -549,7 +558,7 @@ async function restoreAllFromTrash() {
 
 async function emptyTrash() {
   const count = state.folderInfo ? state.folderInfo.trashCount : 0;
-  if (!confirm('Permanently delete ' + plural(count, 'item') + ' in the trash of ' + folderUrl(state.folderSegments) + '? This cannot be undone.')) return;
+  if (!confirm('Permanently delete ' + plural(count, 'item') + ' in the trash of ' + folderPathText(state.folderSegments) + '? This cannot be undone.')) return;
   await runAction('Empty trash', async () => (await postJson('/api/trash/empty', trashRequestBody())).message);
   afterTrashChange();
 }
