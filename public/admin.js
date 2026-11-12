@@ -503,17 +503,22 @@ async function trashImage(name, row) {
 // Trash of the current folder
 // ======================================================================
 
+async function fetchTrashItems(segments) {
+  const data = await getJson('/api/trash?folder=' + encodeURIComponent(folderRelativePath(segments)));
+  return data.items || [];
+}
+
 async function loadTrash() {
   const segments = state.folderSegments;
-  let data;
+  let items;
   try {
-    data = await getJson('/api/trash?folder=' + encodeURIComponent(folderRelativePath(segments)));
+    items = await fetchTrashItems(segments);
   } catch (error) {
     if (!(error instanceof SignedOutError)) showNotice('Could not load the trash: ' + error.message, true);
     return;
   }
   if (segments !== state.folderSegments) return;
-  renderTrash(data.items || []);
+  renderTrash(items);
 }
 
 function renderTrash(items) {
@@ -556,10 +561,24 @@ async function restoreAllFromTrash() {
   afterTrashChange();
 }
 
+// The confirmation counts what is in the trash now, read again and shown
+// first, and the request names exactly those items: anything trashed after
+// that (from the gallery, another tab) stays in the trash.
 async function emptyTrash() {
-  const count = state.folderInfo ? state.folderInfo.trashCount : 0;
-  if (!confirm('Permanently delete ' + plural(count, 'item') + ' in the trash of ' + folderPathText(state.folderSegments) + '? This cannot be undone.')) return;
-  await runAction('Empty trash', async () => (await postJson('/api/trash/empty', trashRequestBody())).message);
+  const segments = state.folderSegments;
+  let items;
+  try {
+    items = await fetchTrashItems(segments);
+  } catch (error) {
+    if (!(error instanceof SignedOutError)) showNotice('Could not load the trash: ' + error.message, true);
+    return;
+  }
+  if (segments !== state.folderSegments) return;
+  renderTrash(items);
+  if (!items.length) { showNotice('The trash is already empty.'); return; }
+  if (!confirm('Permanently delete ' + plural(items.length, 'item') + ' in the trash of ' + folderPathText(segments) + '? This cannot be undone.')) return;
+  const names = items.map(item => item.name);
+  await runAction('Empty trash', async () => (await postJson('/api/trash/empty', trashRequestBody({ names }))).message);
   afterTrashChange();
 }
 
