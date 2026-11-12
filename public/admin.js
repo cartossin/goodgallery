@@ -934,29 +934,39 @@ async function uploadOneFile({ file, folderSegments }, row) {
   setUploadRowState(row, 'done', 'Uploaded', 1);
 }
 
-// Network blips must not lose a large batch: retry each chunk until it lands,
-// backing off up to UPLOAD_RETRY_MAX_WAIT_MS.
+// Network blips must not lose a large batch, so a chunk is retried, backing
+// off up to UPLOAD_RETRY_MAX_WAIT_MS, as long as a retry can help: no answer
+// at all, a server error (5xx) or "too many requests" (429). Any other
+// refusal (the upload is gone, a bad chunk) would only repeat, so the file
+// fails with the server's reason.
+function chunkRetryCanHelp(status) {
+  return status >= 500 || status === 429;
+}
+
 async function sendChunkWithRetry(uploadId, index, bytes, row) {
   const hash = await sha256Hex(bytes);
   const headers = hash ? { 'X-Chunk-Hash': hash } : {};
   for (let attempt = 1; ; attempt++) {
+    let response = null;
     try {
-      const response = await fetch('/api/upload/chunk/' + uploadId + '/' + index, {
+      response = await fetch('/api/upload/chunk/' + uploadId + '/' + index, {
         method: 'POST',
         credentials: 'same-origin',
         headers,
         body: bytes,
       });
+    } catch {}  // no answer: retried below
+    let reason = 'no answer from the server';
+    if (response) {
       const data = await response.json().catch(() => ({}));
       if (response.status === 401) { showSignIn(); throw new SignedOutError('signed out'); }
       if (response.ok) return;
-      throw new Error(data.error || ('HTTP ' + response.status));
-    } catch (error) {
-      if (error instanceof SignedOutError) throw error;
-      const waitMs = Math.min(attempt * 1000, UPLOAD_RETRY_MAX_WAIT_MS);
-      setUploadRowState(row, 'retrying', 'Retry ' + attempt + ' in ' + (waitMs / 1000) + ' s (' + error.message + ')');
-      await new Promise(resolve => setTimeout(resolve, waitMs));
+      reason = data.error || ('HTTP ' + response.status);
+      if (!chunkRetryCanHelp(response.status)) throw new HttpError(reason, response.status);
     }
+    const waitMs = Math.min(attempt * 1000, UPLOAD_RETRY_MAX_WAIT_MS);
+    setUploadRowState(row, 'retrying', 'Retry ' + attempt + ' in ' + (waitMs / 1000) + ' s (' + reason + ')');
+    await new Promise(resolve => setTimeout(resolve, waitMs));
   }
 }
 
