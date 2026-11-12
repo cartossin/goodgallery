@@ -2287,10 +2287,12 @@
   // (programmatic scrollLeft doesn't get native scroll inertia). 2-finger
   // gestures are left alone so native pinch-zoom keeps working.
   // A tap (no/tiny movement, short duration) navigates to the original file.
+  var TAP_MAX_MOVE_PX = 10;  // the usual touch slop on phones (Android: 8 dp)
   function setupMainImageGestures() {
     if (!mainEl) return;
     var startX = 0, startY = 0, startT = 0, startScrollLeft = 0;
     var dragging = false, multiTouch = false;
+    var farthestMove = 0;  // px the finger has moved from where it went down
     var lastX = 0, lastT = 0, velX = 0;  // px/ms
     var lastDragEndAt = 0;
 
@@ -2325,6 +2327,7 @@
       startT = lastT = performance.now();
       startScrollLeft = filmstripEl ? filmstripEl.scrollLeft : 0;
       dragging = false;
+      farthestMove = 0;
       velX = 0;
     }, { passive: true });
 
@@ -2334,6 +2337,7 @@
       var t = e.touches[0];
       var dx = t.clientX - startX;
       var dy = t.clientY - startY;
+      farthestMove = Math.max(farthestMove, Math.sqrt(dx * dx + dy * dy));
       if (!dragging) {
         // Lock into horizontal drag once we've moved enough horizontally and
         // it dominates vertical movement.
@@ -2364,9 +2368,10 @@
         lastDragEndAt = performance.now();
         return;
       }
-      // Tap: no/tiny drag, short duration -> open original file.
+      // Tap: short in time AND in distance -> open original file. A quick
+      // vertical swipe is short in time too, but it is not a tap.
       var dt = performance.now() - startT;
-      if (dt < 350) {
+      if (dt < 350 && farthestMove <= TAP_MAX_MOVE_PX) {
         var name = images && images[focusedIdx];
         if (name) {
           var url = folderURL + encodeURIComponent(name);
