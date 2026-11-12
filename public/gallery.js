@@ -373,6 +373,10 @@
       return;
     }
     applyPendingHashUpdate();
+    // Mid-way through a film-strip move, reopen the photo it was heading for.
+    if (focusedIdx > 0 && images[photoTheVisitorChose()]) {
+      try { history.replaceState(null, '', '#' + encodeURIComponent(images[photoTheVisitorChose()])); } catch (_) {}
+    }
     location.reload();
   }
 
@@ -390,6 +394,14 @@
   // commandedIdx is the most-recently-requested focus target. Fast successive
   // shifts accumulate against it so the chase animation tracks the final target.
   var commandedIdx = 0;
+  // The photo the visitor chose. While the film strip is still moving to a
+  // photo the visitor commanded (arrow keys, a click on the strip), that
+  // photo, not one the strip is passing on the way (focusedIdx follows the
+  // strip's centre). An action on "this photo" must act on this one.
+  function photoTheVisitorChose() {
+    return (focusInProgrammaticScroll && commandedIdx > 0) ? commandedIdx : focusedIdx;
+  }
+
   function shiftFocus(delta) {
     if (lastimagevalue < 1) return;
     // Mid-animation → commandedIdx (ahead of focusedIdx). Settled → focusedIdx.
@@ -3074,7 +3086,7 @@
 
   function moveFocusedToTrash() {
     if (focusedIdx <= 0 || trashInProgress) return;
-    var idx = focusedIdx;
+    var idx = photoTheVisitorChose();
     var name = images[idx];
     trashInProgress = true;
     showAdminBar();
