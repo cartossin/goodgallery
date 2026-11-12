@@ -3169,6 +3169,7 @@
     renderZoomControl();
 
     window.addEventListener('resize', scheduleRender);
+    watchDevicePixelRatio();
 
     // Initial route after the binary imagemap loads (or fails — renderGallery
     // has its own placeholder for spriteMeta=null).
@@ -3208,6 +3209,19 @@
     // IIFE's window.* exports on Safari.
     window.addEventListener('keydown', keycheck);
     watchBuildStatus();
+  }
+
+  // A device-pixel-ratio change alone (the window moved to a screen with
+  // other scaling, browser zoom without a size change) fires no resize. The
+  // standard way to hear it: a media query for the current resolution, whose
+  // change event fires when the ratio leaves it; then watch the new ratio.
+  function watchDevicePixelRatio() {
+    if (!window.matchMedia) return;
+    var query = window.matchMedia('(resolution: ' + window.devicePixelRatio + 'dppx)');
+    query.addEventListener('change', function () {
+      scheduleRender();
+      watchDevicePixelRatio();
+    }, { once: true });
   }
 
   // Cookie is HttpOnly; the probe is the only way to detect a valid session.
