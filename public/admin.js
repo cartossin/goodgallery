@@ -66,7 +66,7 @@ async function postFolderAction(url) {
   const response = await fetch(url, { method: 'POST', credentials: 'same-origin' });
   const text = await response.text();
   if (response.status === 401 || response.status === 403) { showSignIn(); throw new SignedOutError('signed out'); }
-  if (!response.ok) throw new Error(text || ('HTTP ' + response.status));
+  if (!response.ok) throw Object.assign(new Error(text || ('HTTP ' + response.status)), { status: response.status });
   return text;
 }
 
@@ -717,11 +717,12 @@ async function handlePickedFolder(event) {
 }
 
 // Create each missing folder along parentSegments + subfolders. ?mkdir on an
-// existing folder is a harmless no-op.
+// existing folder answers 409, which here just means it is already there.
 async function createFolderChain(parentSegments, subfolders) {
   let segments = parentSegments;
   for (const name of subfolders) {
-    await postFolderAction(folderUrl(segments) + '?mkdir=' + encodeURIComponent(name));
+    try { await postFolderAction(folderUrl(segments) + '?mkdir=' + encodeURIComponent(name)); }
+    catch (error) { if (error.status !== 409) throw error; }
     segments = segments.concat(name);
   }
   return segments;
