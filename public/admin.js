@@ -208,6 +208,7 @@ function showFolder(segments) {
   byId('imagesSection').open = false;
   byId('trashSection').open = false;
   byId('imageFilter').value = '';
+  clearFolderLists(segments);
   // A loop, not a spread: a folder upload can hold tens of thousands of rows.
   const uploadList = byId('uploadList');
   uploadList.replaceChildren();
@@ -216,6 +217,22 @@ function showFolder(segments) {
   showNewFolderForm(false);
   renderBreadcrumb();
   loadFolder();
+}
+
+// Nothing of the previous folder stays on screen while the new one loads:
+// its rows would still be clickable, and its counts would be wrong.
+function clearFolderLists(segments) {
+  byId('folderTitle').textContent = folderDisplayName(segments);
+  byId('folderFacts').textContent = 'Loading…';
+  byId('folderNotYetBuilt').hidden = true;
+  renderFolderButtons(segments);
+  byId('subfolderList').replaceChildren(emptyRow('Loading…'));
+  byId('imageList').replaceChildren();
+  byId('imageListNote').textContent = '';
+  byId('imageCount').textContent = '';
+  byId('trashList').replaceChildren();
+  byId('trashActions').hidden = true;
+  byId('trashCount').textContent = '';
 }
 
 // Link that navigates inside the panel on a plain click but still opens in a
@@ -375,9 +392,12 @@ function renderSubfolders(info) {
   for (const subfolder of info.subfolders) list.append(subfolderRow(subfolder));
 }
 
+// A row acts on the folder it was rendered for, whatever is on screen when
+// it is clicked.
 function subfolderRow(subfolder) {
   const row = byId('subfolderRowTemplate').content.firstElementChild.cloneNode(true);
-  const segments = state.folderSegments.concat(subfolder.name);
+  const parentSegments = state.folderSegments;
+  const segments = parentSegments.concat(subfolder.name);
   row.classList.toggle('is-hidden', subfolder.hidden);
 
   const link = row.querySelector('.row-name');
@@ -397,7 +417,7 @@ function subfolderRow(subfolder) {
 
   const hiddenCheckbox = row.querySelector('input[type=checkbox]');
   hiddenCheckbox.checked = subfolder.hidden;
-  hiddenCheckbox.addEventListener('change', () => setSubfolderHidden(subfolder.name, hiddenCheckbox));
+  hiddenCheckbox.addEventListener('change', () => setSubfolderHidden(parentSegments, subfolder.name, hiddenCheckbox));
 
   row.querySelector('button').addEventListener('click', () => trashFolder(segments));
   return row;
@@ -410,12 +430,12 @@ function emptyRow(text) {
   return row;
 }
 
-async function setSubfolderHidden(name, checkbox) {
+async function setSubfolderHidden(parentSegments, name, checkbox) {
   const hide = checkbox.checked;
   checkbox.disabled = true;
   await runAction(hide ? 'Hide' : 'Unhide', async () => {
     try {
-      await postFolderAction(folderUrl(state.folderSegments) + '?sethidden=' + encodeURIComponent(name) + '&hide=' + (hide ? 1 : 0));
+      await postFolderAction(folderUrl(parentSegments) + '?sethidden=' + encodeURIComponent(name) + '&hide=' + (hide ? 1 : 0));
     } catch (error) {
       checkbox.checked = !hide;
       throw error;
@@ -535,7 +555,12 @@ async function loadImages() {
   try {
     data = await getJson(folderUrl(segments) + '?api=list');
   } catch (error) {
-    if (!(error instanceof SignedOutError)) byId('imageListNote').textContent = 'Could not load images: ' + error.message;
+    if (error instanceof SignedOutError) return;
+    if (segments !== state.folderSegments) return;  // navigated away meanwhile
+    // No rows from an earlier load: they may name photos that are gone.
+    state.imageNames = null;
+    byId('imageList').replaceChildren();
+    byId('imageListNote').textContent = 'Could not load images: ' + error.message;
     return;
   }
   if (segments !== state.folderSegments) return;
@@ -543,9 +568,12 @@ async function loadImages() {
   renderImages();
 }
 
+// state.imageNames always belongs to state.folderSegments: it is reset on
+// navigation and set only by a load for the folder still on screen.
 function renderImages() {
   if (!state.imageNames) return;  // still loading
   const names = state.imageNames;
+  const segments = state.folderSegments;
   const filter = byId('imageFilter').value.trim().toLowerCase();
   const matches = filter ? names.filter(name => name.toLowerCase().includes(filter)) : names;
   const shown = matches.slice(0, IMAGE_LIST_LIMIT);
@@ -553,7 +581,7 @@ function renderImages() {
   const list = byId('imageList');
   list.replaceChildren();
   list.classList.add('scroll');
-  for (const name of shown) list.append(imageRow(name));
+  for (const name of shown) list.append(imageRow(segments, name));
   if (!names.length) list.append(emptyRow('No images in this folder.'));
   else if (!matches.length) list.append(emptyRow('No image names contain "' + filter + '".'));
 
@@ -562,27 +590,32 @@ function renderImages() {
     : '';
 }
 
-function imageRow(name) {
+function imageRow(segments, name) {
   const row = byId('imageRowTemplate').content.firstElementChild.cloneNode(true);
   const link = row.querySelector('.row-name');
   link.textContent = name;
-  link.href = folderUrl(state.folderSegments) + encodeURIComponent(name);
+  link.href = folderUrl(segments) + encodeURIComponent(name);
   // Trash is reversible from the Trash section, so no confirmation.
-  row.querySelector('button').addEventListener('click', () => trashImage(name, row));
+  row.querySelector('button').addEventListener('click', () => trashImage(segments, name, row));
   return row;
 }
 
-async function trashImage(name, row) {
+// segments: the folder the row was shown for. The panel may have moved on
+// by the time the server answers; then only the outcome is reported.
+async function trashImage(segments, name, row) {
   const button = row.querySelector('button');
   button.disabled = true;
   let trashed = false;
   await runAction('Move to trash', async () => {
-    const message = await postFolderAction(folderUrl(state.folderSegments) + '?movetotrash=' + encodeURIComponent(name));
+    const message = await postFolderAction(folderUrl(segments) + '?movetotrash=' + encodeURIComponent(name));
     trashed = true;
-    state.imageNames = state.imageNames.filter(other => other !== name);
-    renderImages();
     return message;
   });
+  if (segments !== state.folderSegments) return;
+  if (trashed && state.imageNames) {
+    state.imageNames = state.imageNames.filter(other => other !== name);
+    renderImages();
+  }
   if (!trashed) {
     // The list may be out of date (the photo removed on disk meanwhile):
     // read it again rather than leave a row whose button does nothing.
@@ -607,51 +640,58 @@ async function loadTrash() {
   try {
     items = await fetchTrashItems(segments);
   } catch (error) {
-    if (!(error instanceof SignedOutError)) showNotice('Could not load the trash: ' + error.message, true);
+    if (error instanceof SignedOutError) return;
+    if (segments !== state.folderSegments) return;  // navigated away meanwhile
+    // No rows or buttons from an earlier load: they may name items that are gone.
+    byId('trashList').replaceChildren(emptyRow('Could not load the trash.'));
+    byId('trashActions').hidden = true;
+    showNotice('Could not load the trash: ' + error.message, true);
     return;
   }
   if (segments !== state.folderSegments) return;
-  renderTrash(items);
+  renderTrash(segments, items);
 }
 
-function renderTrash(items) {
+// segments: the folder the items are in, which is the folder on screen.
+function renderTrash(segments, items) {
   const list = byId('trashList');
   list.replaceChildren();
   list.classList.add('scroll');
   byId('trashCount').textContent = numberFormat.format(items.length);
   byId('trashActions').hidden = items.length === 0;
   if (!items.length) { list.append(emptyRow('The trash is empty.')); return; }
-  for (const item of items) list.append(trashRow(item));
+  for (const item of items) list.append(trashRow(segments, item));
 }
 
-function trashRow(item) {
+function trashRow(segments, item) {
   const row = byId('trashRowTemplate').content.firstElementChild.cloneNode(true);
   row.querySelector('.row-name').textContent = item.name + (item.isFolder ? '/' : '');
   const details = [item.isFolder ? 'folder' : bytesText(item.size), 'trashed ' + timeAgo(item.trashedAt)];
   row.querySelector('.row-meta').textContent = details.join(' · ');
-  row.querySelector('[data-action=restore]').addEventListener('click', () => restoreFromTrash(item.name));
-  row.querySelector('[data-action=delete]').addEventListener('click', () => deleteFromTrash(item.name));
+  row.querySelector('[data-action=restore]').addEventListener('click', () => restoreFromTrash(segments, item.name));
+  row.querySelector('[data-action=delete]').addEventListener('click', () => deleteFromTrash(segments, item.name));
   return row;
 }
 
-function trashRequestBody(extra) {
-  return Object.assign({ folder: folderRelativePath(state.folderSegments) }, extra);
+function trashRequestBody(segments, extra) {
+  return Object.assign({ folder: folderRelativePath(segments) }, extra);
 }
 
-async function restoreFromTrash(name) {
-  await runAction('Restore', async () => (await postJson('/api/trash/restore', trashRequestBody({ name }))).message);
-  afterTrashChange();
+async function restoreFromTrash(segments, name) {
+  await runAction('Restore', async () => (await postJson('/api/trash/restore', trashRequestBody(segments, { name }))).message);
+  afterTrashChange(segments);
 }
 
-async function deleteFromTrash(name) {
+async function deleteFromTrash(segments, name) {
   if (!confirm('Permanently delete "' + name + '"? This cannot be undone.')) return;
-  await runAction('Delete', async () => (await postJson('/api/trash/delete', trashRequestBody({ name }))).message);
-  afterTrashChange();
+  await runAction('Delete', async () => (await postJson('/api/trash/delete', trashRequestBody(segments, { name }))).message);
+  afterTrashChange(segments);
 }
 
 async function restoreAllFromTrash() {
-  await runAction('Restore all', async () => (await postJson('/api/trash/restoreAll', trashRequestBody())).message);
-  afterTrashChange();
+  const segments = state.folderSegments;
+  await runAction('Restore all', async () => (await postJson('/api/trash/restoreAll', trashRequestBody(segments))).message);
+  afterTrashChange(segments);
 }
 
 // The confirmation counts what is in the trash now, read again and shown
@@ -667,15 +707,17 @@ async function emptyTrash() {
     return;
   }
   if (segments !== state.folderSegments) return;
-  renderTrash(items);
+  renderTrash(segments, items);
   if (!items.length) { showNotice('The trash is already empty.'); return; }
   if (!confirm('Permanently delete ' + plural(items.length, 'item') + ' in the trash of ' + folderPathText(segments) + '? This cannot be undone.')) return;
   const names = items.map(item => item.name);
-  await runAction('Empty trash', async () => (await postJson('/api/trash/empty', trashRequestBody({ names }))).message);
-  afterTrashChange();
+  await runAction('Empty trash', async () => (await postJson('/api/trash/empty', trashRequestBody(segments, { names }))).message);
+  afterTrashChange(segments);
 }
 
-function afterTrashChange() {
+// Reload the lists a trash action changed, if the panel is still on that folder.
+function afterTrashChange(segments) {
+  if (segments !== state.folderSegments) return;
   state.imageNames = null;
   if (byId('imagesSection').open) loadImages();
   loadFolder();  // also reloads the open trash list
