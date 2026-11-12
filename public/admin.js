@@ -419,7 +419,8 @@ function subfolderRow(subfolder) {
   hiddenCheckbox.checked = subfolder.hidden;
   hiddenCheckbox.addEventListener('change', () => setSubfolderHidden(parentSegments, subfolder.name, hiddenCheckbox));
 
-  row.querySelector('button').addEventListener('click', () => trashFolder(segments));
+  const trashButton = row.querySelector('button');
+  trashButton.addEventListener('click', oneAtATime(trashButton, () => trashFolder(segments)));
   return row;
 }
 
@@ -537,8 +538,9 @@ function showNewFolderForm(show) {
   else byId('newFolderName').value = '';
 }
 
-async function createSubfolder(event) {
-  event.preventDefault();
+// Spaces typed around the name are dropped here: the server refuses a name
+// that starts or ends with one rather than change it.
+async function createSubfolder() {
   const input = byId('newFolderName');
   const name = input.value.trim();
   if (!name) return;
@@ -675,8 +677,10 @@ function trashRow(segments, item) {
   row.querySelector('.row-name').textContent = item.name + (item.isFolder ? '/' : '');
   const details = [item.isFolder ? 'folder' : bytesText(item.size), 'trashed ' + timeAgo(item.trashedAt)];
   row.querySelector('.row-meta').textContent = details.join(' · ');
-  row.querySelector('[data-action=restore]').addEventListener('click', () => restoreFromTrash(segments, item.name));
-  row.querySelector('[data-action=delete]').addEventListener('click', () => deleteFromTrash(segments, item.name));
+  const restoreButton = row.querySelector('[data-action=restore]');
+  const deleteButton = row.querySelector('[data-action=delete]');
+  restoreButton.addEventListener('click', oneAtATime(restoreButton, () => restoreFromTrash(segments, item.name)));
+  deleteButton.addEventListener('click', oneAtATime(deleteButton, () => deleteFromTrash(segments, item.name)));
   return row;
 }
 
@@ -1354,9 +1358,11 @@ function showApp() {
 
 // For buttons that confirm and then wait on the server: the button is
 // disabled until its action is over, so a double click asks once and acts
-// once.
+// once. A form's submit button guards Enter the same way: a form whose
+// submit button is disabled is not submitted by Enter.
 function oneAtATime(button, action) {
   return async () => {
+    if (button.disabled) return;
     button.disabled = true;
     try {
       await action();
@@ -1374,7 +1380,11 @@ function wireControls() {
   byId('rescanTreeButton').addEventListener('click', rescanCurrentTree);
   byId('rebuildTreeButton').addEventListener('click', rebuildCurrentTree);
   byId('trashFolderButton').addEventListener('click', oneAtATime(byId('trashFolderButton'), () => trashFolder(state.folderSegments)));
-  byId('newFolderForm').addEventListener('submit', createSubfolder);
+  const createFolderOnce = oneAtATime(byId('createFolderButton'), createSubfolder);
+  byId('newFolderForm').addEventListener('submit', event => {
+    event.preventDefault();
+    createFolderOnce();
+  });
   byId('newFolderButton').addEventListener('click', () => showNewFolderForm(true));
   byId('cancelNewFolderButton').addEventListener('click', () => showNewFolderForm(false));
   byId('newFolderForm').addEventListener('keydown', event => {
@@ -1391,7 +1401,7 @@ function wireControls() {
   byId('trashSection').addEventListener('toggle', () => {
     if (byId('trashSection').open) loadTrash();
   });
-  byId('restoreAllButton').addEventListener('click', restoreAllFromTrash);
+  byId('restoreAllButton').addEventListener('click', oneAtATime(byId('restoreAllButton'), restoreAllFromTrash));
   byId('emptyTrashButton').addEventListener('click', oneAtATime(byId('emptyTrashButton'), emptyTrash));
   byId('createPasskeyButton').addEventListener('click', registerPasskey);
   byId('loginLinkButton').addEventListener('click', createLoginLink);
