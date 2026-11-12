@@ -631,8 +631,11 @@
           sharp = !!loc && gridRenderer.hasTexture(atlasH + ':' + Math.floor(loc.idx / spriteMeta.atlases[String(atlasH)].cellsPerSprite));
           lit = sharp || (!!floorKey && pushAtlasFallback(new Map(), t, [floorKey]));
         } else {
-          sharp = perImageTextures.has(t.name + '|' + tierH);
-          lit = bestTexturedPerImageTier(t.name) > 0 || pushAtlasFallback(new Map(), t, ['50', '10', '5']);
+          // Sharp: the tier this tile wants is on the GPU (a tile no tier
+          // fits, a panorama, is as sharp as it gets once it is lit).
+          var tileTier = perImageTierForTile(t, devicePixelRatio());
+          lit = bestTexturedPerImageTier(t.name) > 0 || pushAtlasFallback(new Map(), t, ['50', '10', '5']) > 0;
+          sharp = tileTier ? perImageTextures.has(t.name + '|' + tileTier) : lit;
         }
         if (sharp) r.sharp++;
         if (lit) r.lit++;
@@ -643,12 +646,11 @@
       var thumbsEl = $('thumbs');
       if (!thumbsEl || !canvasEl) return null;
       var top = thumbsEl.scrollTop, bot = top + thumbsEl.clientHeight;
-      var tierH = pickPerImageTier(currentRowHeight * devicePixelRatio());
       var r = { visibleDone: 0, visibleTotal: 0, bufferDone: 0, bufferTotal: 0 };
       for (var i = firstTileIndexAtOrBelow(bufferTop); i < lastTileRects.length; i++) {
         var t = lastTileRects[i];
         if (t.y > bufferTop + bufferH) break;
-        var done = perImageTextures.has(t.name + '|' + tierH) ? 1 : 0;
+        var done = perImageTextures.has(t.name + '|' + perImageTierForTile(t, devicePixelRatio())) ? 1 : 0;
         r.bufferTotal++; r.bufferDone += done;
         if (t.y + t.h >= top && t.y <= bot) { r.visibleTotal++; r.visibleDone += done; }
       }
@@ -664,6 +666,7 @@
   //   focus → the bitmap itself, drawn through the 2D main canvas.
   // Both share one fetch/decode queue. Keys are `${name}|${tierH}`.
   var perImageTextures = new Set();       // keys whose texture is on the GPU
+  var perImageTexturesRefused = new Set(); // keys the GPU could not take (too large)
   var perImageBitmapsSync = new Map();    // key -> open ImageBitmap (focus)
   var perImageTextureLoads = new Map();   // key -> job, in-progress only
   var perImageBitmapLoads = new Map();    // key -> job, in-progress only
@@ -862,9 +865,16 @@
     if (t.y > scrollY + viewportH) return t.y - (scrollY + viewportH);
     return 0;
   }
+  // True if the texture is on the GPU. A tile the GPU refuses (wider than
+  // its texture limit) is remembered, so the grid uses a smaller tier or the
+  // atlas for it instead of fetching it again.
   function _installPerImageTexture(key, bm) {
-    gridRenderer.uploadSprite('img:' + key, bm);
+    if (!gridRenderer.uploadSprite('img:' + key, bm)) {
+      if (gridRenderer.available()) perImageTexturesRefused.add(key);
+      return false;
+    }
     perImageTextures.add(key);
+    return true;
   }
 
   function _runPerImageJob(job) {
@@ -901,9 +911,9 @@
           perImageBitmapsSync.set(job.key, bm);
           job.resolve(bm);
         } else {
-          _installPerImageTexture(job.key, bm);
+          var installed = _installPerImageTexture(job.key, bm);
           closeBitmap(bm);
-          job.resolve(true);
+          job.resolve(installed ? true : null);
         }
         _pumpPerImageQueue();
       });
@@ -972,8 +982,7 @@
     var bm = perImageBitmapsSync.get(key);
     if (bm) {
       // Focus mode already decoded this one (leaving focus back to the grid).
-      _installPerImageTexture(key, bm);
-      return Promise.resolve(true);
+      return Promise.resolve(_installPerImageTexture(key, bm) ? true : null);
     }
     return _startPerImageLoad(name, tierH, false, priority);
   }
@@ -1041,7 +1050,9 @@
     var attachedCanvas = null;
     var textures = new Map();        // textureKey -> { tex, w, h }
     var staticBuffers = new Map();   // instanceKey -> { buf, count }
-    var failed = false;
+    var failed = false;              // no WebGL2 here: the grid cannot be drawn
+    var contextLost = false;         // the GPU dropped the context; waiting for it back
+    var maxTextureSize = 0;
 
     // aDstRect.y is the tile's WORLD y (layout coord). uTopOffset is the
     // world y of the canvas top; the shader subtracts to get canvas-local
@@ -1117,8 +1128,10 @@
         dynInstVBO = gl.createBuffer();
 
         gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+        maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
 
         attachedCanvas = canvas;
+        contextLost = false;
         return true;
       } catch (e) {
         console.warn('[gridRenderer] init failed:', e.message);
@@ -1137,12 +1150,22 @@
       return init(canvas);
     }
 
-    function available() { return !failed && gl !== null; }
+    function available() { return !failed && !contextLost && gl !== null; }
+    function unsupported() { return failed; }
 
+    // Largest texture side this GPU takes (8192 on many phones and on
+    // Chrome's software renderer); a generous guess before the first context.
+    function maxTextureSide() { return maxTextureSize || 16384; }
+
+    // True if the texture is on the GPU. A bitmap wider or taller than the
+    // GPU allows would fail with INVALID_VALUE and draw black; it is refused
+    // here and nothing is recorded, so the caller falls back to a smaller
+    // source. (Checking the size up front avoids gl.getError(), which waits
+    // for the GPU on every upload.)
     function uploadSprite(key, bitmap) {
-      if (!available() || !bitmap) return;
-      var existing = textures.get(key);
-      if (existing) return;
+      if (!available() || !bitmap) return false;
+      if (textures.has(key)) return true;
+      if (bitmap.width > maxTextureSize || bitmap.height > maxTextureSize) return false;
       var tex = gl.createTexture();
       gl.bindTexture(gl.TEXTURE_2D, tex);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
@@ -1151,6 +1174,23 @@
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
       textures.set(key, { tex: tex, w: bitmap.width, h: bitmap.height });
+      return true;
+    }
+
+    // The GPU dropped the context (driver reset, GPU switch). Every texture
+    // and buffer went with it; forget them until the context comes back.
+    function loseContext() {
+      contextLost = true;
+      textures.clear();
+      staticBuffers.clear();
+    }
+    // The context is back: build the program and buffers again on the same
+    // canvas. The caller uploads the textures again.
+    function restoreContext() {
+      var canvas = attachedCanvas;
+      gl = null; program = null; quadVBO = null; dynInstVBO = null;
+      attachedCanvas = null;
+      return init(canvas);
     }
 
     function releaseAll() {
@@ -1258,7 +1298,8 @@
     function hasTexture(key) { return textures.has(key); }
 
     return {
-      attach: attach, available: available, uploadSprite: uploadSprite,
+      attach: attach, available: available, unsupported: unsupported, uploadSprite: uploadSprite,
+      maxTextureSide: maxTextureSide, loseContext: loseContext, restoreContext: restoreContext,
       releaseAll: releaseAll, deleteTexture: deleteTexture,
       uploadStatic: uploadStatic, dropStatic: dropStatic,
       releaseAllStatic: releaseAllStatic, hasStatic: hasStatic,
@@ -1350,6 +1391,8 @@
     spacerEl.appendChild(canvasEl);
     thumbsEl.appendChild(spacerEl);
     canvasEl.addEventListener('click', onCanvasClick);
+    canvasEl.addEventListener('webglcontextlost', onGridContextLost);
+    canvasEl.addEventListener('webglcontextrestored', onGridContextRestored);
     if (!thumbsScrollAttached) {
       thumbsEl.addEventListener('scroll', onThumbsScroll, { passive: true });
       thumbsScrollAttached = true;
@@ -1362,15 +1405,36 @@
     // again (served from the HTTP cache); floor sprites refetch the same
     // way, on the next draw. Static instance buffers are
     // per-context too — drop them so renderGallery rebuilds for the new context.
-    if (gridRenderer.attach(canvasEl)) {
-      Object.keys(atlasBitmapsSync).forEach(function (k) {
-        var arr = atlasBitmapsSync[k];
-        for (var i = 0; i < arr.length; i++) {
-          if (arr[i]) gridRenderer.uploadSprite(k + ':' + i, arr[i]);
-        }
-      });
-      perImageTextures.clear();
-    }
+    if (gridRenderer.attach(canvasEl)) reuploadAfterNewContext();
+  }
+
+  // A new or restored GL context has no textures. Atlas sprites re-upload
+  // from their kept bitmaps; per-image textures and floor sprites are
+  // fetched again on the next draw (from the HTTP cache).
+  function reuploadAfterNewContext() {
+    Object.keys(atlasBitmapsSync).forEach(function (k) {
+      var arr = atlasBitmapsSync[k];
+      for (var i = 0; i < arr.length; i++) {
+        if (arr[i]) gridRenderer.uploadSprite(k + ':' + i, arr[i]);
+      }
+    });
+    perImageTextures.clear();
+    perImageTexturesRefused.clear();
+    atlasInstancesBuiltFor = null;
+  }
+
+  // The GPU can drop the context (driver reset or update, a switch between
+  // GPUs). preventDefault() asks the browser to give it back; until then
+  // nothing can be drawn, and when it is back the grid is drawn again.
+  function onGridContextLost(e) {
+    e.preventDefault();
+    gridRenderer.loseContext();
+    perImageTextures.clear();
+  }
+  function onGridContextRestored() {
+    if (!gridRenderer.restoreContext()) return;
+    reuploadAfterNewContext();
+    scheduleGridRedraw();
   }
 
   // Sized to fit content (no overscan needed) or 3 viewports tall, whichever
@@ -1620,8 +1684,10 @@
         // Already on GPU? Nothing to wait on, nothing to redraw for.
         if (gridRenderer.hasTexture(aKey + ':' + spIdx)) return;
         // Atlas arrival is FIRST content for those tiles — redraw immediately.
-        loadSpriteAt(atlasH, spIdx).then(function (bm) {
-          if (bm && canvasEl) scheduleGridRedraw();
+        // Only when the texture took: a sheet the GPU refused would otherwise
+        // be asked for again by the redraw, which would redraw again, forever.
+        loadSpriteAt(atlasH, spIdx).then(function () {
+          if (canvasEl && gridRenderer.hasTexture(aKey + ':' + spIdx)) scheduleGridRedraw();
         }, function () {});
       });
     }
@@ -1661,24 +1727,25 @@
 
   function drawGridPerImage(W, dpr, scrollY, viewportH) {
     var bufBot = bufferTop + bufferH;
-    var tierH = pickPerImageTier(currentRowHeight * dpr);
-    var loadedTiers = [tierH].concat(PER_IMAGE_TIERS.filter(function (h) { return h < tierH; }).reverse());
     var tilesInBuffer = [];
+    var tileTiers = [];  // per tile: the tier it wants, 0 = atlas only
     for (var i = firstTileIndexAtOrBelow(bufferTop); i < lastTileRects.length; i++) {
       if (lastTileRects[i].y > bufBot) break;
       tilesInBuffer.push(lastTileRects[i]);
+      tileTiers.push(perImageTierForTile(lastTileRects[i], dpr));
     }
 
     // h800/h1600 tiles get a per-image h200 first: ~15 KB each, it lands
     // long before the real tier, while the h50 sprite that stands in for
     // smaller tiles (1.7 MB, 50 MB decoded, 1400 tiles) rarely beats it.
-    var stepTier = tierH >= 800 ? 200 : 0;
+    function stepTierFor(tierH) { return tierH >= 800 ? 200 : 0; }
 
     // Anything queued for a tile outside the buffer is stale (user scrolled past it).
     var keepKeys = new Set();
     for (var k = 0; k < tilesInBuffer.length; k++) {
-      keepKeys.add(tilesInBuffer[k].name + '|' + tierH);
-      if (stepTier) keepKeys.add(tilesInBuffer[k].name + '|' + stepTier);
+      if (!tileTiers[k]) continue;
+      keepKeys.add(tilesInBuffer[k].name + '|' + tileTiers[k]);
+      if (stepTierFor(tileTiers[k])) keepKeys.add(tilesInBuffer[k].name + '|' + stepTierFor(tileTiers[k]));
     }
     cancelPerImageLoadsExcept(keepKeys);
 
@@ -1689,7 +1756,10 @@
     drawnTierByName = new Map();
     for (var ti = 0; ti < tilesInBuffer.length; ti++) {
       var t = tilesInBuffer[ti];
+      var tierH = tileTiers[ti];
+      var stepTier = stepTierFor(tierH);
       warmNames.add(t.name);
+      var loadedTiers = PER_IMAGE_TIERS.filter(function (h) { return h <= tierH; }).reverse();
       var loadedKey = bestLoadedPerImageKey(t.name, loadedTiers);
       var drawnTier;
       if (loadedKey) {
@@ -1708,7 +1778,7 @@
       // Only chain a redraw if the IDEAL tier isn't already on GPU. Without
       // this, every redraw re-chains and an already-cached promise triggers
       // another redraw — infinite loop.
-      if (!gridRenderer.hasTexture('img:' + t.name + '|' + tierH)) {
+      if (tierH && !gridRenderer.hasTexture('img:' + t.name + '|' + tierH)) {
         loadPerImageTexture(t.name, tierH, distance).then(function (ok) {
           // null means the load was canceled — no new content arrived.
           // An arrival redraws at once (coalesced to one draw per frame):
@@ -1722,6 +1792,26 @@
     evictPerImage(warmNames);
 
     if (gridRenderer.beginFrame(W, bufferH, dpr, bufferTop)) gridRenderer.drawDynamic(batchesFromAccum(batchAccum));
+  }
+
+  // The per-photo tier for tile `t`: the smallest tier at least as tall as
+  // the tile is drawn (rows are stretched up to 1.5x to fill the width, so
+  // the nominal row height is not enough), stepping down past any tier whose
+  // texture would be wider than the GPU allows (a panorama) or that the GPU
+  // already refused. 0 when no tier fits: the tile is drawn from the atlas.
+  function perImageTierForTile(t, dpr) {
+    var loc = spriteMeta.imageMap[t.name];
+    var aspect = (loc ? loc.w : CANONICAL_H) / CANONICAL_H;
+    var maxSide = gridRenderer.maxTextureSide();
+    var wanted = pickPerImageTier(t.h * dpr);
+    for (var i = PER_IMAGE_TIERS.length - 1; i >= 0; i--) {
+      var tierH = PER_IMAGE_TIERS[i];
+      if (tierH > wanted) continue;
+      if (tierH * aspect > maxSide || tierH > maxSide) continue;
+      if (perImageTexturesRefused.has(t.name + '|' + tierH)) continue;
+      return tierH;
+    }
+    return 0;
   }
 
   // Largest per-image tier of `name` that the grid has as a texture, or 0.
@@ -1764,8 +1854,8 @@
     }
     spriteIdxs.forEach(function (spIdx) {
       if (gridRenderer.hasTexture(fallbackKey + ':' + spIdx)) return;
-      loadSpriteAt(atlasH, spIdx).then(function (bm) {
-        if (bm && canvasEl) scheduleGridRedraw();
+      loadSpriteAt(atlasH, spIdx).then(function () {
+        if (canvasEl && gridRenderer.hasTexture(fallbackKey + ':' + spIdx)) scheduleGridRedraw();
       }, function () {});
     });
     evictAtlasBitmaps(atlasH, spriteIdxs);
@@ -2539,6 +2629,12 @@
     thumbsEl.style.overflowAnchor = 'none';
 
     ensureCanvasAndSpacer(thumbsEl);
+    if (gridRenderer.unsupported()) {
+      thumbsEl.innerHTML = '<div style="padding:32px;text-align:center;color:#888">' +
+        'This browser cannot show the photo grid: it needs WebGL 2, which is turned off or not supported here.</div>';
+      canvasEl = null; spacerEl = null;
+      return;
+    }
     applyGridLayout(thumbsEl, W, viewportH, totalH);
     // Atlas instance buffers depend on tile rects; force rebuild on next draw.
     atlasInstancesBuiltFor = null;
