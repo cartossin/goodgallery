@@ -1883,16 +1883,20 @@
     if (gridRenderer.beginFrame(W, bufferH, dpr, bufferTop - glOriginY)) gridRenderer.drawDynamic(batchesFromAccum(batchAccum));
   }
 
-  // The per-photo tier for tile `t`: the smallest tier at least as tall as
-  // the tile is drawn (rows are stretched up to 1.5x to fill the width, so
-  // the nominal row height is not enough), stepping down past any tier whose
+  // The per-photo tier for tile `t`: the smallest tier that covers the height
+  // the tile is drawn at, give or take TIER_UPSCALE_ALLOWED. Rows are
+  // stretched to fill the width, usually by 5-30%, and the next tier up is
+  // four times the pixels to download and decode; a tile drawn up to 30%
+  // larger than its texture is not visibly softer, a row stretched further
+  // is. Then stepping down past any tier whose
   // texture would be wider than the GPU allows (a panorama) or that the GPU
   // already refused. 0 when no tier fits: the tile is drawn from the atlas.
+  var TIER_UPSCALE_ALLOWED = 1.3;
   function perImageTierForTile(t, dpr) {
     var loc = spriteMeta.imageMap[t.name];
     var aspect = (loc ? loc.w : CANONICAL_H) / CANONICAL_H;
     var maxSide = gridRenderer.maxTextureSide();
-    var wanted = pickPerImageTier(t.h * dpr);
+    var wanted = pickPerImageTier(t.h * dpr / TIER_UPSCALE_ALLOWED);
     for (var i = PER_IMAGE_TIERS.length - 1; i >= 0; i--) {
       var tierH = PER_IMAGE_TIERS[i];
       if (tierH > wanted) continue;
