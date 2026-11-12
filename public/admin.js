@@ -19,7 +19,8 @@ const state = {
   folderSegments: [],      // current folder, e.g. ['trips', '2024']
   folderInfo: null,        // last /api/admin/folder response
   imageNames: null,        // loaded lazily when the Images section opens
-  sessionOrigin: null,     // 'passkey' | 'link'
+  sessionOrigin: null,     // 'passkey' | 'server-link' | 'link'
+  canCreatePasskey: false, // only a session from a server-made link, while no passkey exists
   lastQueueRemaining: null,
   lastFolderRefreshAt: 0,
   uploadBatch: newUploadBatch(),  // counter for the upload list in this folder
@@ -885,12 +886,15 @@ function renderSessions(sessions, passkeyExists) {
   byId('revokeOthersButton').disabled = !canManage || others === 0;
   byId('loginLinkButton').disabled = !canManage;
   const createButton = byId('createPasskeyButton');
-  createButton.hidden = passkeyExists;
+  createButton.hidden = passkeyExists || !state.canCreatePasskey;
   createButton.disabled = !window.PublicKeyCredential;
   byId('accessHint').textContent = accessHintText(canManage, passkeyExists);
 }
 
 function accessHintText(canManage, passkeyExists) {
+  if (!passkeyExists && !state.canCreatePasskey) {
+    return 'No passkey yet. Only a browser signed in with a link made on the server ("node server.js login-link") can create it.';
+  }
   if (!passkeyExists) {
     return window.PublicKeyCredential
       ? 'No passkey yet. Create one to sign in without the server command. Only passkey sessions can create login links here; until then, make them on the server with "node server.js login-link".'
@@ -901,12 +905,17 @@ function accessHintText(canManage, passkeyExists) {
     : 'This browser signed in with a one-time link, so it cannot create links or sign out other sessions. Use a browser with the passkey for that.';
 }
 
+const SIGN_IN_METHODS = {
+  'passkey': 'passkey',
+  'server-link': 'login link from the server',
+  'link': 'login link',
+};
+
 function sessionRow(session, canManage) {
   const row = byId('sessionRowTemplate').content.firstElementChild.cloneNode(true);
   row.querySelector('.row-name').textContent = describeUserAgent(session.userAgent) + (session.current ? ' (this browser)' : '');
   if (session.userAgent) row.querySelector('.row-name').title = session.userAgent;
-  const via = session.origin === 'link' ? 'login link' : 'passkey';
-  row.querySelector('.row-meta').textContent = 'Signed in ' + timeAgo(session.createdAt) + ' with ' + via;
+  row.querySelector('.row-meta').textContent = 'Signed in ' + timeAgo(session.createdAt) + ' with ' + SIGN_IN_METHODS[session.origin];
   return row;
 }
 
@@ -969,6 +978,7 @@ async function startAuth() {
   const data = probe ? await probe.json().catch(() => ({})) : null;
   if (data && data.admin) {
     state.sessionOrigin = data.origin || 'passkey';
+    state.canCreatePasskey = !!data.canCreatePasskey;
     byId('version').textContent = data.version ? 'v' + data.version : '';
     showApp();
     return;
