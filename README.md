@@ -131,7 +131,8 @@ from its own environment only.
 3. Create a folder or upload images from the admin page, or copy a directory
    of images into the galleries root, give it to the service user
    (`chown -R goodgallery:goodgallery <folder>`: a folder the service
-   cannot write never finishes building), and press **Rescan all folders**
+   cannot write cannot be built, and the admin page says so), and press
+   **Rescan all folders**
    (under Troubleshooting on the admin page).
 4. Open `http://your-host:3000/` (or whatever your proxy serves); the
    server prints the address when it starts. The first visit to a folder
@@ -145,8 +146,13 @@ Remove it from the originals before adding them if it should stay private.
 A hidden folder is only left out of listings; anyone with its address can
 open it.
 
-Supported source formats: JPEG, PNG, GIF, WebP, AVIF. Images libvips cannot
-read get a red placeholder tile instead of breaking the gallery.
+Supported source formats: JPEG, PNG, GIF, WebP, AVIF. A photo libvips cannot
+read, one above the pixel limit (`MAX_SOURCE_MEGAPIXELS`), or one whose
+conversion failed gets a red placeholder tile instead of breaking the
+gallery, and the admin page names it and says why. Rescanning the folder
+tries failed conversions again. A photo whose file name is longer than 233
+bytes is left out, with a line in the log: its renditions' names would not
+fit the filesystem's 255-byte limit.
 
 ## Admin page
 
@@ -154,8 +160,9 @@ read get a red placeholder tile instead of breaking the gallery.
 shows the build queue, and for the current folder: counts and build state,
 a notice when files on disk are not in the gallery yet, subfolders with
 hide toggles, uploads of files or whole folders (chunked, several files in
-flight), the image list, and the folder's trash. A chunk that fails is sent
-again, so an upload survives a brief network drop; it does not survive
+flight), the image list, and the folder's trash. A chunk that fails because
+of the network or a server error is sent again, so an upload survives a
+brief network drop; a chunk the server refuses is not. An upload does not survive
 reloading or closing the page, which starts the file over (the chunks
 already sent are removed after 24 hours). Folders can be
 created, hidden from public listings (they stay reachable by direct URL),
@@ -166,8 +173,12 @@ The Sign-ins card lists every signed-in browser. **Create login link** mints
 a one-time URL that signs in another browser; useful on a device that
 cannot use your passkey. Only passkey sessions can mint links from the
 page; `node server.js login-link` on the server always can. **Sign out all
-other sessions** ends every session but the current one. Sessions do not
-expire on their own.
+other sessions** ends every session but the current one and cancels every
+login link that has not been used yet. Sessions do not expire on their own.
+
+The passkey and the sessions are files in the state dir (`passkey.json`,
+`sessions.json`). If one of them is damaged the server refuses to start
+and names the file, rather than treating it as absent.
 
 ## On-disk layout
 
@@ -178,19 +189,20 @@ the originals:
 <folder>/<image>.jpg
 <folder>/gg/<image>.jpg.h200.avif     per-image renditions, AVIF (h200..h1600)
 <folder>/gg/<image>.jpg.h5.v          small lossless copies, the atlas input (h5..h100)
-<folder>/gg/atlas_<hash>/             sprite atlases + imagemap for this build
+<folder>/gg/atlas_<id>/               sprite atlases + imagemap for this build
 <folder>/gg/_manifest.json            the committed listing a pageview renders from
 <folder>/gg/_sources.json             size and time of each photo at the last build
+<folder>/gg/_placeholders.json        photos shown as placeholders, and why
 <folder>/gg/trash/                    soft-deleted images and folders
 <folder>/gg/hidden                    sentinel: folder is hidden from listings
 ```
 
 `trash/` and `hidden` are user state; keep them. Everything else in `gg/` is
 built from the photos. Deleting all of it at once is safe: the next visit
-rebuilds the folder. Deleting only part of it, such as one `atlas_` directory
-or some renditions, is not noticed, and the folder stays broken; to rebuild
-a folder, delete all of it but `trash/` and `hidden`, or use **Rebuild from
-scratch** on the admin page.
+rebuilds the folder. Deleting only part of it is repaired too: a missing
+`atlas_` directory on the next visit, missing renditions at the next rescan
+or restart. To rebuild a folder completely, delete all of it but `trash/`
+and `hidden`, or use **Rebuild from scratch** on the admin page.
 
 A manifest is only written after every file it references exists, so an
 interrupted build never leaves a half-served gallery; it just rebuilds.
@@ -224,6 +236,8 @@ is refused as ambiguous).
 | `SPRITE_CELL_W_MAX` | `600` | Widest atlas cell, in pixels |
 | `SPRITE_ENCODE_PARALLEL` | `4` | Atlas images encoded at once while a folder bakes |
 | `AVIF_MAX_DIM` | `16384` | libheif per-axis limit; extreme panoramas are bounded to this width |
+| `MAX_SOURCE_MEGAPIXELS` | `300` | Photos with more pixels than this get a placeholder instead of being decoded (memory follows the pixel count, not the file size) |
+| `VIPS_TIMEOUT_SECONDS` | `600` | A vips process running longer than this is stopped and its photo counted as a failed conversion |
 | `CHUNK_SIZE` | `16MiB` | Upload chunk size (64 KiB to 1 GiB) |
 | `MAX_UPLOAD_BYTES` | `64GiB` | Largest file the uploader accepts |
 | `VIPS_CONCURRENCY` | `1` | Threads inside each vips process. Builds run several processes instead (`BUILD_CONCURRENCY`) |
@@ -243,11 +257,15 @@ is refused as ambiguous).
   `lib/sources.js` the record of its photos at the last build
   (`_sources.json`).
 - `lib/rebuild.js` is the one place a folder's build is committed, using
-  `lib/build.js` (per-image renditions, through the libvips helpers in
-  `lib/vips.js`), `lib/build_queue.js` and `lib/atlas.js` (atlases, baked
-  in `lib/sprite_worker.js`).
+  `lib/build_plan.js` (which sizes each photo still needs), `lib/build.js`
+  (per-image renditions, through the libvips helpers in `lib/vips.js`),
+  `lib/build_queue.js`, `lib/placeholders.js` (which photos are shown as
+  placeholders, and why) and `lib/atlas.js` (atlases, baked in
+  `lib/sprite_worker.js`).
 - `lib/auth.js`, `lib/webauthn.js` and `lib/admin_api.js` handle the passkey
-  admin; `lib/upload.js` the chunked uploader; `lib/trash.js` the trash.
+  admin; `lib/upload.js` the chunked uploader; `lib/trash.js` the trash;
+  `lib/place.js` puts a file under a name without replacing one that is
+  there.
 - `public/gallery.js` is the client: layout, WebGL grid, focus view.
 - `public/admin.html`, `admin.css`, `admin.js` are the admin panel.
 
