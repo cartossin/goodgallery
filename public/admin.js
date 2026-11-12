@@ -297,8 +297,12 @@ function renderFolderUnavailable(segments) {
 }
 
 // One line for a folder's build state, with a CSS class for its colour.
-function describeBuild(build, imageCount) {
+// A folder inside a running tree rescan or rebuild that has no build at
+// that moment is the walk's work in progress (its old build was deleted
+// when its turn came, or its atlas is being packed), so it says "Building".
+function describeBuild(build, imageCount, segments) {
   if (build.queued > 0) return { text: 'Building, ' + plural(build.queued, 'image') + ' left', className: 'status-busy' };
+  if (!build.built && insideTreeWalk(segments)) return { text: 'Building', className: 'status-busy' };
   if (!build.built) return { text: 'Not built yet', className: 'status-none' };
   if (imageCount === 0) return { text: 'Built', className: 'status-built' };
   return { text: 'Built ' + (build.builtAt ? timeAgo(build.builtAt) : ''), className: 'status-built' };
@@ -311,7 +315,7 @@ function renderFolderSummary(info) {
 
   const facts = byId('folderFacts');
   facts.replaceChildren();
-  const build = describeBuild(info.build, info.imageCount);
+  const build = describeBuild(info.build, info.imageCount, segments);
   const buildSpan = document.createElement('span');
   buildSpan.className = build.className;
   buildSpan.textContent = build.text;
@@ -377,7 +381,7 @@ function subfolderRow(subfolder) {
   link.textContent = subfolder.name;
   folderLink(link, segments);
 
-  const build = describeBuild(subfolder.build, subfolder.imageCount);
+  const build = describeBuild(subfolder.build, subfolder.imageCount, segments);
   const meta = row.querySelector('.row-meta');
   const counts = [];
   const hasOnlyFolders = subfolder.imageCount === 0 && subfolder.folderCount > 0;
@@ -443,6 +447,13 @@ function treeWalkRunning(segments) {
   const key = folderRelativePath(segments);
   return state.treeWalkStarting === key ||
     state.treeWalks.rescanning.includes(key) || state.treeWalks.rebuilding.includes(key);
+}
+
+// Is this folder the top of a running tree walk, or below one?
+function insideTreeWalk(segments) {
+  const key = folderRelativePath(segments);
+  const walks = state.treeWalks.rescanning.concat(state.treeWalks.rebuilding);
+  return walks.some(top => top === '' || key === top || key.startsWith(top + '/'));
 }
 
 function renderTreeWalkButtons() {
@@ -703,10 +714,16 @@ function renderQueue(queue) {
   status.textContent = busy ? parts.join(' · ') : 'Idle';
   status.className = 'queue-status ' + (busy ? 'busy' : 'idle');
   byId('clearQueueButton').disabled = queue.remaining === 0;
+  const walksChanged = !sameNames(state.treeWalks.rescanning, queue.rescanning) || !sameNames(state.treeWalks.rebuilding, queue.rebuilding);
   state.treeWalks = { rescanning: queue.rescanning, rebuilding: queue.rebuilding };
   renderTreeWalkButtons();
-  if (state.folderLoadFailed) loadFolder();
+  // A walk that starts or ends changes what the folder's rows should say.
+  if (state.folderLoadFailed || walksChanged) loadFolder();
   else refreshFolderIfBuildMoved(queue.remaining);
+}
+
+function sameNames(first, second) {
+  return first.length === second.length && first.every((name, index) => name === second[index]);
 }
 
 // Keep the folder's build labels current without re-reading it on every poll:
