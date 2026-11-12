@@ -385,16 +385,7 @@
     if (!el) return;
     if (focusedIdx > 0) {
       el.innerHTML = '<button class="zoom-back" title="Up to gallery" aria-label="Up to gallery">↑</button>';
-      el.querySelector('button').addEventListener('click', function () {
-        // Anchor the grid scroll on the image we were just viewing. renderGallery
-        // reads cachedAnchorName during relayout and sets scrollTop to put that
-        // image's row at the viewport top.
-        if (focusedIdx > 0 && images[focusedIdx]) {
-          cachedAnchorName = images[focusedIdx];
-        }
-        var lv = availableLevels()[lastGridLevelIdx];
-        location.hash = lv && lv.hash ? '#' + lv.hash : '#fit';
-      });
+      el.querySelector('button').addEventListener('click', returnToGrid);
       return;
     }
     var levels = availableLevels();
@@ -504,6 +495,11 @@
     mainSrcHeight: function () { return mainDrawSrc ? mainDrawSrc.sh : null; },
     perImageTextureKeys: function () { return Array.from(perImageTextures); },
     perImageBitmapKeys: function () { return Array.from(perImageBitmapsSync.keys()); },
+    // Which view is showing and whether the film strip is still animating,
+    // for the navigation checks.
+    viewer: function () {
+      return { focusedIdx: focusedIdx, commandedIdx: commandedIdx, chasing: focusChaseRaf !== null };
+    },
     // Per-image grid tiles with their ideal-tier texture ready, split into
     // on-screen and whole-buffer counts. Lets a harness time "visible done".
     // On-screen tiles the current draw path would put content under (any
@@ -1752,7 +1748,8 @@
   var filmTotalW  = 0;
   var filmPadL    = 0;    // pads so the first/last tile can sit at center
   var filmPadR    = 0;
-  var filmScrollPending = false;
+  var filmRedrawRaf = null;       // scheduled filmstrip + main image redraw
+  var mainImageDecayRaf = null;   // momentum after a swipe on the main image
   var focusInProgrammaticScroll = false;
 
   function buildFilmstripLayout() {
@@ -1805,9 +1802,11 @@
   // rAF chase toward filmScrollForIdx1(commandedIdx). Reads commandedIdx live,
   // so successive shifts bump the target without restarting the chase.
   var focusChaseRaf = null;
+  var focusChasePreviousScrollLeft = NaN;  // scrollLeft before the last step
   function startFocusChase() {
     focusInProgrammaticScroll = true;
     if (focusChaseRaf) return;
+    focusChasePreviousScrollLeft = NaN;
     focusChaseRaf = requestAnimationFrame(focusChaseTick);
   }
   function focusChaseTick() {
@@ -1820,11 +1819,11 @@
     var target = filmScrollForIdx1(commandedIdx, W);
     var cur = filmstripEl.scrollLeft;
     var diff = target - cur;
-    // Exit when we are within a pixel. The prior threshold of 0.5 combined
-    // with a min-step clamp of 1 ping-ponged forever on platforms where the
-    // browser rounds scrollLeft to an integer: target=X.5, cur=X → step
-    // clamped to +1 → cur=X+1 → step clamped to -1 → cur=X → ….
-    if (Math.abs(diff) < 1) {
+    // The chase ends when the strip is within a pixel of the target, or when
+    // the last step did not move it at all (the target lies past the end the
+    // browser lets the strip scroll to). Every other step moves the strip at
+    // least one pixel closer, so the chase always ends.
+    if (Math.abs(diff) < 1 || cur === focusChasePreviousScrollLeft) {
       filmstripEl.scrollLeft = target;
       // Authoritative settle: the commanded tile is the focus. drawFilmstrip
       // re-derives focusedIdx from scrollLeft, and a browser-rounded
@@ -1834,13 +1833,46 @@
       focusInProgrammaticScroll = false;
       return;
     }
-    // No step-magnitude clamp — modern browsers handle fractional scrollLeft,
-    // and the 0.25*diff geometric progression converges fast enough on its own.
-    filmstripEl.scrollLeft = cur + diff * 0.25;
+    // A quarter of the remaining distance, but at least one whole pixel:
+    // browsers round scrollLeft, and with under 2 px to go a quarter step
+    // rounds back to the same position, so the chase would never arrive.
+    // Never more than the remaining distance, so it cannot overshoot.
+    var stepSize = Math.min(Math.abs(diff), Math.max(1, Math.abs(diff) * 0.25));
+    focusChasePreviousScrollLeft = cur;
+    filmstripEl.scrollLeft = cur + (diff > 0 ? stepSize : -stepSize);
     focusChaseRaf = requestAnimationFrame(focusChaseTick);
   }
 
+  // Leaving the photo view, or rebuilding it after a resize, must stop
+  // everything the old view scheduled. An animation frame or timer that ran
+  // later would read the detached film strip, whose scrollLeft is 0, decide
+  // that photo 1 is open and rewrite the URL to it.
+  function teardownPhotoView() {
+    if (focusChaseRaf) cancelAnimationFrame(focusChaseRaf);
+    focusChaseRaf = null;
+    focusInProgrammaticScroll = false;
+    if (filmRedrawRaf) cancelAnimationFrame(filmRedrawRaf);
+    filmRedrawRaf = null;
+    if (mainImageDecayRaf) cancelAnimationFrame(mainImageDecayRaf);
+    mainImageDecayRaf = null;
+    if (pendingHashTimer) clearTimeout(pendingHashTimer);
+    pendingHashTimer = null;
+    if (focusStableTimer) clearTimeout(focusStableTimer);
+    focusStableTimer = null;
+    mainEl = null;
+    filmstripEl = null;
+    filmCanvasEl = null;
+    filmSpacerEl = null;
+    filmTilePos = null;
+    filmTileW = null;
+    mainDrawSrc = null;
+  }
+
   function setupFilmstripFocus(thumbsEl) {
+    // A resize or rotation rebuilds the view; a chase still under way keeps
+    // the photo it was heading for.
+    var chaseTargetIdx = focusChaseRaf ? commandedIdx : 0;
+    teardownPhotoView();
     var W = layoutWidth(), H = layoutHeight();
     var mainH = Math.max(120, H - FILM_H);
 
@@ -1908,20 +1940,26 @@
     var target = filmScrollForIdx1(focusedIdx, W);
     filmstripEl.scrollLeft = target;
     commandedIdx = focusedIdx;
+    // Rebuilding the view cancelled any pending URL update for the photo shown.
+    var photoHash = '#' + encodeURIComponent(images[focusedIdx]);
+    if (location.hash !== photoHash) scheduleHashUpdate(photoHash);
     renderZoomControl();
 
     drawFilmstrip();
     drawMainImage();
+    if (chaseTargetIdx && chaseTargetIdx !== focusedIdx) {
+      commandedIdx = chaseTargetIdx;
+      startFocusChase();
+    }
   }
 
   // Redraw the filmstrip and main image on the next frame. Scroll events and
   // sprite arrivals share this so a redraw always reads the CURRENT scroll
   // position, not one captured when a load was queued.
   function scheduleFilmstripRedraw() {
-    if (filmScrollPending) return;
-    filmScrollPending = true;
-    requestAnimationFrame(function () {
-      filmScrollPending = false;
+    if (filmRedrawRaf) return;
+    filmRedrawRaf = requestAnimationFrame(function () {
+      filmRedrawRaf = null;
       drawFilmstrip();
       drawMainImage();
     });
@@ -2252,12 +2290,12 @@
   function setupMainImageGestures() {
     if (!mainEl) return;
     var startX = 0, startY = 0, startT = 0, startScrollLeft = 0;
-    var dragging = false, multiTouch = false, decayRaf = null;
+    var dragging = false, multiTouch = false;
     var lastX = 0, lastT = 0, velX = 0;  // px/ms
     var lastDragEndAt = 0;
 
     function stopDecay() {
-      if (decayRaf) { cancelAnimationFrame(decayRaf); decayRaf = null; }
+      if (mainImageDecayRaf) { cancelAnimationFrame(mainImageDecayRaf); mainImageDecayRaf = null; }
     }
     function startDecay() {
       stopDecay();
@@ -2266,15 +2304,15 @@
       function step(now) {
         var dt = Math.max(1, now - prevT);
         prevT = now;
-        if (!filmstripEl) { decayRaf = null; return; }
+        if (!filmstripEl) { mainImageDecayRaf = null; return; }
         // Decay rate ~exp(-dt/180ms). Stop when below ~0.04 px/ms (~24 px/s).
         var decay = Math.exp(-dt / 180);
         v *= decay;
-        if (Math.abs(v) < 0.04) { decayRaf = null; return; }
+        if (Math.abs(v) < 0.04) { mainImageDecayRaf = null; return; }
         filmstripEl.scrollLeft -= v * dt;
-        decayRaf = requestAnimationFrame(step);
+        mainImageDecayRaf = requestAnimationFrame(step);
       }
-      decayRaf = requestAnimationFrame(step);
+      mainImageDecayRaf = requestAnimationFrame(step);
     }
 
     mainEl.addEventListener('touchstart', function (e) {
@@ -2448,23 +2486,6 @@
     drawCanvasForScroll();
   }
 
-  function displaythumbs() {
-    showAdminBar();
-    focusedIdx = 0;
-    setText('counter', '');
-    // Apply current grid level so the render matches the toolbar label.
-    var levels = availableLevels();
-    var idx = lastGridLevelIdx;
-    if (idx > levels.length - 1) idx = levels.length - 1;
-    currentLevelIdx = idx;
-    var lv = levels[idx];
-    if (lv && lv.h !== 'focus') levelTargetH = lv.h;
-    document.body.classList.add('thumb-view');
-    document.body.classList.remove('image-view');
-    renderGallery();
-    renderZoomControl();
-  }
-
   // ---------- hash routing ----------
   // The URL fragment as text. A fragment with a malformed escape ("#%")
   // cannot be decoded; it is treated as no fragment, so the grid still loads.
@@ -2473,55 +2494,63 @@
     catch (_) { return ''; }
   }
 
+  // The fragment names a zoom level (#fit, #size4), a photo (#name.jpg) or
+  // nothing. An empty or unknown fragment shows the grid at the default zoom.
+  // Zoom levels are checked first; photo names always carry an extension, so
+  // they cannot collide with them.
   function refreshfromhash() {
-    showAdminBar();
     var raw = hashText();
-    // #fit and #sizeN → ZOOM_LEVELS entries; bare names → focus.
     var levels = availableLevels();
-    var matchedIdx = -1;
     for (var li = 0; li < levels.length; li++) {
-      if (levels[li].hash && levels[li].hash === raw) { matchedIdx = li; break; }
+      if (levels[li].hash && levels[li].hash === raw) { showGridView(li); return; }
     }
-    if (matchedIdx >= 0) {
-      currentLevelIdx = matchedIdx;
-      lastGridLevelIdx = matchedIdx;
-      var lv0 = levels[matchedIdx];
-      if (lv0.h !== 'focus') levelTargetH = lv0.h;
-      focusedIdx = 0;
-      document.body.classList.add('thumb-view');
-      document.body.classList.remove('image-view');
-      renderGallery();
-      renderZoomControl();
-      return;
+    var photoIdx = photoIndexOfName(raw);
+    if (photoIdx > 0) showPhotoView(photoIdx);
+    else showGridView(defaultLevelIdx());
+  }
+
+  function photoIndexOfName(name) {
+    if (!name) return 0;
+    for (var i = 1; i <= lastimagevalue; i++) {
+      if (images[i] === name) return i;
     }
-    if (!raw || raw.charAt(0) === ':') {
-      var didx = defaultLevelIdx();
-      currentLevelIdx = didx;
-      lastGridLevelIdx = didx;
-      var dlv = levels[didx];
-      if (dlv.h !== 'focus') levelTargetH = dlv.h;
-      focusedIdx = 0;
-      document.body.classList.add('thumb-view');
-      document.body.classList.remove('image-view');
-      renderGallery();
-      renderZoomControl();
-    } else {
-      // #filename → focus on that image.
-      for (var i = 1; i <= lastimagevalue; i++) {
-        if (raw === images[i]) {
-          focusedIdx = i;
-          document.body.classList.add('image-view');
-          document.body.classList.remove('thumb-view');
-          renderGallery();
-          renderZoomControl();
-          return;
-        }
-      }
-      // Unknown name — fall through to grid.
-      focusedIdx = 0;
-      renderGallery();
-      renderZoomControl();
-    }
+    return 0;
+  }
+
+  // Each view switch starts from a torn-down photo view, so nothing the
+  // previous photo view scheduled can act on the new one. The admin bar is
+  // refreshed last, after focusedIdx says which view is showing.
+  function showGridView(levelIdx) {
+    teardownPhotoView();
+    currentLevelIdx = levelIdx;
+    lastGridLevelIdx = levelIdx;
+    var lv = availableLevels()[levelIdx];
+    if (lv.h !== 'focus') levelTargetH = lv.h;
+    focusedIdx = 0;
+    setText('counter', '');
+    document.body.classList.add('thumb-view');
+    document.body.classList.remove('image-view');
+    renderGallery();
+    renderZoomControl();
+    showAdminBar();
+  }
+
+  function showPhotoView(photoIdx) {
+    teardownPhotoView();
+    focusedIdx = photoIdx;
+    document.body.classList.add('image-view');
+    document.body.classList.remove('thumb-view');
+    renderGallery();
+    renderZoomControl();
+    showAdminBar();
+  }
+
+  // Back to the grid at the zoom the visitor came from, with the photo just
+  // viewed at the top.
+  function returnToGrid() {
+    if (focusedIdx > 0 && images[focusedIdx]) cachedAnchorName = images[focusedIdx];
+    var lv = availableLevels()[lastGridLevelIdx];
+    location.hash = lv && lv.hash ? '#' + lv.hash : '#fit';
   }
 
   // ---------- admin bar ----------
@@ -2602,18 +2631,7 @@
     // Initial route after the binary imagemap loads (or fails — renderGallery
     // has its own placeholder for spriteMeta=null).
     function runInitialRoute() {
-      var raw = hashText();
-      if (raw && (raw === 'fit' || raw.match(/^size\d+$/))) {
-        refreshfromhash();
-      } else if (!raw || raw.charAt(0) === ':') {
-        refreshfromhash();
-      } else if (lastimagevalue > 0) {
-        var found = 0;
-        for (var j = 1; j <= lastimagevalue; j++) if (raw === images[j]) { found = 1; break; }
-        if (found) refreshfromhash(); else displaythumbs();
-      } else {
-        displaythumbs();
-      }
+      refreshfromhash();
       // Re-render after two rAFs so layoutHeight measures with chrome settled.
       requestAnimationFrame(function () {
         requestAnimationFrame(function () { scheduleRender(); });
