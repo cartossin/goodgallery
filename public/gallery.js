@@ -25,10 +25,20 @@
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ token: token })
     }).then(function (r) {
-      if (r.ok) location.reload();
-      // On failure (expired / already used) we just stay on the page,
-      // unauthenticated. No alert here — the gallery is still usable for
-      // anyone, admin or not.
+      if (r.ok) { location.reload(); return; }
+      // Expired, already used or mistyped: stay on the gallery, signed out,
+      // and say why, or the visitor cannot tell a failed link from a slow one.
+      // A dialog, because the top controls hide over a grid of photos.
+      var dialog = document.createElement('dialog');
+      dialog.textContent = 'This sign-in link is invalid or has expired. A link works once, within 10 minutes of being made. ';
+      var form = document.createElement('form');
+      form.method = 'dialog';
+      var okButton = document.createElement('button');
+      okButton.textContent = 'OK';
+      form.appendChild(okButton);
+      dialog.appendChild(form);
+      document.body.appendChild(dialog);
+      dialog.showModal();
     }).catch(function () {});
   })();
 

@@ -14,10 +14,12 @@ ProtectSystem=full
 UMask=0077
 Restart=on-failure
 RestartSec=2
-Environment=NODE_ENV=production
-Environment=PORT=3000
-Environment=GALLERIES_ROOT=/var/lib/goodgallery/galleries
-Environment=STATE_DIR=/var/lib/goodgallery
+# Settings (PORT, GALLERIES_ROOT, STATE_DIR, ...), one VARIABLE=value per
+# line; see "Configuration" in the README. `node server.js login-link` reads
+# the same file, so the link it makes matches the service. The leading "-"
+# makes the file optional: without it the defaults apply (port 3000, state
+# in /var/lib/goodgallery, galleries in /var/lib/goodgallery/galleries).
+EnvironmentFile=-/etc/goodgallery.env
 
 [Install]
 WantedBy=multi-user.target
