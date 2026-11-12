@@ -43,8 +43,7 @@
   // count u32 LE | widths (count × u16 LE) | NUL-terminated UTF-8 names.
   async function loadImagemap() {
     if (!window.imagemapURL) return false;
-    var resp = await fetch(window.imagemapURL, { credentials: 'same-origin' });
-    if (!resp.ok) throw new Error('imagemap fetch failed: ' + resp.status);
+    var resp = await fetchOk(window.imagemapURL, { credentials: 'same-origin' });
     var buf = await resp.arrayBuffer();
     var dv = new DataView(buf);
     var bytes = new Uint8Array(buf);
@@ -60,6 +59,7 @@
     var imageMap = {};
     var pos = namesBase;
     for (var i = 0; i < count; i++) {
+      if (pos >= bytes.length) throw new Error('imagemap truncated: ' + i + ' of ' + count + ' names');
       var end = pos;
       while (end < bytes.length && bytes[end] !== 0) end++;
       var name = dec.decode(bytes.subarray(pos, end));
@@ -76,10 +76,64 @@
 
   var GG_DIR = 'gg';
   var focusedIdx = 0;       // 0 = grid view; 1..N = focused image
+  var photoListFailed = false;  // the imagemap could not be loaded after all retries
 
 
   function $(id) { return document.getElementById(id); }
   function setText(id, t) { var e = $(id); if (e) e.textContent = t; }
+
+  // ---------- failed loads ----------
+  // One policy for every load the viewer depends on (the photo list, atlas
+  // sheets, per-photo tiles): a failed attempt is tried again after 0.5, 2
+  // and 6 seconds; after that the load gives up and the visitor is told.
+  // A failure never schedules a redraw, so a load that keeps failing cannot
+  // turn into a request loop; the next redraw the visitor causes may try it
+  // again.
+  var RETRY_DELAYS_MS = [500, 2000, 6000];
+
+  // fetch() that treats an HTTP error status as a failure.
+  function fetchOk(url, options) {
+    return fetch(url, options).then(function (response) {
+      if (!response.ok) throw new Error('HTTP ' + response.status + ' for ' + url);
+      return response;
+    });
+  }
+
+  // Runs attempt() until it resolves, retrying on rejection with the delays
+  // above. Resolves null as soon as `signal` aborts (the load is no longer
+  // wanted); rejects with the last error once the retries are used up.
+  function withRetries(attempt, signal) {
+    return new Promise(function (resolve, reject) {
+      var failures = 0;
+      function run() {
+        if (signal && signal.aborted) { resolve(null); return; }
+        attempt().then(resolve, function (err) {
+          if (signal && signal.aborted) { resolve(null); return; }
+          if (failures >= RETRY_DELAYS_MS.length) { reject(err); return; }
+          var timer = setTimeout(run, RETRY_DELAYS_MS[failures]);
+          failures++;
+          if (signal) signal.addEventListener('abort', function () { clearTimeout(timer); resolve(null); }, { once: true });
+        });
+      }
+      run();
+    });
+  }
+
+  // A plain message at the bottom of the window, shown once, when a photo or
+  // an atlas sheet could not be loaded after all retries.
+  var loadProblemShown = false;
+  function showLoadProblem() {
+    if (loadProblemShown) return;
+    loadProblemShown = true;
+    var box = document.createElement('div');
+    box.id = 'loadproblem';
+    box.setAttribute('role', 'status');
+    box.textContent = 'Some photos could not be loaded. Reload the page to try again.';
+    box.style.cssText = 'position:fixed; left:50%; bottom:48px; transform:translateX(-50%); z-index:10;' +
+      ' max-width:calc(100% - 32px); padding:8px 14px; border-radius:6px; background:#262626; color:#eee;' +
+      ' font-size:14px; box-shadow:0 2px 8px rgba(0,0,0,.6);';
+    document.body.appendChild(box);
+  }
 
   // ---------- realtime monitor ----------
   function note(msg) {
@@ -632,18 +686,17 @@
   // Fetch + decode one sprite. Resolves null if `signal` was aborted, even
   // after the bytes arrived: the decode is skipped when the abort came
   // first, and closed when it came during the decode.
+  // Failed attempts are retried (withRetries); rejects once they give up.
   function fetchSpriteBitmap(atlas, spriteIdx, signal) {
     var url = folderURL + GG_DIR + '/' + atlas.sprites[spriteIdx].file;
-    return fetch(url, { credentials: 'same-origin', signal: signal })
-      .then(function (r) { return r.blob(); })
-      .then(function (b) { return signal && signal.aborted ? null : createImageBitmap(b); })
-      .then(function (bm) {
-        if (bm && signal && signal.aborted) { closeBitmap(bm); return null; }
-        return bm;
-      }, function (err) {
-        if (signal && signal.aborted) return null;
-        throw err;
-      });
+    return withRetries(function () {
+      return fetchOk(url, { credentials: 'same-origin', signal: signal })
+        .then(function (r) { return r.blob(); })
+        .then(function (b) { return signal && signal.aborted ? null : createImageBitmap(b); });
+    }, signal).then(function (bm) {
+      if (bm && signal && signal.aborted) { closeBitmap(bm); return null; }
+      return bm;
+    });
   }
 
   // ---- floor tier --------------------------------------------------------
@@ -691,7 +744,10 @@
       // First content for any tile that had nothing — redraw now. (Only if
       // the upload took: a redraw with no texture would just refetch.)
       if (canvasEl && gridRenderer.hasTexture(key + ':' + spriteIdx)) scheduleGridRedraw();
-    }, function () { floorSpritesLoading.delete(spriteIdx); });
+    }, function () {
+      floorSpritesLoading.delete(spriteIdx);
+      showLoadProblem();
+    });
   }
 
   // Dynamic batches drawing, from the floor tier, every buffered tile whose
@@ -731,6 +787,12 @@
       atlasBitmapsSync[key][spriteIdx] = bm;
       gridRenderer.uploadSprite(key + ':' + spriteIdx, bm);
       return bm;
+    }, function (err) {
+      // Given up after the retries: forget the job, so a later redraw the
+      // visitor causes (a scroll, a zoom) can try the sheet again.
+      if (spriteLoads[key][spriteIdx] === job) delete spriteLoads[key][spriteIdx];
+      showLoadProblem();
+      throw err;
     });
     spriteLoads[key][spriteIdx] = job;
     return job.promise;
@@ -817,11 +879,13 @@
     // limits, HTTP/2 stream weights); ignored where unsupported.
     var fetchOpts = { credentials: 'same-origin', priority: job.priority === 0 ? 'high' : 'low' };
     if (job.ctrl) fetchOpts.signal = job.ctrl.signal;
-    fetch(job.url, fetchOpts)
-      .then(function (r) { return r.blob(); })
-      // Cancelled after the bytes arrived: skip the decode, it's the expensive part.
-      .then(function (b) { return job.ctrl && job.ctrl.signal.aborted ? null : createImageBitmap(b); })
-      .catch(function () { return null; })
+    withRetries(function () {
+      return fetchOk(job.url, fetchOpts)
+        .then(function (r) { return r.blob(); })
+        // Cancelled after the bytes arrived: skip the decode, it's the expensive part.
+        .then(function (b) { return job.ctrl && job.ctrl.signal.aborted ? null : createImageBitmap(b); });
+    }, job.ctrl && job.ctrl.signal)
+      .catch(function () { showLoadProblem(); return null; })
       .then(function (bm) {
         perImageInFlight.delete(job);
         _perImageLoads(job.wantBitmap).delete(job.key);
@@ -2419,6 +2483,13 @@
       canvasEl = null; spacerEl = null;
       return;
     }
+    if (photoListFailed) {
+      thumbsEl.innerHTML = '<div style="padding:32px;text-align:center;color:#888">' +
+        'The list of photos in this folder could not be loaded. Reload the page to try again.</div>';
+      thumbsEl.style.cssText = '';
+      canvasEl = null; spacerEl = null;
+      return;
+    }
     if (!window.spriteMeta) {
       thumbsEl.innerHTML = '<div style="padding:32px;text-align:center;color:#888">' +
         '<div id="buildstatus-main" style="font-size:16px;margin-bottom:8px">Building LoD cache…</div>' +
@@ -2659,12 +2730,10 @@
     if (window.imagemapURL && window.spriteMeta) {
       var thumbsEl = $('thumbs');
       if (thumbsEl) thumbsEl.innerHTML = '<div style="padding:32px;text-align:center;color:#888">Loading…</div>';
-      loadImagemap().then(function () {
-        runInitialRoute();
-      }).catch(function (e) {
+      withRetries(loadImagemap).catch(function (e) {
         console.warn('[imagemap] load failed:', e);
-        runInitialRoute();
-      });
+        photoListFailed = true;
+      }).then(runInitialRoute);
     } else {
       runInitialRoute();
     }
