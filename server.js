@@ -33,7 +33,7 @@ if (command === 'login-link') {
 }
 
 async function startServer() {
-  const config = await import('./lib/config.js');
+  const config = await import('./lib/config.js');  // exits on an invalid setting
   config.prepareDataDirectories();
   const { preflightVips } = await import('./lib/vips.js');
   preflightVips();
@@ -48,6 +48,10 @@ async function startServer() {
       console.error('[handler error]', req.method, req.url, err);
       if (!res.headersSent) sendText(res, 500, 'internal error');
     });
+  });
+  server.on('error', error => {
+    console.error(`[fatal] cannot listen on ${config.HOST} port ${config.PORT}: ${listenErrorText(error)}`);
+    process.exit(1);
   });
 
   // Startup is O(1): LoDs and atlases build on first pageview. An interrupted
@@ -67,4 +71,12 @@ async function startServer() {
       console.log('  no admin yet: run `node server.js login-link` and open the link it prints');
     }
   });
+}
+
+function listenErrorText(error) {
+  if (error.code === 'EADDRINUSE') return 'the port is in use by another program. Set PORT to a free port.';
+  if (error.code === 'EACCES') return 'permission denied (ports below 1024 need privileges). Set PORT to 1024 or above.';
+  if (error.code === 'EADDRNOTAVAIL') return 'this machine has no such address. Set HOST to one of its addresses, or 0.0.0.0 for all.';
+  if (error.code === 'ENOTFOUND' || error.code === 'EAI_AGAIN') return 'HOST is not an address or a name that resolves. Set HOST to an IP address, or 0.0.0.0 for all.';
+  return error.message;
 }
