@@ -3,6 +3,8 @@
 // State injected by the server-rendered page:
 //   images = [null, "a.jpg", ...]  (1-indexed)
 //   lastimagevalue, isadmin, hasPasskey, folderURL, spriteMeta, imagemapURL
+//   folderURL and imagemapURL are already %-encoded; use them as they are and
+//   encode every name added to them (encodeURIComponent).
 
 (function () {
   'use strict';
