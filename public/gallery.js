@@ -53,7 +53,7 @@
   // count u32 LE | widths (count × u16 LE) | NUL-terminated UTF-8 names.
   async function loadImagemap() {
     if (!window.imagemapURL) return false;
-    var resp = await fetchOk(window.imagemapURL, { credentials: 'same-origin' });
+    var resp = await fetchFromBuild(window.imagemapURL, { credentials: 'same-origin' });
     var buf = await resp.arrayBuffer();
     var dv = new DataView(buf);
     var bytes = new Uint8Array(buf);
@@ -101,17 +101,39 @@
   // again.
   var RETRY_DELAYS_MS = [500, 2000, 6000];
 
-  // fetch() that treats an HTTP error status as a failure.
-  function fetchOk(url, options) {
+  // fetch() for a file of the build the page was rendered from (the photo
+  // list, an atlas sheet, a photo's tile); an HTTP error status is a failure.
+  // A 404 is not a flaky network: the server removes the previous atlas as
+  // soon as a photo is trashed or deleted (it is public, and would keep the
+  // photo public), and a removed photo's tiles go with it. So a 404 means
+  // the folder has a newer build: the error is marked buildReplaced, is not
+  // retried, and the page moves to the new build (noticeBuildReplaced).
+  // A file that answered 404 is not asked for again (a redraw would ask for
+  // it on every frame until the page has moved to the new build); the rest
+  // of the old build is still served meanwhile and keeps being drawn.
+  var filesOfReplacedBuild = new Set();
+  function fetchFromBuild(url, options) {
+    if (filesOfReplacedBuild.has(url)) return Promise.reject(replacedBuildError(url));
     return fetch(url, options).then(function (response) {
+      if (response.status === 404) {
+        filesOfReplacedBuild.add(url);
+        noticeBuildReplaced();
+        throw replacedBuildError(url);
+      }
       if (!response.ok) throw new Error('HTTP ' + response.status + ' for ' + url);
       return response;
     });
   }
+  function replacedBuildError(url) {
+    var error = new Error('HTTP 404 for ' + url + ': the folder has a newer build');
+    error.buildReplaced = true;
+    return error;
+  }
 
   // Runs attempt() until it resolves, retrying on rejection with the delays
   // above. Resolves null as soon as `signal` aborts (the load is no longer
-  // wanted); rejects with the last error once the retries are used up.
+  // wanted); rejects with the last error once the retries are used up, and
+  // at once for a file of a replaced build (trying again cannot bring it back).
   function withRetries(attempt, signal) {
     return new Promise(function (resolve, reject) {
       var failures = 0;
@@ -119,6 +141,7 @@
         if (signal && signal.aborted) { resolve(null); return; }
         attempt().then(resolve, function (err) {
           if (signal && signal.aborted) { resolve(null); return; }
+          if (err && err.buildReplaced) { reject(err); return; }
           if (failures >= RETRY_DELAYS_MS.length) { reject(err); return; }
           var timer = setTimeout(run, RETRY_DELAYS_MS[failures]);
           failures++;
@@ -130,9 +153,12 @@
   }
 
   // A plain message at the bottom of the window, shown once, when a photo or
-  // an atlas sheet could not be loaded after all retries.
+  // an atlas sheet could not be loaded after all retries. A file of a
+  // replaced build is not a load problem: the page moves to the new build,
+  // and says so through giveUpOnReplacedBuild() if it cannot.
   var loadProblemShown = false;
-  function showLoadProblem() {
+  function showLoadProblem(error) {
+    if (error && error.buildReplaced) return;
     if (loadProblemShown) return;
     loadProblemShown = true;
     var box = document.createElement('div');
@@ -167,17 +193,26 @@
   // is pending at a time, so answers are handled in the order they were asked.
   //
   // A page rendered before the folder was built (no atlas yet) waits for the
-  // build and reloads when it is done. Any other page only shows a build in
-  // progress in the status line.
+  // build and reloads when it is done; so does a page whose build was
+  // replaced (buildReplaced). Any other page only shows a build in progress
+  // in the status line.
   var DEFAULT_BUILD_MESSAGE = 'Building LoD cache…';
   var waitingForFirstBuild = !window.spriteMeta && lastimagevalue > 0;
+  var buildReplaced = false;       // a file of the page's build answered 404
   var buildMessage = '';           // what the page says about the build now; '' = nothing
   var buildPoll = {
     timer: null,                   // the next poll, when one is scheduled
     inFlight: false,               // a request is waiting for its answer
     finished: false,               // a final answer came (failed, gone, unreachable); nothing more to ask
     failures: 0,                   // requests in a row that got no answer
+    requestsSent: 0,
+    firstUsableRequest: 1,         // answers to earlier requests predate a change the page waits on
   };
+  // Called with no arguments when the page gives up on a replaced build
+  // before it could show anything (its photo list was the file that 404'd).
+  var afterReplacedBuildGivenUp = null;
+
+  function reloadIsAwaited() { return waitingForFirstBuild || buildReplaced; }
   // A request that gets no answer (network down, server restarting, an HTTP
   // error) is asked again after these delays; then the page says so and stops.
   var BUILD_STATUS_RETRY_DELAYS_MS = [2000, 4000, 8000, 16000];
@@ -207,6 +242,16 @@
     scheduleBuildStatusPoll(0);
   }
 
+  // Watches again after something changed on the server that the page now
+  // waits on: polling starts even if it had stopped, and an answer to a
+  // request sent before the change does not count.
+  function watchBuildStatusAfterChange() {
+    buildPoll.finished = false;
+    buildPoll.failures = 0;
+    buildPoll.firstUsableRequest = buildPoll.requestsSent + 1;
+    if (!buildPoll.inFlight) scheduleBuildStatusPoll(0);
+  }
+
   function scheduleBuildStatusPoll(delayMs) {
     if (buildPoll.timer) clearTimeout(buildPoll.timer);
     buildPoll.timer = setTimeout(requestBuildStatus, delayMs);
@@ -215,12 +260,14 @@
   function requestBuildStatus() {
     buildPoll.timer = null;
     buildPoll.inFlight = true;
+    var requestNumber = ++buildPoll.requestsSent;
     fetch(folderURL + '?build-status', { credentials: 'same-origin' })
       .then(readBuildStatus)
       .then(function (status) {
         buildPoll.inFlight = false;
         buildPoll.failures = 0;
-        onBuildStatus(status);
+        if (requestNumber < buildPoll.firstUsableRequest) scheduleBuildStatusPoll(0);
+        else onBuildStatus(status);
       }, function () {
         buildPoll.inFlight = false;
         onBuildStatusUnanswered();
@@ -239,6 +286,7 @@
     if (buildPoll.failures >= BUILD_STATUS_RETRY_DELAYS_MS.length) {
       buildPoll.finished = true;
       setBuildMessage('The server cannot be reached. Reload the page to try again.');
+      if (buildReplaced) giveUpOnReplacedBuild();
       return;
     }
     scheduleBuildStatusPoll(BUILD_STATUS_RETRY_DELAYS_MS[buildPoll.failures]);
@@ -251,15 +299,17 @@
     if (status.state === 'gone') {
       buildPoll.finished = true;
       setBuildMessage('This folder no longer exists.');
+      if (buildReplaced) giveUpOnReplacedBuild();
     } else if (status.state === 'failed') {
       // Stop waiting. A page that shows an earlier build keeps showing it.
       buildPoll.finished = true;
       setBuildMessage(waitingForFirstBuild ? 'This folder could not be built.' + (status.error ? ' ' + status.error : '') : '');
+      if (buildReplaced) giveUpOnReplacedBuild();
     } else if (status.state === 'building' && status.remaining > 0) {
       var eta = status.etaSeconds != null ? ' — ETA ' + formatEta(status.etaSeconds) : '';
       setBuildMessage('Building ' + status.remaining + ' image' + (status.remaining === 1 ? '' : 's') + eta);
       scheduleBuildStatusPoll(5000);
-    } else if (waitingForFirstBuild && status.state === 'building') {
+    } else if (reloadIsAwaited() && status.state === 'building') {
       // Its photos are done; the atlas is being made.
       setBuildMessage('Finalizing…');
       scheduleBuildStatusPoll(2000);
@@ -267,9 +317,49 @@
       buildPoll.finished = true;
       setBuildMessage('Build complete. Reloading…');
       setTimeout(function () { location.reload(); }, 1500);
+    } else if (buildReplaced) {
+      buildPoll.finished = true;
+      reloadOntoCurrentBuild();
     } else {
       setBuildMessage('');
     }
+  }
+
+  // ---------- the page's build was replaced ----------
+  // A file of the page's build answered 404 (fetchFromBuild): the folder
+  // changed. Wait until it is built (never reload while a rebuild runs, or
+  // the next page would be replaced again a moment later), then reload at
+  // the same URL. The hash keeps the zoom level and the open photo, and the
+  // photo at the top of the grid is kept in sessionStorage (persistAnchor).
+  function noticeBuildReplaced() {
+    if (buildReplaced) return;
+    buildReplaced = true;
+    watchBuildStatusAfterChange();
+  }
+
+  // At most one reload per build: the page remembers which build it reloaded
+  // away from, and a page that is handed that same build again (the server
+  // keeps serving a build whose files are missing) gives up instead of
+  // reloading in a loop.
+  function reloadOntoCurrentBuild() {
+    var key = 'gg.reloadedFromBuild.' + folderURL;
+    var thisBuild = (window.spriteMeta && spriteMeta._atlasDir) || '(flat)';
+    try {
+      if (sessionStorage.getItem(key) === thisBuild) { giveUpOnReplacedBuild(); return; }
+      sessionStorage.setItem(key, thisBuild);
+    } catch (_) {
+      // No storage to remember it in: no reload, so no loop.
+      giveUpOnReplacedBuild();
+      return;
+    }
+    applyPendingHashUpdate();
+    location.reload();
+  }
+
+  function giveUpOnReplacedBuild() {
+    showLoadProblem();
+    if (afterReplacedBuildGivenUp) afterReplacedBuildGivenUp();
+    afterReplacedBuildGivenUp = null;
   }
 
   // ---------- nav helpers ----------
@@ -617,12 +707,21 @@
   // (crbug.com/1038223) trips around ~25 hash changes/sec sustained; once
   // tripped, queued ops burst at once -> freeze, RAM spike, repaint chaos.
   var pendingHashTimer = null;
+  var pendingHash = null;
   function scheduleHashUpdate(newHash) {
     if (pendingHashTimer) clearTimeout(pendingHashTimer);
-    pendingHashTimer = setTimeout(function () {
-      pendingHashTimer = null;
-      try { history.replaceState(null, '', newHash); } catch (_) {}
-    }, 200);
+    pendingHash = newHash;
+    pendingHashTimer = setTimeout(applyPendingHashUpdate, 200);
+  }
+  // Also called at once before a reload, so the reloaded page opens where
+  // the visitor is, not where the URL was 200 ms ago.
+  function applyPendingHashUpdate() {
+    if (pendingHashTimer) clearTimeout(pendingHashTimer);
+    pendingHashTimer = null;
+    if (pendingHash === null) return;
+    var hash = pendingHash;
+    pendingHash = null;
+    try { history.replaceState(null, '', hash); } catch (_) {}
   }
 
   // Per-atlas-height ImageBitmap cache (h5/h10/h50, loaded lazily).
@@ -786,7 +885,7 @@
   function fetchSpriteBitmap(atlas, spriteIdx, signal) {
     var url = folderURL + GG_DIR + '/' + atlas.sprites[spriteIdx].file;
     return withRetries(function () {
-      return fetchOk(url, { credentials: 'same-origin', signal: signal })
+      return fetchFromBuild(url, { credentials: 'same-origin', signal: signal })
         .then(function (r) { return r.blob(); })
         .then(function (b) { return signal && signal.aborted ? null : createImageBitmap(b); });
     }, signal).then(function (bm) {
@@ -840,9 +939,9 @@
       // First content for any tile that had nothing — redraw now. (Only if
       // the upload took: a redraw with no texture would just refetch.)
       if (canvasEl && gridRenderer.hasTexture(key + ':' + spriteIdx)) scheduleGridRedraw();
-    }, function () {
+    }, function (err) {
       floorSpritesLoading.delete(spriteIdx);
-      showLoadProblem();
+      showLoadProblem(err);
     });
   }
 
@@ -887,7 +986,7 @@
       // Given up after the retries: forget the job, so a later redraw the
       // visitor causes (a scroll, a zoom) can try the sheet again.
       if (spriteLoads[key][spriteIdx] === job) delete spriteLoads[key][spriteIdx];
-      showLoadProblem();
+      showLoadProblem(err);
       throw err;
     });
     spriteLoads[key][spriteIdx] = job;
@@ -983,12 +1082,12 @@
     var fetchOpts = { credentials: 'same-origin', priority: job.priority === 0 ? 'high' : 'low' };
     if (job.ctrl) fetchOpts.signal = job.ctrl.signal;
     withRetries(function () {
-      return fetchOk(job.url, fetchOpts)
+      return fetchFromBuild(job.url, fetchOpts)
         .then(function (r) { return r.blob(); })
         // Cancelled after the bytes arrived: skip the decode, it's the expensive part.
         .then(function (b) { return job.ctrl && job.ctrl.signal.aborted ? null : createImageBitmap(b); });
     }, job.ctrl && job.ctrl.signal)
-      .catch(function () { showLoadProblem(); return null; })
+      .catch(function (err) { showLoadProblem(err); return null; })
       .then(function (bm) {
         perImageInFlight.delete(job);
         _perImageLoads(job.wantBitmap).delete(job.key);
@@ -2188,6 +2287,7 @@
     mainImageDecayRaf = null;
     if (pendingHashTimer) clearTimeout(pendingHashTimer);
     pendingHashTimer = null;
+    pendingHash = null;
     if (focusStableTimer) clearTimeout(focusStableTimer);
     focusStableTimer = null;
     mainEl = null;
@@ -2992,10 +3092,20 @@
     if (window.imagemapURL && window.spriteMeta) {
       var thumbsEl = $('thumbs');
       if (thumbsEl) thumbsEl.innerHTML = '<div style="padding:32px;text-align:center;color:#888">Loading…</div>';
-      withRetries(loadImagemap).catch(function (e) {
-        console.warn('[imagemap] load failed:', e);
+      var showPhotoListFailed = function () {
         photoListFailed = true;
-      }).then(runInitialRoute);
+        runInitialRoute();
+      };
+      withRetries(loadImagemap).then(runInitialRoute, function (e) {
+        if (e && e.buildReplaced) {
+          // The folder has a newer build: the page keeps saying "Loading…"
+          // and reloads onto it, or says it failed if it cannot.
+          afterReplacedBuildGivenUp = showPhotoListFailed;
+          return;
+        }
+        console.warn('[imagemap] load failed:', e);
+        showPhotoListFailed();
+      });
     } else {
       runInitialRoute();
     }
