@@ -24,6 +24,8 @@ const state = {
   lastQueueRemaining: null,
   lastFolderRefreshAt: 0,
   folderLoadFailed: false, // the folder on screen could not be read; retried when the server answers
+  treeWalks: { rescanning: [], rebuilding: [] },  // from the last queue poll
+  treeWalkStarting: null,  // folder whose tree walk was asked for and is not in a poll yet
 };
 
 const byId = id => document.getElementById(id);
@@ -97,11 +99,12 @@ async function runAction(description, action) {
 }
 
 // A toast at the bottom of the window. Confirmations fade out on their own;
-// errors stay until clicked or replaced.
+// errors stay until dismissed (a click on it, or its button from the
+// keyboard) or replaced.
 let noticeTimer = null;
 function showNotice(message, isError) {
   const notice = byId('notice');
-  notice.textContent = message;
+  byId('noticeText').textContent = message;
   notice.classList.toggle('is-error', !!isError);
   notice.hidden = false;
   clearTimeout(noticeTimer);
@@ -336,6 +339,7 @@ function renderFolderButtons(segments) {
   byId('trashFolderButton').hidden = isRoot;
   byId('rescanTreeButton').textContent = isRoot ? 'Rescan all folders' : 'Rescan this folder and all subfolders';
   byId('rebuildTreeButton').textContent = isRoot ? 'Rebuild every folder from scratch' : 'Rebuild this folder and all subfolders from scratch';
+  renderTreeWalkButtons();
 }
 
 // The gallery serves the last committed build. Say what it does not show yet,
@@ -432,25 +436,48 @@ async function rescanCurrentFolder() {
   setTimeout(loadFolder, 1500);
 }
 
-async function rescanCurrentTree() {
-  const isRoot = state.folderSegments.length === 0;
-  const where = isRoot ? 'all folders' : folderPathText(state.folderSegments) + ' and everything below it';
-  await runAction('Rescan with subfolders', async () => {
-    await postJson('/api/admin/rescanfolder', { folder: folderRelativePath(state.folderSegments), recursive: true });
-    return 'Rescanning ' + where + '. Progress shows in the bar above.';
+// A rescan or rebuild of a folder's tree runs on the server for a while.
+// Its two buttons wait while one is running or being started, so a double
+// click asks once and starts one walk.
+function treeWalkRunning(segments) {
+  const key = folderRelativePath(segments);
+  return state.treeWalkStarting === key ||
+    state.treeWalks.rescanning.includes(key) || state.treeWalks.rebuilding.includes(key);
+}
+
+function renderTreeWalkButtons() {
+  const running = treeWalkRunning(state.folderSegments);
+  byId('rescanTreeButton').disabled = running;
+  byId('rebuildTreeButton').disabled = running;
+}
+
+async function startTreeWalk(segments, description, url, body, message) {
+  state.treeWalkStarting = folderRelativePath(segments);
+  renderTreeWalkButtons();
+  await runAction(description, async () => {
+    await postJson(url, body);
+    return message;
   });
-  pollQueueOnce();
+  await pollQueueOnce();
+  state.treeWalkStarting = null;
+  renderTreeWalkButtons();
+}
+
+async function rescanCurrentTree() {
+  const segments = state.folderSegments;
+  if (treeWalkRunning(segments)) return;
+  const where = segments.length === 0 ? 'all folders' : folderPathText(segments) + ' and everything below it';
+  await startTreeWalk(segments, 'Rescan with subfolders', '/api/admin/rescanfolder',
+    { folder: folderRelativePath(segments), recursive: true }, 'Rescanning ' + where + '. Progress shows in the bar above.');
 }
 
 async function rebuildCurrentTree() {
-  const isRoot = state.folderSegments.length === 0;
-  const where = isRoot ? 'every folder' : folderPathText(state.folderSegments) + ' and everything below it';
+  const segments = state.folderSegments;
+  if (treeWalkRunning(segments)) return;
+  const where = segments.length === 0 ? 'every folder' : folderPathText(segments) + ' and everything below it';
   if (!confirm('Delete every thumbnail and atlas in ' + where + ' and build them all again from the originals?\n\nThis is the recursive rebuild. Folders are rebuilt one at a time and each shows "Building" until it finishes. On a large tree this takes hours.')) return;
-  await runAction('Rebuild with subfolders', async () => {
-    await postJson('/api/admin/rebuildtree', { folder: folderRelativePath(state.folderSegments) });
-    return 'Rebuilding ' + where + ' from scratch. Progress shows in the bar above.';
-  });
-  pollQueueOnce();
+  await startTreeWalk(segments, 'Rebuild with subfolders', '/api/admin/rebuildtree',
+    { folder: folderRelativePath(segments) }, 'Rebuilding ' + where + ' from scratch. Progress shows in the bar above.');
   loadFolder();
 }
 
@@ -676,6 +703,8 @@ function renderQueue(queue) {
   status.textContent = busy ? parts.join(' · ') : 'Idle';
   status.className = 'queue-status ' + (busy ? 'busy' : 'idle');
   byId('clearQueueButton').disabled = queue.remaining === 0;
+  state.treeWalks = { rescanning: queue.rescanning, rebuilding: queue.rebuilding };
+  renderTreeWalkButtons();
   if (state.folderLoadFailed) loadFolder();
   else refreshFolderIfBuildMoved(queue.remaining);
 }
@@ -1246,17 +1275,36 @@ function showApp() {
   pollQueueOnce();
 }
 
+// For buttons that confirm and then wait on the server: the button is
+// disabled until its action is over, so a double click asks once and acts
+// once.
+function oneAtATime(button, action) {
+  return async () => {
+    button.disabled = true;
+    try {
+      await action();
+    } finally {
+      button.disabled = false;
+    }
+  };
+}
+
 function wireControls() {
   byId('clearQueueButton').addEventListener('click', clearQueue);
   byId('rescanFolderButton').addEventListener('click', rescanCurrentFolder);
   byId('rescanChangedButton').addEventListener('click', rescanCurrentFolder);
-  byId('rebuildFolderButton').addEventListener('click', rebuildCurrentFolder);
+  byId('rebuildFolderButton').addEventListener('click', oneAtATime(byId('rebuildFolderButton'), rebuildCurrentFolder));
   byId('rescanTreeButton').addEventListener('click', rescanCurrentTree);
   byId('rebuildTreeButton').addEventListener('click', rebuildCurrentTree);
-  byId('trashFolderButton').addEventListener('click', () => trashFolder(state.folderSegments));
+  byId('trashFolderButton').addEventListener('click', oneAtATime(byId('trashFolderButton'), () => trashFolder(state.folderSegments)));
   byId('newFolderForm').addEventListener('submit', createSubfolder);
   byId('newFolderButton').addEventListener('click', () => showNewFolderForm(true));
   byId('cancelNewFolderButton').addEventListener('click', () => showNewFolderForm(false));
+  byId('newFolderForm').addEventListener('keydown', event => {
+    if (event.key !== 'Escape') return;
+    showNewFolderForm(false);
+    byId('newFolderButton').focus();
+  });
   byId('notice').addEventListener('click', () => { byId('notice').hidden = true; });
   byId('signInsLink').addEventListener('click', () => { byId('access').open = true; });
   byId('imagesSection').addEventListener('toggle', () => {
@@ -1267,7 +1315,7 @@ function wireControls() {
     if (byId('trashSection').open) loadTrash();
   });
   byId('restoreAllButton').addEventListener('click', restoreAllFromTrash);
-  byId('emptyTrashButton').addEventListener('click', emptyTrash);
+  byId('emptyTrashButton').addEventListener('click', oneAtATime(byId('emptyTrashButton'), emptyTrash));
   byId('createPasskeyButton').addEventListener('click', registerPasskey);
   byId('loginLinkButton').addEventListener('click', createLoginLink);
   byId('copyLoginLinkButton').addEventListener('click', copyLoginLink);
