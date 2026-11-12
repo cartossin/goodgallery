@@ -563,6 +563,16 @@
     viewer: function () {
       return { focusedIdx: focusedIdx, commandedIdx: commandedIdx, chasing: focusChaseRaf !== null };
     },
+    // Scroll mapping: layout height, spacer height, ratio, the layout y at
+    // the viewport top and the photo whose row is there.
+    layout: function () {
+      var thumbsEl = $('thumbs');
+      var top = thumbsEl ? viewTop(thumbsEl) : 0;
+      var i = firstTileIndexAtOrBelow(top);
+      var t = lastTileRects[i];
+      return { totalLayoutH: totalLayoutH, spacerH: spacerEl ? parseFloat(spacerEl.style.height) : 0,
+        scrollRatio: scrollRatio, scaled: scrollScaled, viewTop: top, topTile: t ? t.name : null };
+    },
     // Grid layout: the tile rects in layout coordinates.
     tiles: function () {
       return lastTileRects.map(function (t) { return { x: t.x, y: t.y, w: t.w, h: t.h, name: t.name }; });
@@ -581,7 +591,7 @@
     visibleDrawnTiers: function () {
       var thumbsEl = $('thumbs');
       if (!thumbsEl || !canvasEl || pickAtlasHeight(currentRowHeight * devicePixelRatio()) != null) return null;
-      var top = thumbsEl.scrollTop, bot = top + thumbsEl.clientHeight;
+      var top = viewTop(thumbsEl), bot = top + thumbsEl.clientHeight;
       var hist = {};
       for (var i = firstTileIndexAtOrBelow(top); i < lastTileRects.length; i++) {
         var t = lastTileRects[i];
@@ -594,7 +604,7 @@
     visibleTiers: function () {
       var thumbsEl = $('thumbs');
       if (!thumbsEl || !canvasEl) return null;
-      var top = thumbsEl.scrollTop, bot = top + thumbsEl.clientHeight;
+      var top = viewTop(thumbsEl), bot = top + thumbsEl.clientHeight;
       var hist = {};
       for (var i = firstTileIndexAtOrBelow(top); i < lastTileRects.length; i++) {
         var t = lastTileRects[i];
@@ -615,7 +625,7 @@
     visibleCoverage: function () {
       var thumbsEl = $('thumbs');
       if (!thumbsEl || !canvasEl) return null;
-      var top = thumbsEl.scrollTop, bot = top + thumbsEl.clientHeight;
+      var top = viewTop(thumbsEl), bot = top + thumbsEl.clientHeight;
       var targetH = currentRowHeight * devicePixelRatio();
       var atlasH = pickAtlasHeight(targetH);
       var tierH = pickPerImageTier(targetH);
@@ -645,7 +655,7 @@
     perImageProgress: function () {
       var thumbsEl = $('thumbs');
       if (!thumbsEl || !canvasEl) return null;
-      var top = thumbsEl.scrollTop, bot = top + thumbsEl.clientHeight;
+      var top = viewTop(thumbsEl), bot = top + thumbsEl.clientHeight;
       var r = { visibleDone: 0, visibleTotal: 0, bufferDone: 0, bufferTotal: 0 };
       for (var i = firstTileIndexAtOrBelow(bufferTop); i < lastTileRects.length; i++) {
         var t = lastTileRects[i];
@@ -1054,10 +1064,11 @@
     var contextLost = false;         // the GPU dropped the context; waiting for it back
     var maxTextureSize = 0;
 
-    // aDstRect.y is the tile's WORLD y (layout coord). uTopOffset is the
-    // world y of the canvas top; the shader subtracts to get canvas-local
-    // pixels. This lets atlas mode pre-upload a single static instance
-    // buffer per (atlasH, sprite) and re-draw with just one uniform update.
+    // aDstRect.y is the tile's WORLD y (layout coord, relative to glOriginY
+    // in a very tall layout). uTopOffset is the world y of the canvas top on
+    // the same basis; the shader subtracts to get canvas-local pixels. This
+    // lets atlas mode pre-upload a single static instance buffer per
+    // (atlasH, sprite) and re-draw with just one uniform update.
     var VS = '#version 300 es\n' +
       'in vec2 aQuadPos;\n' +
       'in vec4 aDstRect;\n' +
@@ -1366,9 +1377,50 @@
   var totalLayoutH = 0;      // full content height (spacer height)
   var atlasInstancesBuiltFor = null;  // String(atlasH) we built static buffers for
   var atlasInstancesLayoutH = -1;     // currentRowHeight when built
+  var atlasInstancesOriginY = 0;      // glOriginY the instance y values are relative to
   var pendingReposition = false;
   var BUFFER_VIEWPORTS = 5;
   var EDGE_MARGIN_FRAC = 0.5;
+
+  // ---- scroll height cap ----
+  // Browsers cap how tall an element can be: Chrome and Safari at about
+  // 33,554,400 px, and Firefox ignores a height above 17,895,697 px. The
+  // layout of a big folder at a large zoom is taller than that (100,000
+  // photos at #size6 is about 99 million px), so its end would be out of
+  // reach. Above MAX_SCROLL_HEIGHT the spacer is capped at that height and
+  // the scroll position maps to the layout through scrollRatio; below it
+  // the ratio is exactly 1 and nothing changes. Every read or write of
+  // #thumbs.scrollTop goes through the two helpers below.
+  var MAX_SCROLL_HEIGHT = 16000000;
+  var scrollRatio = 1;        // layout px per scroll px
+  var scrollScaled = false;   // true when the spacer is capped
+
+  // Layout y at the top of the viewport for a scrollTop.
+  function layoutYFromScrollTop(scrollTop) {
+    return scrollScaled ? scrollTop * scrollRatio : scrollTop;
+  }
+  // scrollTop that puts layout y at (or just past) the viewport top. Rounded
+  // up, so the photo whose row starts at y is the one at the top.
+  function scrollTopFromLayoutY(y) {
+    return scrollScaled ? Math.ceil(y / scrollRatio) : y;
+  }
+  // Layout y at the top of the viewport now.
+  function viewTop(thumbsEl) {
+    return layoutYFromScrollTop(thumbsEl.scrollTop);
+  }
+
+  // Positions reach the GPU as 32-bit floats, which lose sub-pixel precision
+  // above about 4 million (and whole pixels above 16.7 million). In a layout
+  // taller than PRECISE_LAYOUT_H every y sent to the GPU is relative to
+  // glOriginY, a multiple of GL_ORIGIN_STEP near the canvas top; in a shorter
+  // layout the origin is 0 and the values are the layout values themselves.
+  var PRECISE_LAYOUT_H = 4194304;  // 2^22
+  var GL_ORIGIN_STEP = 1048576;    // 2^20
+  var glOriginY = 0;
+  function glOriginFor(canvasTop) {
+    if (totalLayoutH <= PRECISE_LAYOUT_H) return 0;
+    return Math.floor(canvasTop / GL_ORIGIN_STEP) * GL_ORIGIN_STEP;
+  }
 
   // Coalesce redraw requests into one drawCanvasForScroll per animation frame.
   function scheduleGridRedraw() {
@@ -1437,13 +1489,30 @@
     scheduleGridRedraw();
   }
 
-  // Sized to fit content (no overscan needed) or 3 viewports tall, whichever
-  // is smaller. Called from renderGallery once layout is known.
+  // Sized to fit content (no overscan needed) or BUFFER_VIEWPORTS viewports
+  // tall, whichever is smaller. Called from renderGallery once layout is known.
+  //
+  // In a layout taller than MAX_SCROLL_HEIGHT the content moves scrollRatio
+  // layout px per scroll px, so a canvas that scrolls natively with the
+  // spacer would move at the wrong rate between redraws. There the canvas is
+  // one viewport tall, pinned to the viewport (position: sticky) and redrawn
+  // on every scroll frame.
   function applyGridLayout(thumbsEl, W, viewportH, totalH) {
     totalLayoutH = totalH;
-    spacerEl.style.height = Math.max(1, Math.ceil(totalH)) + 'px';
-    bufferH = Math.min(Math.ceil(totalH), Math.ceil(viewportH * BUFFER_VIEWPORTS));
-    if (bufferH < viewportH) bufferH = viewportH;  // never smaller than viewport
+    var fullH = Math.max(1, Math.ceil(totalH));
+    scrollScaled = fullH > MAX_SCROLL_HEIGHT;
+    var spacerH = scrollScaled ? MAX_SCROLL_HEIGHT : fullH;
+    scrollRatio = scrollScaled ? (totalH - viewportH) / (spacerH - viewportH) : 1;
+    spacerEl.style.height = spacerH + 'px';
+    if (scrollScaled) {
+      bufferH = viewportH;
+      canvasEl.style.position = 'sticky';
+    } else {
+      bufferH = Math.min(Math.ceil(totalH), Math.ceil(viewportH * BUFFER_VIEWPORTS));
+      if (bufferH < viewportH) bufferH = viewportH;  // never smaller than viewport
+      canvasEl.style.position = 'absolute';
+    }
+    canvasEl.style.top = '0px';
     var dpr = devicePixelRatio();
     canvasEl.width = Math.round(W * dpr);
     canvasEl.height = Math.round(bufferH * dpr);
@@ -1461,7 +1530,8 @@
     else { captureAnchorFromScroll(); hideControls(); }
     var thumbsEl = $('thumbs');
     if (!thumbsEl || !canvasEl) return;
-    var scrollY = thumbsEl.scrollTop;
+    if (scrollScaled) { scheduleGridRedraw(); return; }  // pinned canvas: redraw every frame
+    var scrollY = viewTop(thumbsEl);
     var viewportH = thumbsEl.clientHeight;
     if (!bufferNeedsReposition(scrollY, viewportH)) return;
     scheduleGridRedraw();
@@ -1491,7 +1561,7 @@
     if (!thumbsEl) return;
     var trect = thumbsEl.getBoundingClientRect();
     var cx = e.clientX - trect.left;
-    var cy = e.clientY - trect.top + thumbsEl.scrollTop;
+    var cy = e.clientY - trect.top + viewTop(thumbsEl);
     // Binary search by y (rows are emitted top-down, so lastTileRects is
     // sorted by y). For 100k tiles this drops a click from ~5ms to <0.1ms.
     var n = lastTileRects.length;
@@ -1526,7 +1596,7 @@
   function captureAnchorFromScroll() {
     var thumbsEl = document.getElementById('thumbs');
     if (!thumbsEl || !lastTileRects.length) { cachedAnchorName = null; persistAnchor(); return; }
-    var scrollY = thumbsEl.scrollTop;
+    var scrollY = viewTop(thumbsEl);
     if (scrollY <= 0) { cachedAnchorName = null; persistAnchor(); return; }
     // Row-major tile order → first tile whose y-range spans scrollY is the
     // leftmost image of the topmost visible row.
@@ -1565,7 +1635,7 @@
       var loc = spriteMeta.imageMap[t.name];
       if (!loc) continue;
       var cell = atlasCellRect(loc, atlas);
-      perSprite[cell.spIdx].push(t.x, t.y, t.w, t.h,
+      perSprite[cell.spIdx].push(t.x, t.y - glOriginY, t.w, t.h,
         cell.sx / cell.spriteW, cell.sy / cell.spriteH, cell.sw / cell.spriteW, cell.sh / cell.spriteH);
     }
     // Drop any prior buffers for this atlas, then upload fresh.
@@ -1580,6 +1650,7 @@
     }
     atlasInstancesBuiltFor = key;
     atlasInstancesLayoutH = currentRowHeight;
+    atlasInstancesOriginY = glOriginY;
   }
 
   // Index of the first tile that overlaps or lies below world y `top`.
@@ -1647,15 +1718,18 @@
     if (!canvasEl || !window.spriteMeta) return;
     var thumbsEl = $('thumbs');
     if (!thumbsEl) return;
-    var scrollY = thumbsEl.scrollTop;
+    var scrollY = viewTop(thumbsEl);
     var dpr = devicePixelRatio();
     var W = canvasEl.width / dpr;
     var viewportH = thumbsEl.clientHeight || (canvasEl.height / dpr);
     if (!viewportH) return;
 
-    if (bufferTop < 0 || bufferNeedsReposition(scrollY, viewportH)) {
+    if (scrollScaled) {
+      bufferTop = scrollY;  // the pinned canvas shows exactly the viewport
+    } else if (bufferTop < 0 || bufferNeedsReposition(scrollY, viewportH)) {
       recenterBuffer(scrollY, viewportH);
     }
+    glOriginY = glOriginFor(bufferTop);
 
     var atlasH = pickAtlasHeight(currentRowHeight * dpr);
     if (atlasH != null) drawGridFromAtlas(atlasH, W, dpr);
@@ -1668,7 +1742,7 @@
   // needs are on the GPU and issue one draw per sprite.
   function drawGridFromAtlas(atlasH, W, dpr) {
     var aKey = String(atlasH);
-    if (atlasInstancesBuiltFor !== aKey || atlasInstancesLayoutH !== currentRowHeight) {
+    if (atlasInstancesBuiltFor !== aKey || atlasInstancesLayoutH !== currentRowHeight || atlasInstancesOriginY !== glOriginY) {
       dropStaticBuffersOfPreviousAtlas(aKey);
       buildStaticAtlasBuffers(atlasH);
     }
@@ -1702,7 +1776,7 @@
     }
     // Tiles whose sprite hasn't arrived draw from the floor tier meanwhile.
     var floorBatches = floorBatchesForMissingSprites(aKey, needed);
-    if (gridRenderer.beginFrame(W, bufferH, dpr, bufferTop)) {
+    if (gridRenderer.beginFrame(W, bufferH, dpr, bufferTop - glOriginY)) {
       gridRenderer.drawStatic(batches);
       gridRenderer.drawDynamic(floorBatches);
     }
@@ -1791,7 +1865,7 @@
     warmPerImageNames = warmNames;
     evictPerImage(warmNames);
 
-    if (gridRenderer.beginFrame(W, bufferH, dpr, bufferTop)) gridRenderer.drawDynamic(batchesFromAccum(batchAccum));
+    if (gridRenderer.beginFrame(W, bufferH, dpr, bufferTop - glOriginY)) gridRenderer.drawDynamic(batchesFromAccum(batchAccum));
   }
 
   // The per-photo tier for tile `t`: the smallest tier at least as tall as
@@ -1870,10 +1944,11 @@
     return batches;
   }
 
+  // `y` is a layout y; the GPU gets it relative to glOriginY.
   function pushBatch(batchAccum, key, x, y, w, h, u0, v0, du, dv) {
     var arr = batchAccum.get(key);
     if (!arr) { arr = []; batchAccum.set(key, arr); }
-    arr.push(x, y, w, h, u0, v0, du, dv);
+    arr.push(x, y - glOriginY, w, h, u0, v0, du, dv);
   }
 
   // Draw a tile from the first of `tiers` whose sprite is on the GPU.
@@ -2657,9 +2732,10 @@
       for (var ki = 0; ki < lastTileRects.length; ki++) {
         if (lastTileRects[ki].name === anchorName) {
           var newTop = Math.max(0, Math.min(maxScroll, lastTileRects[ki].y));
-          if (Math.abs(thumbsEl.scrollTop - newTop) > 0.5) {
+          var newScrollTop = scrollTopFromLayoutY(newTop);
+          if (Math.abs(thumbsEl.scrollTop - newScrollTop) > 0.5) {
             suppressNextAnchorCapture = true;
-            thumbsEl.scrollTop = newTop;
+            thumbsEl.scrollTop = newScrollTop;
           }
           break;
         }
@@ -2774,7 +2850,7 @@
   function findCenteredImageName() {
     var thumbsEl = $('thumbs');
     if (!thumbsEl || !lastTileRects.length) return null;
-    var sy = thumbsEl.scrollTop;
+    var sy = viewTop(thumbsEl);
     var cx = thumbsEl.clientWidth / 2;
     var cy = sy + thumbsEl.clientHeight / 2;
     var best = null, bestD = Infinity;
