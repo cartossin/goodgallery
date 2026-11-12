@@ -35,8 +35,9 @@ if (command === 'login-link') {
 async function startServer() {
   const config = await import('./lib/config.js');  // exits on an invalid setting
   config.prepareDataDirectories();
-  const { preflightVips } = await import('./lib/vips.js');
+  const { preflightVips, stopVipsProcesses } = await import('./lib/vips.js');
   preflightVips();
+  const { stopAtlasWorker } = await import('./lib/atlas.js');
   const { getPasskey, sessions } = await import('./lib/auth.js');
   const { brokenTilesReady } = await import('./lib/build.js');
   const { sendText } = await import('./lib/http.js');
@@ -66,6 +67,20 @@ async function startServer() {
   server.listen(config.PORT, config.HOST, () => {
     printStartupLines(config, !getPasskey() && sessions.size === 0);
   });
+
+  // A plain `kill` (SIGTERM) or Ctrl-C (SIGINT) must not leave vips processes
+  // behind, still writing into gg/ after the server is gone. Under systemd
+  // the unit's cgroup is killed anyway; a server run by hand has no such net.
+  for (const signal of ['SIGTERM', 'SIGINT']) {
+    process.once(signal, async () => {
+      console.log(`[shutdown] ${signal}: stopping image builds`);
+      stopVipsProcesses();
+      await stopAtlasWorker();
+      // End the way the signal would have, so systemd and shells see the
+      // usual status for it.
+      process.kill(process.pid, signal);
+    });
+  }
 }
 
 function listenErrorText(error) {
