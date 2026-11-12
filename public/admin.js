@@ -77,7 +77,7 @@ async function postFolderAction(url) {
   const response = await fetch(url, { method: 'POST', credentials: 'same-origin' });
   const text = await response.text();
   if (response.status === 401 || response.status === 403) { showSignIn(); throw new SignedOutError('signed out'); }
-  if (!response.ok) throw Object.assign(new Error(text || ('HTTP ' + response.status)), { status: response.status });
+  if (!response.ok) throw new HttpError(text || ('HTTP ' + response.status), response.status);
   return text;
 }
 
@@ -745,13 +745,21 @@ async function handleDrop(event) {
     .map(item => item.webkitGetAsEntry && item.webkitGetAsEntry())
     .filter(Boolean);
   const items = [];
+  const refused = new Map();
+  const problems = [];
   if (entries.length) {
     byId('uploadCount').textContent = 'Listing files';
-    for (const entry of entries) await collectEntry(entry, targetSegments, items);
+    try {
+      for (const entry of entries) await collectEntry(entry, targetSegments, items, refused);
+    } catch (error) {
+      if (error instanceof SignedOutError) return;
+      problems.push('Could not read everything that was dropped (' + error.message + ').');
+    }
   } else {
     for (const file of event.dataTransfer.files || []) items.push({ file, folderSegments: targetSegments });
   }
-  await uploadItems(items);
+  if (refused.size) problems.push(refusedFoldersText(refused, 0));
+  await uploadItems(items, problems);
   finishUploads(targetSegments);
 }
 
@@ -774,42 +782,73 @@ async function handlePickedFolder(event) {
     filesByFolder.get(key).files.push(file);
   }
   const items = [];
-  for (const { subfolders, files } of filesByFolder.values()) {
-    const folderSegments = await createFolderChain(targetSegments, subfolders);
-    for (const file of files) items.push({ file, folderSegments });
+  const refused = new Map();
+  let skippedFiles = 0;
+  try {
+    for (const { subfolders, files } of filesByFolder.values()) {
+      const folderSegments = await createFolderChain(targetSegments, subfolders, refused);
+      if (!folderSegments) { skippedFiles += files.length; continue; }
+      for (const file of files) items.push({ file, folderSegments });
+    }
+  } catch (error) {
+    if (error instanceof SignedOutError) return;
+    throw error;
   }
-  await uploadItems(items);
+  await uploadItems(items, refused.size ? [refusedFoldersText(refused, skippedFiles)] : []);
   event.target.value = '';
   finishUploads(targetSegments);
 }
 
-// Create each missing folder along parentSegments + subfolders. ?mkdir on an
-// existing folder answers 409, which here just means it is already there.
-async function createFolderChain(parentSegments, subfolders) {
+// Create each missing folder along parentSegments + subfolders and return
+// the folder's segments. A name the server refuses (gg, a dot-folder, ...)
+// is recorded in refused with the reason, and null is returned for it and
+// for everything below it, so the rest of the tree still uploads. An
+// existing folder is fine: ?mkdir answers 200 or 409 for it.
+async function createFolderChain(parentSegments, subfolders, refused) {
   let segments = parentSegments;
   for (const name of subfolders) {
-    try { await postFolderAction(folderUrl(segments) + '?mkdir=' + encodeURIComponent(name)); }
-    catch (error) { if (error.status !== 409) throw error; }
+    const parent = segments;
     segments = segments.concat(name);
+    const key = folderRelativePath(segments);
+    if (refused.has(key)) return null;
+    try {
+      await postFolderAction(folderUrl(parent) + '?mkdir=' + encodeURIComponent(name));
+    } catch (error) {
+      if (error instanceof SignedOutError) throw error;
+      if (!(error instanceof HttpError && error.status === 409)) {
+        refused.set(key, error.message);
+        return null;
+      }
+    }
   }
   return segments;
 }
 
+// "Skipped the folder /up/Trip/gg/ (invalid name)", for the upload notice.
+function refusedFoldersText(refused, skippedFiles) {
+  const folders = Array.from(refused, ([key, reason]) => folderPathText(key.split('/')) + ' (' + reason + ')');
+  let text = 'Skipped ' + (folders.length === 1 ? 'the folder ' : 'the folders ') + folders.join(', ');
+  if (skippedFiles) text += ' and the ' + plural(skippedFiles, 'file') + ' in ' + (folders.length === 1 ? 'it' : 'them');
+  return text + '.';
+}
+
 // Walk a dropped file or directory entry, creating folders as it goes, and
-// add every file found to items.
-async function collectEntry(entry, parentSegments, items) {
+// add every file found to items. A folder the server refuses is skipped
+// with everything in it (see createFolderChain).
+async function collectEntry(entry, parentSegments, items, refused) {
   if (entry.isFile) {
     const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
     items.push({ file, folderSegments: parentSegments });
     return;
   }
   if (!entry.isDirectory) return;
-  const folderSegments = await createFolderChain(parentSegments, [entry.name]);
+  const folderSegments = await createFolderChain(parentSegments, [entry.name], refused);
+  if (!folderSegments) return;
   const reader = entry.createReader();
   while (true) {
     const batch = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
     if (!batch.length) break;
-    for (const child of batch) await collectEntry(child, folderSegments, items);
+    for (const child of batch) await collectEntry(child, folderSegments, items, refused);
   }
 }
 
@@ -817,10 +856,14 @@ function finishUploads(targetSegments) {
   if (targetSegments === state.folderSegments) loadFolder();
 }
 
-async function uploadItems(items) {
+// problems: sentences about what was left out before this point (folders
+// the server refused), shown in the same notice as skipped non-images.
+async function uploadItems(items, problems = []) {
   const images = items.filter(({ file }) => file.type && file.type.startsWith('image/'));
   const skipped = items.length - images.length;
-  if (skipped) showNotice('Skipped ' + plural(skipped, 'file') + ' that ' + (skipped === 1 ? 'is' : 'are') + ' not an image.', true);
+  const notes = problems.slice();
+  if (skipped) notes.push('Skipped ' + plural(skipped, 'file') + ' that ' + (skipped === 1 ? 'is' : 'are') + ' not an image.');
+  if (notes.length) showNotice(notes.join(' '), true);
   const batch = state.uploadBatch;
   batch.total += images.length;
   renderUploadCount();
