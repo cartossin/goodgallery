@@ -159,8 +159,25 @@
       .catch(function () { onText(''); });
   }
 
-  // The page just monitors server-side build state; mutations live in /_admin/.
-  var statusTimer = null;
+  // ---------- build status ----------
+  // The page watches the folder's build state on the server (?build-status);
+  // mutations live in /_admin/. There is one poller per page and one place,
+  // onBuildStatus(), that decides what the page says about the build and
+  // whether it reloads. Only one request is in flight and at most one timer
+  // is pending at a time, so answers are handled in the order they were asked.
+  //
+  // A page rendered before the folder was built (no atlas yet) waits for the
+  // build and reloads when it is done. Any other page only shows a build in
+  // progress in the status line.
+  var DEFAULT_BUILD_MESSAGE = 'Building LoD cache…';
+  var waitingForFirstBuild = !window.spriteMeta && lastimagevalue > 0;
+  var buildMessage = '';           // what the page says about the build now; '' = nothing
+  var buildPoll = {
+    timer: null,                   // the next poll, when one is scheduled
+    inFlight: false,               // a request is waiting for its answer
+    finished: false,               // a final answer came (failed); nothing more to ask
+  };
+
   function formatEta(s) {
     if (s < 60) return s + 's';
     if (s < 3600) return Math.round(s / 60) + 'm';
@@ -168,38 +185,63 @@
     var m = Math.round((s - h * 3600) / 60);
     return m === 0 ? h + 'h' : h + 'h ' + m + 'm';
   }
+
+  // Shown in the status line and, on a waiting page, in its box. The box is
+  // drawn again by every renderGallery(), which reads buildMessage, so a
+  // re-render cannot put the default text back over a later message.
   function setBuildMessage(msg) {
-    note(msg);
+    buildMessage = msg || '';
+    note(buildMessage);
     var b = document.getElementById('buildstatus-main');
-    if (b) b.textContent = msg || 'Building LoD cache…';
+    if (b) b.textContent = buildMessage || DEFAULT_BUILD_MESSAGE;
   }
-  function pollBuildStatus(opts) {
-    opts = opts || {};
-    var reloadOnComplete = !!opts.reloadOnComplete;
-    if (statusTimer) { clearTimeout(statusTimer); statusTimer = null; }
-    fetch(folderURL + '?build-status')
+
+  // Starts watching the build, unless the poller is already at it or has
+  // had its final answer. Safe to call from every render.
+  function watchBuildStatus() {
+    if (buildPoll.inFlight || buildPoll.timer || buildPoll.finished) return;
+    scheduleBuildStatusPoll(0);
+  }
+
+  function scheduleBuildStatusPoll(delayMs) {
+    if (buildPoll.timer) clearTimeout(buildPoll.timer);
+    buildPoll.timer = setTimeout(requestBuildStatus, delayMs);
+  }
+
+  function requestBuildStatus() {
+    buildPoll.timer = null;
+    buildPoll.inFlight = true;
+    fetch(folderURL + '?build-status', { credentials: 'same-origin' })
       .then(function (r) { return r.json(); })
-      .then(function (p) {
-        // p.state is this folder's own: 'building', 'failed' or 'built'.
-        if (p.state === 'failed') {
-          // Stop waiting. A page that shows an earlier build keeps showing it.
-          setBuildMessage(reloadOnComplete ? 'This folder could not be built.' + (p.error ? ' ' + p.error : '') : '');
-        } else if (p.state === 'building' && p.remaining > 0) {
-          var eta = p.etaSeconds != null ? ' — ETA ' + formatEta(p.etaSeconds) : '';
-          setBuildMessage('Building ' + p.remaining + ' image' + (p.remaining === 1 ? '' : 's') + eta);
-          statusTimer = setTimeout(function () { pollBuildStatus({ reloadOnComplete: reloadOnComplete }); }, 5000);
-        } else if (reloadOnComplete && p.state === 'building') {
-          // Its photos are done; the atlas is being made.
-          setBuildMessage('Finalizing…');
-          statusTimer = setTimeout(function () { pollBuildStatus({ reloadOnComplete: reloadOnComplete }); }, 2000);
-        } else if (reloadOnComplete) {
-          setBuildMessage('Build complete. Reloading…');
-          setTimeout(function () { location.reload(); }, 1500);
-        } else {
-          setBuildMessage('');
-        }
-      })
-      .catch(function () {});
+      .then(function (status) {
+        buildPoll.inFlight = false;
+        onBuildStatus(status);
+      }, function () {
+        buildPoll.inFlight = false;
+      });
+  }
+
+  // status.state is this folder's own: 'building', 'failed' or 'built'.
+  function onBuildStatus(status) {
+    if (status.state === 'failed') {
+      // Stop waiting. A page that shows an earlier build keeps showing it.
+      buildPoll.finished = true;
+      setBuildMessage(waitingForFirstBuild ? 'This folder could not be built.' + (status.error ? ' ' + status.error : '') : '');
+    } else if (status.state === 'building' && status.remaining > 0) {
+      var eta = status.etaSeconds != null ? ' — ETA ' + formatEta(status.etaSeconds) : '';
+      setBuildMessage('Building ' + status.remaining + ' image' + (status.remaining === 1 ? '' : 's') + eta);
+      scheduleBuildStatusPoll(5000);
+    } else if (waitingForFirstBuild && status.state === 'building') {
+      // Its photos are done; the atlas is being made.
+      setBuildMessage('Finalizing…');
+      scheduleBuildStatusPoll(2000);
+    } else if (waitingForFirstBuild) {
+      buildPoll.finished = true;
+      setBuildMessage('Build complete. Reloading…');
+      setTimeout(function () { location.reload(); }, 1500);
+    } else {
+      setBuildMessage('');
+    }
   }
 
   // ---------- nav helpers ----------
@@ -2676,10 +2718,11 @@
     }
     if (!window.spriteMeta) {
       thumbsEl.innerHTML = '<div style="padding:32px;text-align:center;color:#888">' +
-        '<div id="buildstatus-main" style="font-size:16px;margin-bottom:8px">Building LoD cache…</div>' +
+        '<div id="buildstatus-main" style="font-size:16px;margin-bottom:8px"></div>' +
         '<div style="font-size:13px">' + lastimagevalue + ' images in this folder</div>' +
         '</div>';
-      pollBuildStatus({ reloadOnComplete: true });
+      $('buildstatus-main').textContent = buildMessage || DEFAULT_BUILD_MESSAGE;
+      watchBuildStatus();
       thumbsEl.style.cssText = '';
       canvasEl = null; spacerEl = null;
       return;
@@ -2935,7 +2978,7 @@
     // Programmatic key handlers; inline onkey* attributes hit a race with the
     // IIFE's window.* exports on Safari.
     window.addEventListener('keydown', keycheck);
-    pollBuildStatus();
+    watchBuildStatus();
   }
 
   // Cookie is HttpOnly; the probe is the only way to detect a valid session.
