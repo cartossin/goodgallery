@@ -1004,7 +1004,7 @@ async function uploadOneFile({ file, folderSegments }, row) {
   const upload = await postJson('/api/upload/create', {
     filename: file.name,
     size: file.size,
-    targetFolder: folderUrl(folderSegments),
+    targetFolder: folderRelativePath(folderSegments),
   });
   for (let index = 0; index < upload.totalChunks; index++) {
     const start = index * upload.chunkSize;
