@@ -186,7 +186,7 @@
       if (k === 37 || k === 38) leftbutton(); else rightbutton();
     } else if (k === 27 && focusedIdx > 0) {
       e.preventDefault();
-      location.hash = '';
+      returnToGrid();
     }
   }
 
@@ -2546,7 +2546,7 @@
   }
 
   // Back to the grid at the zoom the visitor came from, with the photo just
-  // viewed at the top.
+  // viewed at the top. Used by the up button and by Escape.
   function returnToGrid() {
     if (focusedIdx > 0 && images[focusedIdx]) cachedAnchorName = images[focusedIdx];
     var lv = availableLevels()[lastGridLevelIdx];
