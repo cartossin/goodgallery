@@ -1054,53 +1054,77 @@ function setUploadRowState(row, stateName, text, fraction) {
 }
 
 async function uploadOneFile({ file, folderSegments }, row) {
-  const upload = await postJson('/api/upload/create', {
-    filename: file.name,
-    size: file.size,
-    targetFolder: folderRelativePath(folderSegments),
-  });
+  const upload = await uploadRequest('/api/upload/create', {
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filename: file.name, size: file.size, targetFolder: folderRelativePath(folderSegments) }),
+  }, row);
   for (let index = 0; index < upload.totalChunks; index++) {
     const start = index * upload.chunkSize;
     const bytes = await file.slice(start, Math.min(start + upload.chunkSize, file.size)).arrayBuffer();
-    await sendChunkWithRetry(upload.id, index, bytes, row);
+    await sendChunk(upload.id, index, bytes, row);
     setUploadRowState(row, 'active', (index + 1) + ' of ' + upload.totalChunks + ' chunks', (index + 1) / upload.totalChunks);
   }
   setUploadRowState(row, 'active', 'Finishing');
-  await requestJson('/api/upload/finalize/' + upload.id, { method: 'POST' });
+  await uploadRequest('/api/upload/finalize/' + upload.id, {}, row, judgeRetriedFinalize);
   setUploadRowState(row, 'done', 'Uploaded', 1);
 }
 
-// Network blips must not lose a large batch, so a chunk is retried, backing
-// off up to UPLOAD_RETRY_MAX_WAIT_MS, as long as a retry can help: no answer
-// at all, a server error (5xx) or "too many requests" (429). Any other
-// refusal (the upload is gone, a bad chunk) would only repeat, so the file
-// fails with the server's reason.
-function chunkRetryCanHelp(status) {
+async function sendChunk(uploadId, index, bytes, row) {
+  const hash = await sha256Hex(bytes);
+  const headers = hash ? { 'X-Chunk-Hash': hash } : {};
+  await uploadRequest('/api/upload/chunk/' + uploadId + '/' + index, { headers, body: bytes }, row);
+}
+
+// Network blips and a restarting server must not lose a large batch, so
+// every upload request (create, each chunk, finalize) is retried while a
+// retry can help: no answer at all, a server error (5xx) or "too many
+// requests" (429). Any other refusal (the upload is gone, a bad chunk, the
+// name is taken) would only repeat. The tries are bounded, so a file the
+// server keeps failing ends as a failed row and its worker moves on.
+const UPLOAD_TRIES = 6;  // waits of 1, 2, 4, 8 and 8 s between them
+
+function retryCanHelp(status) {
   return status >= 500 || status === 429;
 }
 
-async function sendChunkWithRetry(uploadId, index, bytes, row) {
-  const hash = await sha256Hex(bytes);
-  const headers = hash ? { 'X-Chunk-Hash': hash } : {};
+function retryWaitMs(attempt) {
+  return Math.min(1000 * 2 ** (attempt - 1), UPLOAD_RETRY_MAX_WAIT_MS);
+}
+
+// A finalize retried after a try that got no answer (or a 5xx) may find
+// that try's work done or still going. The server answers 404 "unknown
+// upload" once the file is in place (it forgets the upload then), and 409
+// while that try is still running ("already being finalized") or finishing
+// (the file is there but the upload not yet forgotten): the first means the
+// file landed, the second is worth another try.
+function judgeRetriedFinalize(status) {
+  if (status === 404) return 'done';
+  if (status === 409) return 'retry';
+  return null;
+}
+
+// POST one upload request with the retry policy above and return the
+// server's JSON answer. judgeRetried(status), when given, reads a refusal
+// that answers a retry: 'done' (an earlier try did the work), 'retry', or
+// null (judged like any refusal).
+async function uploadRequest(url, init, row, judgeRetried) {
   for (let attempt = 1; ; attempt++) {
     let response = null;
     try {
-      response = await fetch('/api/upload/chunk/' + uploadId + '/' + index, {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers,
-        body: bytes,
-      });
+      response = await fetch(url, Object.assign({ method: 'POST', credentials: 'same-origin' }, init));
     } catch {}  // no answer: retried below
     let reason = 'no answer from the server';
     if (response) {
       const data = await response.json().catch(() => ({}));
       if (response.status === 401) { showSignIn(); throw new SignedOutError('signed out'); }
-      if (response.ok) return;
+      if (response.ok) return data;
       reason = data.error || ('HTTP ' + response.status);
-      if (!chunkRetryCanHelp(response.status)) throw new HttpError(reason, response.status);
+      const verdict = attempt > 1 && judgeRetried ? judgeRetried(response.status) : null;
+      if (verdict === 'done') return data;
+      if (verdict !== 'retry' && !retryCanHelp(response.status)) throw new HttpError(reason, response.status);
     }
-    const waitMs = Math.min(attempt * 1000, UPLOAD_RETRY_MAX_WAIT_MS);
+    if (attempt === UPLOAD_TRIES) throw new Error(reason + ' (gave up after ' + UPLOAD_TRIES + ' tries)');
+    const waitMs = retryWaitMs(attempt);
     setUploadRowState(row, 'retrying', 'Retry ' + attempt + ' in ' + (waitMs / 1000) + ' s (' + reason + ')');
     await new Promise(resolve => setTimeout(resolve, waitMs));
   }
