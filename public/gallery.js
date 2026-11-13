@@ -1313,7 +1313,10 @@
       '  vUV = aSrcRect.xy + aQuadPos * aSrcRect.zw;\n' +
       '}\n';
     var FS = '#version 300 es\n' +
-      'precision mediump float;\n' +
+      // highp, which WebGL 2 guarantees in fragment shaders. Phone GPUs give
+      // mediump 10 bits: too few to address a texel on a sheet thousands of
+      // pixels wide, so a tile's edge could sample its neighbour.
+      'precision highp float;\n' +
       'in vec2 vUV;\n' +
       'uniform sampler2D uAtlas;\n' +
       'out vec4 fragColor;\n' +
